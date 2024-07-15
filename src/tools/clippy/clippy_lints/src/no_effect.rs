@@ -1,12 +1,14 @@
 use clippy_utils::diagnostics::{span_lint_hir, span_lint_hir_and_then};
 use clippy_utils::source::snippet_opt;
 use clippy_utils::ty::has_drop;
-use clippy_utils::{any_parent_is_automatically_derived, get_parent_node, is_lint_allowed, path_to_local, peel_blocks};
+use clippy_utils::{
+    in_automatically_derived, is_inside_always_const_context, is_lint_allowed, path_to_local, peel_blocks,
+};
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{
-    is_range_literal, BinOpKind, BlockCheckMode, Expr, ExprKind, HirId, HirIdMap, ItemKind, Node, PatKind, Stmt,
-    StmtKind, UnsafeSource,
+    is_range_literal, BinOpKind, BlockCheckMode, Expr, ExprKind, HirId, HirIdMap, ItemKind, LocalSource, Node, PatKind,
+    Stmt, StmtKind, UnsafeSource,
 };
 use rustc_infer::infer::TyCtxtInferExt as _;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
@@ -42,10 +44,6 @@ declare_clippy_lint! {
     /// Unlike dead code, these bindings are actually
     /// executed. However, as they have no effect and shouldn't be used further on, all they
     /// do is make the code less readable.
-    ///
-    /// ### Known problems
-    /// Further usage of this variable is not checked, which can lead to false positives if it is
-    /// used later in the code.
     ///
     /// ### Example
     /// ```rust,ignore
@@ -98,7 +96,6 @@ impl<'tcx> LateLintPass<'tcx> for NoEffect {
 
     fn check_block_post(&mut self, cx: &LateContext<'tcx>, _: &'tcx rustc_hir::Block<'tcx>) {
         for hir_id in self.local_bindings.pop().unwrap() {
-            // FIXME(rust/#120456) - is `swap_remove` correct?
             if let Some(span) = self.underscore_bindings.swap_remove(&hir_id) {
                 span_lint_hir(
                     cx,
@@ -111,9 +108,8 @@ impl<'tcx> LateLintPass<'tcx> for NoEffect {
         }
     }
 
-    fn check_expr(&mut self, _: &LateContext<'tcx>, expr: &'tcx rustc_hir::Expr<'tcx>) {
+    fn check_expr(&mut self, _: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
         if let Some(def_id) = path_to_local(expr) {
-            // FIXME(rust/#120456) - is `swap_remove` correct?
             self.underscore_bindings.swap_remove(&def_id);
         }
     }
@@ -122,7 +118,11 @@ impl<'tcx> LateLintPass<'tcx> for NoEffect {
 impl NoEffect {
     fn check_no_effect(&mut self, cx: &LateContext<'_>, stmt: &Stmt<'_>) -> bool {
         if let StmtKind::Semi(expr) = stmt.kind {
-            // move `expr.span.from_expansion()` ahead
+            // Covered by rustc `path_statements` lint
+            if matches!(expr.kind, ExprKind::Path(_)) {
+                return true;
+            }
+
             if expr.span.from_expansion() {
                 return false;
             }
@@ -144,7 +144,7 @@ impl NoEffect {
                         for parent in cx.tcx.hir().parent_iter(stmt.hir_id) {
                             if let Node::Item(item) = parent.1
                                 && let ItemKind::Fn(..) = item.kind
-                                && let Some(Node::Block(block)) = get_parent_node(cx.tcx, stmt.hir_id)
+                                && let Node::Block(block) = cx.tcx.parent_hir_node(stmt.hir_id)
                                 && let [.., final_stmt] = block.stmts
                                 && final_stmt.hir_id == stmt.hir_id
                             {
@@ -178,15 +178,16 @@ impl NoEffect {
                 );
                 return true;
             }
-        } else if let StmtKind::Local(local) = stmt.kind {
+        } else if let StmtKind::Let(local) = stmt.kind {
             if !is_lint_allowed(cx, NO_EFFECT_UNDERSCORE_BINDING, local.hir_id)
+                && !matches!(local.source, LocalSource::AsyncFn)
                 && let Some(init) = local.init
                 && local.els.is_none()
                 && !local.pat.span.from_expansion()
                 && has_no_effect(cx, init)
                 && let PatKind::Binding(_, hir_id, ident, _) = local.pat.kind
                 && ident.name.to_ident_string().starts_with('_')
-                && !any_parent_is_automatically_derived(cx.tcx, local.hir_id)
+                && !in_automatically_derived(cx.tcx, local.hir_id)
             {
                 if let Some(l) = self.local_bindings.last_mut() {
                     l.push(hir_id);
@@ -259,13 +260,16 @@ fn has_no_effect(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
 
 fn check_unnecessary_operation(cx: &LateContext<'_>, stmt: &Stmt<'_>) {
     if let StmtKind::Semi(expr) = stmt.kind
+        && !in_external_macro(cx.sess(), stmt.span)
         && let ctxt = stmt.span.ctxt()
         && expr.span.ctxt() == ctxt
         && let Some(reduced) = reduce_expression(cx, expr)
-        && !in_external_macro(cx.sess(), stmt.span)
         && reduced.iter().all(|e| e.span.ctxt() == ctxt)
     {
         if let ExprKind::Index(..) = &expr.kind {
+            if is_inside_always_const_context(cx.tcx, expr.hir_id) {
+                return;
+            }
             let snippet =
                 if let (Some(arr), Some(func)) = (snippet_opt(cx, reduced[0].span), snippet_opt(cx, reduced[1].span)) {
                     format!("assert!({}.len() > {});", &arr, &func)

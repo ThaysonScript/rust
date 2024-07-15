@@ -107,8 +107,10 @@ impl<'ll> CodegenCx<'ll, '_> {
 
     pub(crate) fn type_float_from_ty(&self, t: ty::FloatTy) -> &'ll Type {
         match t {
+            ty::FloatTy::F16 => self.type_f16(),
             ty::FloatTy::F32 => self.type_f32(),
             ty::FloatTy::F64 => self.type_f64(),
+            ty::FloatTy::F128 => self.type_f128(),
         }
     }
 
@@ -125,13 +127,24 @@ impl<'ll> CodegenCx<'ll, '_> {
     pub(crate) fn type_variadic_func(&self, args: &[&'ll Type], ret: &'ll Type) -> &'ll Type {
         unsafe { llvm::LLVMFunctionType(ret, args.as_ptr(), args.len() as c_uint, True) }
     }
-}
 
-impl<'ll, 'tcx> BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
-    fn type_i1(&self) -> &'ll Type {
+    pub(crate) fn type_i1(&self) -> &'ll Type {
         unsafe { llvm::LLVMInt1TypeInContext(self.llcx) }
     }
 
+    pub(crate) fn type_struct(&self, els: &[&'ll Type], packed: bool) -> &'ll Type {
+        unsafe {
+            llvm::LLVMStructTypeInContext(
+                self.llcx,
+                els.as_ptr(),
+                els.len() as c_uint,
+                packed as Bool,
+            )
+        }
+    }
+}
+
+impl<'ll, 'tcx> BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     fn type_i8(&self) -> &'ll Type {
         unsafe { llvm::LLVMInt8TypeInContext(self.llcx) }
     }
@@ -156,6 +169,10 @@ impl<'ll, 'tcx> BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         self.isize_ty
     }
 
+    fn type_f16(&self) -> &'ll Type {
+        unsafe { llvm::LLVMHalfTypeInContext(self.llcx) }
+    }
+
     fn type_f32(&self) -> &'ll Type {
         unsafe { llvm::LLVMFloatTypeInContext(self.llcx) }
     }
@@ -164,19 +181,12 @@ impl<'ll, 'tcx> BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         unsafe { llvm::LLVMDoubleTypeInContext(self.llcx) }
     }
 
-    fn type_func(&self, args: &[&'ll Type], ret: &'ll Type) -> &'ll Type {
-        unsafe { llvm::LLVMFunctionType(ret, args.as_ptr(), args.len() as c_uint, False) }
+    fn type_f128(&self) -> &'ll Type {
+        unsafe { llvm::LLVMFP128TypeInContext(self.llcx) }
     }
 
-    fn type_struct(&self, els: &[&'ll Type], packed: bool) -> &'ll Type {
-        unsafe {
-            llvm::LLVMStructTypeInContext(
-                self.llcx,
-                els.as_ptr(),
-                els.len() as c_uint,
-                packed as Bool,
-            )
-        }
+    fn type_func(&self, args: &[&'ll Type], ret: &'ll Type) -> &'ll Type {
+        unsafe { llvm::LLVMFunctionType(ret, args.as_ptr(), args.len() as c_uint, False) }
     }
 
     fn type_kind(&self, ty: &'ll Type) -> TypeKind {
@@ -195,7 +205,7 @@ impl<'ll, 'tcx> BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         match self.type_kind(ty) {
             TypeKind::Array | TypeKind::Vector => unsafe { llvm::LLVMGetElementType(ty) },
             TypeKind::Pointer => bug!("element_type is not supported for opaque pointers"),
-            other => bug!("element_type called on unsupported type {:?}", other),
+            other => bug!("element_type called on unsupported type {other:?}"),
         }
     }
 
@@ -205,11 +215,12 @@ impl<'ll, 'tcx> BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
 
     fn float_width(&self, ty: &'ll Type) -> usize {
         match self.type_kind(ty) {
+            TypeKind::Half => 16,
             TypeKind::Float => 32,
             TypeKind::Double => 64,
             TypeKind::X86_FP80 => 80,
             TypeKind::FP128 | TypeKind::PPC_FP128 => 128,
-            _ => bug!("llvm_float_width called on a non-float type"),
+            other => bug!("llvm_float_width called on a non-float type {other:?}"),
         }
     }
 
@@ -222,7 +233,7 @@ impl<'ll, 'tcx> BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     }
 
     fn type_array(&self, ty: &'ll Type, len: u64) -> &'ll Type {
-        unsafe { llvm::LLVMRustArrayType(ty, len) }
+        unsafe { llvm::LLVMArrayType2(ty, len) }
     }
 }
 
@@ -250,9 +261,6 @@ impl<'ll, 'tcx> LayoutTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     fn is_backend_scalar_pair(&self, layout: TyAndLayout<'tcx>) -> bool {
         layout.is_llvm_scalar_pair()
     }
-    fn backend_field_index(&self, layout: TyAndLayout<'tcx>, index: usize) -> u64 {
-        layout.llvm_field_index(self, index)
-    }
     fn scalar_pair_element_backend_type(
         &self,
         layout: TyAndLayout<'tcx>,
@@ -272,9 +280,6 @@ impl<'ll, 'tcx> LayoutTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     }
     fn reg_backend_type(&self, ty: &Reg) -> &'ll Type {
         ty.llvm_type(self)
-    }
-    fn scalar_copy_backend_type(&self, layout: TyAndLayout<'tcx>) -> Option<Self::Type> {
-        layout.scalar_copy_llvm_type(self)
     }
 }
 

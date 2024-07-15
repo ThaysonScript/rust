@@ -26,20 +26,23 @@ use rustc_codegen_ssa::debuginfo::type_names::VTableNameKind;
 use rustc_codegen_ssa::traits::*;
 use rustc_fs_util::path_to_c_string;
 use rustc_hir::def::CtorKind;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::bug;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::{
-    self, AdtKind, Instance, ParamEnv, PolyExistentialTraitRef, Ty, TyCtxt, Visibility,
+    self, AdtKind, CoroutineArgsExt, Instance, ParamEnv, PolyExistentialTraitRef, Ty, TyCtxt,
+    Visibility,
 };
 use rustc_session::config::{self, DebugInfo, Lto};
 use rustc_span::symbol::Symbol;
-use rustc_span::FileName;
+use rustc_span::{hygiene, FileName, DUMMY_SP};
 use rustc_span::{FileNameDisplayPreference, SourceFile};
 use rustc_symbol_mangling::typeid_for_trait_ref;
 use rustc_target::abi::{Align, Size};
 use rustc_target::spec::DebuginfoKind;
 use smallvec::smallvec;
+use tracing::{debug, instrument};
 
 use libc::{c_char, c_longlong, c_uint};
 use std::borrow::Cow;
@@ -451,12 +454,16 @@ pub fn type_di_node<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, t: Ty<'tcx>) -> &'ll D
         ty::Slice(_) | ty::Str => build_slice_type_di_node(cx, t, unique_type_id),
         ty::Dynamic(..) => build_dyn_type_di_node(cx, t, unique_type_id),
         ty::Foreign(..) => build_foreign_type_di_node(cx, t, unique_type_id),
-        ty::RawPtr(ty::TypeAndMut { ty: pointee_type, .. }) | ty::Ref(_, pointee_type, _) => {
+        ty::RawPtr(pointee_type, _) | ty::Ref(_, pointee_type, _) => {
             build_pointer_or_reference_di_node(cx, t, pointee_type, unique_type_id)
         }
-        // Box<T, A> may have a non-1-ZST allocator A. In that case, we
-        // cannot treat Box<T, A> as just an owned alias of `*mut T`.
-        ty::Adt(def, args) if def.is_box() && cx.layout_of(args.type_at(1)).is_1zst() => {
+        // Some `Box` are newtyped pointers, make debuginfo aware of that.
+        // Only works if the allocator argument is a 1-ZST and hence irrelevant for layout
+        // (or if there is no allocator argument).
+        ty::Adt(def, args)
+            if def.is_box()
+                && args.get(1).map_or(true, |arg| cx.layout_of(arg.expect_ty()).is_1zst()) =>
+        {
             build_pointer_or_reference_di_node(cx, t, t.boxed_ty(), unique_type_id)
         }
         ty::FnDef(..) | ty::FnPtr(_) => build_subroutine_type_di_node(cx, unique_type_id),
@@ -549,13 +556,16 @@ pub fn file_metadata<'ll>(cx: &CodegenCx<'ll, '_>, source_file: &SourceFile) -> 
     ) -> &'ll DIFile {
         debug!(?source_file.name);
 
-        use rustc_session::RemapFileNameExt;
+        let filename_display_preference =
+            cx.sess().filename_display_preference(RemapPathScopeComponents::DEBUGINFO);
+
+        use rustc_session::config::RemapPathScopeComponents;
         let (directory, file_name) = match &source_file.name {
             FileName::Real(filename) => {
                 let working_directory = &cx.sess().opts.working_dir;
                 debug!(?working_directory);
 
-                if cx.sess().should_prefer_remapped_for_codegen() {
+                if filename_display_preference == FileNameDisplayPreference::Remapped {
                     let filename = cx
                         .sess()
                         .source_map()
@@ -618,7 +628,7 @@ pub fn file_metadata<'ll>(cx: &CodegenCx<'ll, '_>, source_file: &SourceFile) -> 
             }
             other => {
                 debug!(?other);
-                ("".into(), other.for_codegen(cx.sess()).to_string_lossy().into_owned())
+                ("".into(), other.display(filename_display_preference).to_string())
             }
         };
 
@@ -695,11 +705,49 @@ impl MsvcBasicName for ty::UintTy {
 
 impl MsvcBasicName for ty::FloatTy {
     fn msvc_basic_name(self) -> &'static str {
+        // FIXME(f16_f128): `f16` and `f128` have no MSVC representation. We could improve the
+        // debuginfo. See: <https://github.com/rust-lang/rust/issues/121837>
         match self {
+            ty::FloatTy::F16 => {
+                bug!("`f16` should have been handled in `build_basic_type_di_node`")
+            }
             ty::FloatTy::F32 => "float",
             ty::FloatTy::F64 => "double",
+            ty::FloatTy::F128 => "fp128",
         }
     }
+}
+
+fn build_cpp_f16_di_node<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>) -> DINodeCreationResult<'ll> {
+    // MSVC has no native support for `f16`. Instead, emit `struct f16 { bits: u16 }` to allow the
+    // `f16`'s value to be displayed using a Natvis visualiser in `intrinsic.natvis`.
+    let float_ty = cx.tcx.types.f16;
+    let bits_ty = cx.tcx.types.u16;
+    type_map::build_type_with_children(
+        cx,
+        type_map::stub(
+            cx,
+            Stub::Struct,
+            UniqueTypeId::for_ty(cx.tcx, float_ty),
+            "f16",
+            cx.size_and_align_of(float_ty),
+            NO_SCOPE_METADATA,
+            DIFlags::FlagZero,
+        ),
+        // Fields:
+        |cx, float_di_node| {
+            smallvec![build_field_di_node(
+                cx,
+                float_di_node,
+                "bits",
+                cx.size_and_align_of(bits_ty),
+                Size::ZERO,
+                DIFlags::FlagZero,
+                type_di_node(cx, bits_ty),
+            )]
+        },
+        NO_GENERICS,
+    )
 }
 
 fn build_basic_type_di_node<'ll, 'tcx>(
@@ -725,6 +773,9 @@ fn build_basic_type_di_node<'ll, 'tcx>(
         ty::Char => ("char", DW_ATE_UTF),
         ty::Int(int_ty) if cpp_like_debuginfo => (int_ty.msvc_basic_name(), DW_ATE_signed),
         ty::Uint(uint_ty) if cpp_like_debuginfo => (uint_ty.msvc_basic_name(), DW_ATE_unsigned),
+        ty::Float(ty::FloatTy::F16) if cpp_like_debuginfo => {
+            return build_cpp_f16_di_node(cx);
+        }
         ty::Float(float_ty) if cpp_like_debuginfo => (float_ty.msvc_basic_name(), DW_ATE_float),
         ty::Int(int_ty) => (int_ty.name_str(), DW_ATE_signed),
         ty::Uint(uint_ty) => (uint_ty.name_str(), DW_ATE_unsigned),
@@ -823,9 +874,11 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
     codegen_unit_name: &str,
     debug_context: &CodegenUnitDebugContext<'ll, 'tcx>,
 ) -> &'ll DIDescriptor {
+    use rustc_session::{config::RemapPathScopeComponents, RemapFileNameExt};
     let mut name_in_debuginfo = tcx
         .sess
         .local_crate_source_file()
+        .map(|src| src.for_scope(&tcx.sess, RemapPathScopeComponents::DEBUGINFO).to_path_buf())
         .unwrap_or_else(|| PathBuf::from(tcx.crate_name(LOCAL_CRATE).as_str()));
 
     // To avoid breaking split DWARF, we need to ensure that each codegen unit
@@ -853,30 +906,29 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
     // FIXME(#41252) Remove "clang LLVM" if we can get GDB and LLVM to play nice.
     let producer = format!("clang LLVM ({rustc_producer})");
 
-    use rustc_session::RemapFileNameExt;
     let name_in_debuginfo = name_in_debuginfo.to_string_lossy();
-    let work_dir = tcx.sess.opts.working_dir.for_codegen(tcx.sess).to_string_lossy();
+    let work_dir = tcx
+        .sess
+        .opts
+        .working_dir
+        .for_scope(tcx.sess, RemapPathScopeComponents::DEBUGINFO)
+        .to_string_lossy();
     let output_filenames = tcx.output_filenames(());
-    let split_name = if tcx.sess.target_can_use_split_dwarf() {
-        output_filenames
-            .split_dwarf_path(
-                tcx.sess.split_debuginfo(),
-                tcx.sess.opts.unstable_opts.split_dwarf_kind,
-                Some(codegen_unit_name),
-            )
-            // We get a path relative to the working directory from split_dwarf_path
-            .map(|f| {
-                if tcx.sess.should_prefer_remapped_for_split_debuginfo_paths() {
-                    tcx.sess.source_map().path_mapping().map_prefix(f).0
-                } else {
-                    f.into()
-                }
-            })
+    let split_name = if tcx.sess.target_can_use_split_dwarf()
+        && let Some(f) = output_filenames.split_dwarf_path(
+            tcx.sess.split_debuginfo(),
+            tcx.sess.opts.unstable_opts.split_dwarf_kind,
+            Some(codegen_unit_name),
+        ) {
+        // We get a path relative to the working directory from split_dwarf_path
+        Some(tcx.sess.source_map().path_mapping().to_real_filename(f))
     } else {
         None
-    }
-    .unwrap_or_default();
-    let split_name = split_name.to_str().unwrap();
+    };
+    let split_name = split_name
+        .as_ref()
+        .map(|f| f.for_scope(tcx.sess, RemapPathScopeComponents::DEBUGINFO).to_string_lossy())
+        .unwrap_or_default();
     let kind = DebugEmissionKind::from_generic(tcx.sess.opts.debuginfo);
 
     let dwarf_version =
@@ -1268,7 +1320,7 @@ fn build_generic_type_param_di_nodes<'ll, 'tcx>(
         let mut names = generics
             .parent
             .map_or_else(Vec::new, |def_id| get_parameter_names(cx, cx.tcx.generics_of(def_id)));
-        names.extend(generics.params.iter().map(|param| param.name));
+        names.extend(generics.own_params.iter().map(|param| param.name));
         names
     }
 }
@@ -1291,7 +1343,7 @@ pub fn build_global_var_di_node<'ll>(cx: &CodegenCx<'ll, '_>, def_id: DefId, glo
     // We may want to remove the namespace scope if we're in an extern block (see
     // https://github.com/rust-lang/rust/pull/46457#issuecomment-351750952).
     let var_scope = get_namespace_for_item(cx, def_id);
-    let span = tcx.def_span(def_id);
+    let span = hygiene::walk_chain_collapsed(tcx.def_span(def_id), DUMMY_SP);
 
     let (file_metadata, line_number) = if !span.is_dummy() {
         let loc = cx.lookup_debug_loc(span.lo());
@@ -1301,6 +1353,11 @@ pub fn build_global_var_di_node<'ll>(cx: &CodegenCx<'ll, '_>, def_id: DefId, glo
     };
 
     let is_local_to_unit = is_node_local_to_unit(cx, def_id);
+
+    let DefKind::Static { nested, .. } = cx.tcx.def_kind(def_id) else { bug!() };
+    if nested {
+        return;
+    }
     let variable_type = Instance::mono(cx.tcx, def_id).ty(cx.tcx, ty::ParamEnv::reveal_all());
     let type_di_node = type_di_node(cx, variable_type);
     let var_name = tcx.item_name(def_id);
@@ -1429,12 +1486,18 @@ fn build_vtable_type_di_node<'ll, 'tcx>(
     .di_node
 }
 
-fn vcall_visibility_metadata<'ll, 'tcx>(
+pub(crate) fn apply_vcall_visibility_metadata<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
     ty: Ty<'tcx>,
     trait_ref: Option<PolyExistentialTraitRef<'tcx>>,
     vtable: &'ll Value,
 ) {
+    // FIXME(flip1995): The virtual function elimination optimization only works with full LTO in
+    // LLVM at the moment.
+    if !cx.sess().opts.unstable_opts.virtual_function_elimination || cx.sess().lto() != Lto::Fat {
+        return;
+    }
+
     enum VCallVisibility {
         Public = 0,
         LinkageUnit = 1,
@@ -1511,12 +1574,6 @@ pub fn create_vtable_di_node<'ll, 'tcx>(
     poly_trait_ref: Option<ty::PolyExistentialTraitRef<'tcx>>,
     vtable: &'ll Value,
 ) {
-    // FIXME(flip1995): The virtual function elimination optimization only works with full LTO in
-    // LLVM at the moment.
-    if cx.sess().opts.unstable_opts.virtual_function_elimination && cx.sess().lto() == Lto::Fat {
-        vcall_visibility_metadata(cx, ty, poly_trait_ref, vtable);
-    }
-
     if cx.dbg_cx.is_none() {
         return;
     }

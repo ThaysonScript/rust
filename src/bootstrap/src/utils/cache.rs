@@ -9,10 +9,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::Mutex;
-
-// FIXME: replace with std::lazy after it gets stabilized and reaches beta
-use once_cell::sync::Lazy;
+use std::sync::{LazyLock, Mutex};
 
 use crate::core::builder::Step;
 
@@ -194,20 +191,9 @@ impl Interner {
     pub fn intern_str(&self, s: &str) -> Interned<String> {
         self.strs.lock().unwrap().intern_borrow(s)
     }
-    pub fn intern_string(&self, s: String) -> Interned<String> {
-        self.strs.lock().unwrap().intern(s)
-    }
-
-    pub fn intern_path(&self, s: PathBuf) -> Interned<PathBuf> {
-        self.paths.lock().unwrap().intern(s)
-    }
-
-    pub fn intern_list(&self, v: Vec<String>) -> Interned<Vec<String>> {
-        self.lists.lock().unwrap().intern(v)
-    }
 }
 
-pub static INTERNER: Lazy<Interner> = Lazy::new(Interner::default);
+pub static INTERNER: LazyLock<Interner> = LazyLock::new(Interner::default);
 
 /// This is essentially a `HashMap` which allows storing any type in its input and
 /// any type in its output. It is a write-once cache; values are never evicted,

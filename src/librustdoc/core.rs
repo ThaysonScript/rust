@@ -1,9 +1,9 @@
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::unord::UnordSet;
-use rustc_errors::emitter::{DynEmitter, HumanEmitter};
+use rustc_errors::emitter::{stderr_destination, DynEmitter, HumanEmitter};
 use rustc_errors::json::JsonEmitter;
-use rustc_errors::{codes::*, ErrorGuaranteed, TerminalUrl};
+use rustc_errors::{codes::*, DiagCtxtHandle, ErrorGuaranteed, TerminalUrl};
 use rustc_feature::UnstableFeatures;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::{DefId, DefIdMap, DefIdSet, LocalDefId};
@@ -20,6 +20,7 @@ use rustc_span::symbol::sym;
 use rustc_span::{source_map, Span};
 
 use std::cell::RefCell;
+use std::io;
 use std::mem;
 use std::rc::Rc;
 use std::sync::LazyLock;
@@ -31,7 +32,7 @@ use crate::config::{Options as RustdocOptions, OutputFormat, RenderOptions};
 use crate::formats::cache::Cache;
 use crate::passes::{self, Condition::*};
 
-pub(crate) use rustc_session::config::{Input, Options, UnstableOptions};
+pub(crate) use rustc_session::config::{Options, UnstableOptions};
 
 pub(crate) struct DocContext<'tcx> {
     pub(crate) tcx: TyCtxt<'tcx>,
@@ -141,7 +142,7 @@ pub(crate) fn new_dcx(
         ErrorOutputType::HumanReadable(kind) => {
             let (short, color_config) = kind.unzip();
             Box::new(
-                HumanEmitter::stderr(color_config, fallback_bundle)
+                HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
                     .sm(source_map.map(|sm| sm as _))
                     .short_message(short)
                     .teach(unstable_opts.teach)
@@ -155,24 +156,22 @@ pub(crate) fn new_dcx(
                 Lrc::new(source_map::SourceMap::new(source_map::FilePathMapping::empty()))
             });
             Box::new(
-                JsonEmitter::stderr(
-                    None,
+                JsonEmitter::new(
+                    Box::new(io::BufWriter::new(io::stderr())),
                     source_map,
-                    None,
                     fallback_bundle,
                     pretty,
                     json_rendered,
-                    diagnostic_width,
-                    false,
-                    unstable_opts.track_diagnostics,
-                    TerminalUrl::No,
                 )
-                .ui_testing(unstable_opts.ui_testing),
+                .ui_testing(unstable_opts.ui_testing)
+                .diagnostic_width(diagnostic_width)
+                .track_diagnostics(unstable_opts.track_diagnostics)
+                .terminal_url(TerminalUrl::No),
             )
         }
     };
 
-    rustc_errors::DiagCtxt::with_emitter(emitter).with_flags(unstable_opts.dcx_flags(true))
+    rustc_errors::DiagCtxt::new(emitter).with_flags(unstable_opts.dcx_flags(true))
 }
 
 /// Parse, resolve, and typecheck the given crate.
@@ -204,8 +203,6 @@ pub(crate) fn create_config(
 ) -> rustc_interface::Config {
     // Add the doc cfg into the doc build.
     cfgs.push("doc".to_string());
-
-    let input = Input::File(input);
 
     // By default, rustdoc ignores all lints.
     // Specifically unblock lints relevant to documentation or the lint machinery itself.
@@ -264,7 +261,7 @@ pub(crate) fn create_config(
         file_loader: None,
         locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES,
         lint_caps,
-        parse_sess_created: None,
+        psess_created: None,
         hash_untracked_state: None,
         register_lints: Some(Box::new(crate::lint::register_lints)),
         override_queries: Some(|_sess, providers| {
@@ -287,9 +284,9 @@ pub(crate) fn create_config(
                 }
 
                 let hir = tcx.hir();
-                let body = hir.body(hir.body_owned_by(def_id));
+                let body = hir.body_owned_by(def_id);
                 debug!("visiting body for {def_id:?}");
-                EmitIgnoredResolutionErrors::new(tcx).visit_body(body);
+                EmitIgnoredResolutionErrors::new(tcx).visit_body(&body);
                 (rustc_interface::DEFAULT_QUERY_PROVIDERS.typeck)(tcx, def_id)
             };
         }),
@@ -315,20 +312,9 @@ pub(crate) fn run_global_ctxt(
     // typeck function bodies or run the default rustc lints.
     // (see `override_queries` in the `config`)
 
-    // HACK(jynelson) this calls an _extremely_ limited subset of `typeck`
-    // and might break if queries change their assumptions in the future.
-    tcx.sess.time("type_collecting", || {
-        tcx.hir().for_each_module(|module| tcx.ensure().collect_mod_item_types(module))
-    });
-
     // NOTE: These are copy/pasted from typeck/lib.rs and should be kept in sync with those changes.
     let _ = tcx.sess.time("wf_checking", || {
         tcx.hir().try_par_for_each_module(|module| tcx.ensure().check_mod_type_wf(module))
-    });
-    tcx.sess.time("item_types_checking", || {
-        tcx.hir().for_each_module(|module| {
-            let _ = tcx.ensure().check_mod_type_wf(module);
-        });
     });
 
     if let Some(guar) = tcx.dcx().has_errors() {
@@ -386,14 +372,14 @@ pub(crate) fn run_global_ctxt(
         tcx.node_lint(
             crate::lint::MISSING_CRATE_LEVEL_DOCS,
             DocContext::as_local_hir_id(tcx, krate.module.item_id).unwrap(),
-            "no documentation found for this crate's top-level module",
             |lint| {
+                lint.primary_message("no documentation found for this crate's top-level module");
                 lint.help(help);
             },
         );
     }
 
-    fn report_deprecated_attr(name: &str, dcx: &rustc_errors::DiagCtxt, sp: Span) {
+    fn report_deprecated_attr(name: &str, dcx: DiagCtxtHandle<'_>, sp: Span) {
         let mut msg =
             dcx.struct_span_warn(sp, format!("the `#![doc({name})]` attribute is deprecated"));
         msg.note(
@@ -521,7 +507,7 @@ impl<'tcx> Visitor<'tcx> for EmitIgnoredResolutionErrors<'tcx> {
 
 /// `DefId` or parameter index (`ty::ParamTy.index`) of a synthetic type parameter
 /// for `impl Trait` in argument position.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ImplTraitParam {
     DefId(DefId),
     ParamIndex(u32),

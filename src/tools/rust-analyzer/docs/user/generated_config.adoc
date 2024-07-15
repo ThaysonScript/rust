@@ -9,15 +9,25 @@ for enum variants.
 --
 Placeholder expression to use for missing expressions in assists.
 --
+[[rust-analyzer.assist.termSearch.fuel]]rust-analyzer.assist.termSearch.fuel (default: `400`)::
++
+--
+Term search fuel in "units of work" for assists (Defaults to 400).
+--
 [[rust-analyzer.cachePriming.enable]]rust-analyzer.cachePriming.enable (default: `true`)::
 +
 --
 Warm up caches on project load.
 --
-[[rust-analyzer.cachePriming.numThreads]]rust-analyzer.cachePriming.numThreads (default: `0`)::
+[[rust-analyzer.cachePriming.numThreads]]rust-analyzer.cachePriming.numThreads (default: `"physical"`)::
 +
 --
 How many worker threads to handle priming caches. The default `0` means to pick automatically.
+--
+[[rust-analyzer.cargo.allTargets]]rust-analyzer.cargo.allTargets (default: `true`)::
++
+--
+Pass `--all-targets` to cargo invocation.
 --
 [[rust-analyzer.cargo.autoreload]]rust-analyzer.cargo.autoreload (default: `true`)::
 +
@@ -83,10 +93,18 @@ or build-script sources change and are saved.
 Use `RUSTC_WRAPPER=rust-analyzer` when running build scripts to
 avoid checking unnecessary things.
 --
-[[rust-analyzer.cargo.cfgs]]rust-analyzer.cargo.cfgs (default: `{}`)::
+[[rust-analyzer.cargo.cfgs]]rust-analyzer.cargo.cfgs::
 +
 --
+Default:
+----
+{
+  "debug_assertions": null,
+  "miri": null
+}
+----
 List of cfg options to enable with the given values.
+
 --
 [[rust-analyzer.cargo.extraArgs]]rust-analyzer.cargo.extraArgs (default: `[]`)::
 +
@@ -144,20 +162,26 @@ This option does not take effect until rust-analyzer is restarted.
 --
 Compilation target override (target triple).
 --
-[[rust-analyzer.cargo.unsetTest]]rust-analyzer.cargo.unsetTest (default: `["core"]`)::
+[[rust-analyzer.cargo.targetDir]]rust-analyzer.cargo.targetDir (default: `null`)::
 +
 --
-Unsets the implicit `#[cfg(test)]` for the specified crates.
+Optional path to a rust-analyzer specific target directory.
+This prevents rust-analyzer's `cargo check` and initial build-script and proc-macro
+building from locking the `Cargo.lock` at the expense of duplicating build artifacts.
+
+Set to `true` to use a subdirectory of the existing target directory or
+set to a path relative to the workspace to use that path.
 --
 [[rust-analyzer.checkOnSave]]rust-analyzer.checkOnSave (default: `true`)::
 +
 --
 Run the check command for diagnostics on save.
 --
-[[rust-analyzer.check.allTargets]]rust-analyzer.check.allTargets (default: `true`)::
+[[rust-analyzer.check.allTargets]]rust-analyzer.check.allTargets (default: `null`)::
 +
 --
-Check all targets and tests (`--all-targets`).
+Check all targets and tests (`--all-targets`). Defaults to
+`#rust-analyzer.cargo.allTargets#`.
 --
 [[rust-analyzer.check.command]]rust-analyzer.check.command (default: `"check"`)::
 +
@@ -237,7 +261,7 @@ by changing `#rust-analyzer.check.invocationStrategy#` and
 If `$saved_file` is part of the command, rust-analyzer will pass
 the absolute path of the saved file to the provided command. This is
 intended to be used with non-Cargo build systems.
-Note that `$saved_file` is experimental and may be removed in the futureg.
+Note that `$saved_file` is experimental and may be removed in the future.
 
 An example command would be:
 
@@ -305,46 +329,46 @@ Enables completions of private items and fields that are defined in the current 
 Default:
 ----
 {
-            "Arc::new": {
-                "postfix": "arc",
-                "body": "Arc::new(${receiver})",
-                "requires": "std::sync::Arc",
-                "description": "Put the expression into an `Arc`",
-                "scope": "expr"
-            },
-            "Rc::new": {
-                "postfix": "rc",
-                "body": "Rc::new(${receiver})",
-                "requires": "std::rc::Rc",
-                "description": "Put the expression into an `Rc`",
-                "scope": "expr"
-            },
-            "Box::pin": {
-                "postfix": "pinbox",
-                "body": "Box::pin(${receiver})",
-                "requires": "std::boxed::Box",
-                "description": "Put the expression into a pinned `Box`",
-                "scope": "expr"
-            },
-            "Ok": {
-                "postfix": "ok",
-                "body": "Ok(${receiver})",
-                "description": "Wrap the expression in a `Result::Ok`",
-                "scope": "expr"
-            },
-            "Err": {
-                "postfix": "err",
-                "body": "Err(${receiver})",
-                "description": "Wrap the expression in a `Result::Err`",
-                "scope": "expr"
-            },
-            "Some": {
-                "postfix": "some",
-                "body": "Some(${receiver})",
-                "description": "Wrap the expression in an `Option::Some`",
-                "scope": "expr"
-            }
-        }
+  "Arc::new": {
+    "postfix": "arc",
+    "body": "Arc::new(${receiver})",
+    "requires": "std::sync::Arc",
+    "description": "Put the expression into an `Arc`",
+    "scope": "expr"
+  },
+  "Rc::new": {
+    "postfix": "rc",
+    "body": "Rc::new(${receiver})",
+    "requires": "std::rc::Rc",
+    "description": "Put the expression into an `Rc`",
+    "scope": "expr"
+  },
+  "Box::pin": {
+    "postfix": "pinbox",
+    "body": "Box::pin(${receiver})",
+    "requires": "std::boxed::Box",
+    "description": "Put the expression into a pinned `Box`",
+    "scope": "expr"
+  },
+  "Ok": {
+    "postfix": "ok",
+    "body": "Ok(${receiver})",
+    "description": "Wrap the expression in a `Result::Ok`",
+    "scope": "expr"
+  },
+  "Err": {
+    "postfix": "err",
+    "body": "Err(${receiver})",
+    "description": "Wrap the expression in a `Result::Err`",
+    "scope": "expr"
+  },
+  "Some": {
+    "postfix": "some",
+    "body": "Some(${receiver})",
+    "description": "Wrap the expression in an `Option::Some`",
+    "scope": "expr"
+  }
+}
 ----
 Custom completion snippets.
 
@@ -353,6 +377,11 @@ Custom completion snippets.
 +
 --
 Whether to enable term search based snippets like `Some(foo.bar().baz())`.
+--
+[[rust-analyzer.completion.termSearch.fuel]]rust-analyzer.completion.termSearch.fuel (default: `200`)::
++
+--
+Term search fuel in "units of work" for autocompletion (Defaults to 200).
 --
 [[rust-analyzer.diagnostics.disabled]]rust-analyzer.diagnostics.disabled (default: `[]`)::
 +
@@ -375,6 +404,11 @@ have more false positives than usual.
 --
 Map of prefixes to be substituted when parsing diagnostic file paths.
 This should be the reverse mapping of what is passed to `rustc` as `--remap-path-prefix`.
+--
+[[rust-analyzer.diagnostics.styleLints.enable]]rust-analyzer.diagnostics.styleLints.enable (default: `false`)::
++
+--
+Whether to run additional style lints.
 --
 [[rust-analyzer.diagnostics.warningsAsHint]]rust-analyzer.diagnostics.warningsAsHint (default: `[]`)::
 +
@@ -504,6 +538,21 @@ How to render the offset information in a memory layout hover.
 +
 --
 How to render the size information in a memory layout hover.
+--
+[[rust-analyzer.hover.show.enumVariants]]rust-analyzer.hover.show.enumVariants (default: `5`)::
++
+--
+How many variants of an enum to display when hovering on. Show none if empty.
+--
+[[rust-analyzer.hover.show.fields]]rust-analyzer.hover.show.fields (default: `5`)::
++
+--
+How many fields of a struct, variant or union to display when hovering on. Show none if empty.
+--
+[[rust-analyzer.hover.show.traitAssocItems]]rust-analyzer.hover.show.traitAssocItems (default: `null`)::
++
+--
+How many associated items of a trait to display when hovering a trait.
 --
 [[rust-analyzer.imports.granularity.enforce]]rust-analyzer.imports.granularity.enforce (default: `false`)::
 +
@@ -744,7 +793,8 @@ Disable project auto-discovery in favor of explicitly specified set
 of projects.
 
 Elements must be paths pointing to `Cargo.toml`,
-`rust-project.json`, or JSON objects in `rust-project.json` format.
+`rust-project.json`, `.rs` files (which will be treated as standalone files) or JSON
+objects in `rust-project.json` format.
 --
 [[rust-analyzer.lru.capacity]]rust-analyzer.lru.capacity (default: `null`)::
 +
@@ -814,15 +864,23 @@ Command to be executed instead of 'cargo' for runnables.
 Additional arguments to be passed to cargo for runnables such as
 tests or binaries. For example, it may be `--release`.
 --
-[[rust-analyzer.rust.analyzerTargetDir]]rust-analyzer.rust.analyzerTargetDir (default: `null`)::
+[[rust-analyzer.runnables.extraTestBinaryArgs]]rust-analyzer.runnables.extraTestBinaryArgs::
 +
 --
-Optional path to a rust-analyzer specific target directory.
-This prevents rust-analyzer's `cargo check` from locking the `Cargo.lock`
-at the expense of duplicating build artifacts.
+Default:
+----
+[
+  "--show-output"
+]
+----
+Additional arguments to be passed through Cargo to launched tests, benchmarks, or
+doc-tests.
 
-Set to `true` to use a subdirectory of the existing target directory or
-set to a path relative to the workspace to use that path.
+Unless the launched target uses a
+[custom test harness](https://doc.rust-lang.org/cargo/reference/cargo-targets.html#the-harness-field),
+they will end up being interpreted as options to
+[`rustc`’s built-in test harness (“libtest”)](https://doc.rust-lang.org/rustc/tests/index.html#cli-arguments).
+
 --
 [[rust-analyzer.rustc.source]]rust-analyzer.rustc.source (default: `null`)::
 +

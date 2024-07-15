@@ -326,7 +326,7 @@ impl VirtualPath {
     }
 
     fn strip_prefix(&self, base: &VirtualPath) -> Option<&RelPath> {
-        <_ as AsRef<std::path::Path>>::as_ref(&self.0)
+        <_ as AsRef<paths::Utf8Path>>::as_ref(&self.0)
             .strip_prefix(&base.0)
             .ok()
             .map(RelPath::new_unchecked)
@@ -384,8 +384,7 @@ impl VirtualPath {
     ///
     /// # Returns
     /// - `None` if `self` ends with `"//"`.
-    /// - `Some((name, None))` if `self`'s base contains no `.`, or only one `.` at
-    /// the start.
+    /// - `Some((name, None))` if `self`'s base contains no `.`, or only one `.` at the start.
     /// - `Some((name, Some(extension))` else.
     ///
     /// # Note

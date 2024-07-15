@@ -334,7 +334,7 @@ error: layout_of(Result<[u32; 0], Packed<NonZero<u16>>>) = Layout {
        }
   --> $DIR/zero-sized-array-enum-niche.rs:37:1
    |
-LL | type NicheLosesToTagged = Result<[u32; 0], Packed<std::num::NonZeroU16>>;
+LL | type NicheLosesToTagged = Result<[u32; 0], Packed<std::num::NonZero<u16>>>;
    | ^^^^^^^^^^^^^^^^^^^^^^^
 
 error: layout_of(Result<[u32; 0], Packed<U16IsZero>>) = Layout {

@@ -1,16 +1,15 @@
+use crate::infer::at::ToTrace;
 use crate::traits::query::evaluate_obligation::InferCtxtExt as _;
-use crate::traits::{self, DefiningAnchor, ObligationCtxt, SelectionContext};
+use crate::traits::{self, Obligation, ObligationCause, ObligationCtxt, SelectionContext};
 
-use crate::traits::TraitEngineExt as _;
 use rustc_hir::def_id::DefId;
 use rustc_hir::lang_items::LangItem;
-use rustc_infer::traits::{Obligation, TraitEngine, TraitEngineExt as _};
+use rustc_macros::extension;
 use rustc_middle::arena::ArenaAllocatable;
 use rustc_middle::infer::canonical::{Canonical, CanonicalQueryResponse, QueryResponse};
 use rustc_middle::traits::query::NoSolution;
-use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
-use rustc_middle::ty::{GenericArg, ToPredicate};
+use rustc_middle::ty::{GenericArg, Upcast};
 use rustc_span::DUMMY_SP;
 
 use std::fmt::Debug;
@@ -19,6 +18,16 @@ pub use rustc_infer::infer::*;
 
 #[extension(pub trait InferCtxtExt<'tcx>)]
 impl<'tcx> InferCtxt<'tcx> {
+    fn can_eq<T: ToTrace<'tcx>>(&self, param_env: ty::ParamEnv<'tcx>, a: T, b: T) -> bool {
+        self.probe(|_| {
+            let ocx = ObligationCtxt::new(self);
+            let Ok(()) = ocx.eq(&ObligationCause::dummy(), param_env, a, b) else {
+                return false;
+            };
+            ocx.select_where_possible().is_empty()
+        })
+    }
+
     fn type_is_copy_modulo_regions(&self, param_env: ty::ParamEnv<'tcx>, ty: Ty<'tcx>) -> bool {
         let ty = self.resolve_vars_if_possible(ty);
 
@@ -49,8 +58,7 @@ impl<'tcx> InferCtxt<'tcx> {
     /// - the parameter environment
     ///
     /// Invokes `evaluate_obligation`, so in the event that evaluating
-    /// `Ty: Trait` causes overflow, EvaluatedToErrStackDependent
-    /// (or EvaluatedToAmbigStackDependent) will be returned.
+    /// `Ty: Trait` causes overflow, EvaluatedToAmbigStackDependent will be returned.
     #[instrument(level = "debug", skip(self, params), ret)]
     fn type_implements_trait(
         &self,
@@ -64,7 +72,7 @@ impl<'tcx> InferCtxt<'tcx> {
             cause: traits::ObligationCause::dummy(),
             param_env,
             recursion_depth: 0,
-            predicate: ty::Binder::dummy(trait_ref).to_predicate(self.tcx),
+            predicate: trait_ref.upcast(self.tcx),
         };
         self.evaluate_obligation(&obligation).unwrap_or(traits::EvaluationResult::EvaluatedToErr)
     }
@@ -95,9 +103,9 @@ impl<'tcx> InferCtxt<'tcx> {
                 ty::TraitRef::new(self.tcx, trait_def_id, [ty]),
             )) {
                 Ok(Some(selection)) => {
-                    let mut fulfill_cx = <dyn TraitEngine<'tcx>>::new(self);
-                    fulfill_cx.register_predicate_obligations(self, selection.nested_obligations());
-                    Some(fulfill_cx.select_all_or_error(self))
+                    let ocx = ObligationCtxt::new_with_diagnostics(self);
+                    ocx.register_obligations(selection.nested_obligations());
+                    Some(ocx.select_all_or_error())
                 }
                 Ok(None) | Err(_) => None,
             }
@@ -133,9 +141,8 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
         R: Debug + TypeFoldable<TyCtxt<'tcx>>,
         Canonical<'tcx, QueryResponse<'tcx, R>>: ArenaAllocatable<'tcx>,
     {
-        let (infcx, key, canonical_inference_vars) = self
-            .with_opaque_type_inference(DefiningAnchor::Bubble)
-            .build_with_canonical(DUMMY_SP, canonical_key);
+        let (infcx, key, canonical_inference_vars) =
+            self.build_with_canonical(DUMMY_SP, canonical_key);
         let ocx = ObligationCtxt::new(&infcx);
         let value = operation(&ocx, key)?;
         ocx.make_canonicalized_query_response(canonical_inference_vars, value)

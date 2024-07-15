@@ -89,10 +89,10 @@ pub struct GlobalStateInner {
     borrow_tracker_method: BorrowTrackerMethod,
     /// Next unused pointer ID (tag).
     next_ptr_tag: BorTag,
-    /// Table storing the "base" tag for each allocation.
-    /// The base tag is the one used for the initial pointer.
+    /// Table storing the "root" tag for each allocation.
+    /// The root tag is the one used for the initial pointer.
     /// We need this in a separate table to handle cyclic statics.
-    base_ptr_tags: FxHashMap<AllocId, BorTag>,
+    root_ptr_tags: FxHashMap<AllocId, BorTag>,
     /// Next unused call ID (for protectors).
     next_call_id: CallId,
     /// All currently protected tags.
@@ -121,13 +121,6 @@ impl VisitProvenance for GlobalStateInner {
 
 /// We need interior mutable access to the global state.
 pub type GlobalState = RefCell<GlobalStateInner>;
-
-/// Indicates which kind of access is being performed.
-#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
-pub enum AccessKind {
-    Read,
-    Write,
-}
 
 impl fmt::Display for AccessKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -182,7 +175,7 @@ impl GlobalStateInner {
         GlobalStateInner {
             borrow_tracker_method,
             next_ptr_tag: BorTag::one(),
-            base_ptr_tags: FxHashMap::default(),
+            root_ptr_tags: FxHashMap::default(),
             next_call_id: NonZero::new(1).unwrap(),
             protected_tags: FxHashMap::default(),
             tracked_pointer_tags,
@@ -199,7 +192,7 @@ impl GlobalStateInner {
         id
     }
 
-    pub fn new_frame(&mut self, machine: &MiriMachine<'_, '_>) -> FrameState {
+    pub fn new_frame(&mut self, machine: &MiriMachine<'_>) -> FrameState {
         let call_id = self.next_call_id;
         trace!("new_frame: Assigning call ID {}", call_id);
         if self.tracked_call_ids.contains(&call_id) {
@@ -220,8 +213,8 @@ impl GlobalStateInner {
         }
     }
 
-    pub fn base_ptr_tag(&mut self, id: AllocId, machine: &MiriMachine<'_, '_>) -> BorTag {
-        self.base_ptr_tags.get(&id).copied().unwrap_or_else(|| {
+    pub fn root_ptr_tag(&mut self, id: AllocId, machine: &MiriMachine<'_>) -> BorTag {
+        self.root_ptr_tags.get(&id).copied().unwrap_or_else(|| {
             let tag = self.new_ptr();
             if self.tracked_pointer_tags.contains(&tag) {
                 machine.emit_diagnostic(NonHaltingDiagnostic::CreatedPointerTag(
@@ -230,14 +223,14 @@ impl GlobalStateInner {
                     None,
                 ));
             }
-            trace!("New allocation {:?} has base tag {:?}", id, tag);
-            self.base_ptr_tags.try_insert(id, tag).unwrap();
+            trace!("New allocation {:?} has rpot tag {:?}", id, tag);
+            self.root_ptr_tags.try_insert(id, tag).unwrap();
             tag
         })
     }
 
-    pub fn remove_unreachable_allocs(&mut self, allocs: &LiveAllocs<'_, '_, '_>) {
-        self.base_ptr_tags.retain(|id, _| allocs.is_live(*id));
+    pub fn remove_unreachable_allocs(&mut self, allocs: &LiveAllocs<'_, '_>) {
+        self.root_ptr_tags.retain(|id, _| allocs.is_live(*id));
     }
 }
 
@@ -267,8 +260,8 @@ impl GlobalStateInner {
         &mut self,
         id: AllocId,
         alloc_size: Size,
-        kind: MemoryKind<machine::MiriMemoryKind>,
-        machine: &MiriMachine<'_, '_>,
+        kind: MemoryKind,
+        machine: &MiriMachine<'_>,
     ) -> AllocState {
         match self.borrow_tracker_method {
             BorrowTrackerMethod::StackedBorrows =>
@@ -283,13 +276,13 @@ impl GlobalStateInner {
     }
 }
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn retag_ptr_value(
         &mut self,
         kind: RetagKind,
-        val: &ImmTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, ImmTy<'tcx, Provenance>> {
+        val: &ImmTy<'tcx>,
+    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let this = self.eval_context_mut();
         let method = this.machine.borrow_tracker.as_ref().unwrap().borrow().borrow_tracker_method;
         match method {
@@ -301,7 +294,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn retag_place_contents(
         &mut self,
         kind: RetagKind,
-        place: &PlaceTy<'tcx, Provenance>,
+        place: &PlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let method = this.machine.borrow_tracker.as_ref().unwrap().borrow().borrow_tracker_method;
@@ -311,10 +304,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    fn protect_place(
-        &mut self,
-        place: &MPlaceTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, MPlaceTy<'tcx, Provenance>> {
+    fn protect_place(&mut self, place: &MPlaceTy<'tcx>) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
         let this = self.eval_context_mut();
         let method = this.machine.borrow_tracker.as_ref().unwrap().borrow().borrow_tracker_method;
         match method {
@@ -334,7 +324,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn give_pointer_debug_name(
         &mut self,
-        ptr: Pointer<Option<Provenance>>,
+        ptr: Pointer,
         nth_parent: u8,
         name: &str,
     ) -> InterpResult<'tcx> {
@@ -361,7 +351,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn on_stack_pop(
         &self,
-        frame: &Frame<'mir, 'tcx, Provenance, FrameExtra<'tcx>>,
+        frame: &Frame<'tcx, Provenance, FrameExtra<'tcx>>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_ref();
         let borrow_tracker = this.machine.borrow_tracker.as_ref().unwrap();
@@ -384,7 +374,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             if matches!(kind, AllocKind::LiveData) {
                 let alloc_extra = this.get_alloc_extra(*alloc_id)?; // can still fail for `extern static`
                 let alloc_borrow_tracker = &alloc_extra.borrow_tracker.as_ref().unwrap();
-                alloc_borrow_tracker.release_protector(&this.machine, borrow_tracker, *tag)?;
+                alloc_borrow_tracker.release_protector(
+                    &this.machine,
+                    borrow_tracker,
+                    *tag,
+                    *alloc_id,
+                )?;
             }
         }
         borrow_tracker.borrow_mut().end_call(&frame.extra);
@@ -433,7 +428,7 @@ impl AllocState {
         alloc_id: AllocId,
         prov_extra: ProvenanceExtra,
         range: AllocRange,
-        machine: &MiriMachine<'_, 'tcx>,
+        machine: &MiriMachine<'tcx>,
     ) -> InterpResult<'tcx> {
         match self {
             AllocState::StackedBorrows(sb) =>
@@ -454,7 +449,7 @@ impl AllocState {
         alloc_id: AllocId,
         prov_extra: ProvenanceExtra,
         range: AllocRange,
-        machine: &MiriMachine<'_, 'tcx>,
+        machine: &MiriMachine<'tcx>,
     ) -> InterpResult<'tcx> {
         match self {
             AllocState::StackedBorrows(sb) =>
@@ -474,14 +469,14 @@ impl AllocState {
         &mut self,
         alloc_id: AllocId,
         prov_extra: ProvenanceExtra,
-        range: AllocRange,
-        machine: &MiriMachine<'_, 'tcx>,
+        size: Size,
+        machine: &MiriMachine<'tcx>,
     ) -> InterpResult<'tcx> {
         match self {
             AllocState::StackedBorrows(sb) =>
-                sb.get_mut().before_memory_deallocation(alloc_id, prov_extra, range, machine),
+                sb.get_mut().before_memory_deallocation(alloc_id, prov_extra, size, machine),
             AllocState::TreeBorrows(tb) =>
-                tb.get_mut().before_memory_deallocation(alloc_id, prov_extra, range, machine),
+                tb.get_mut().before_memory_deallocation(alloc_id, prov_extra, size, machine),
         }
     }
 
@@ -495,13 +490,15 @@ impl AllocState {
     /// Tree Borrows needs to be told when a tag stops being protected.
     pub fn release_protector<'tcx>(
         &self,
-        machine: &MiriMachine<'_, 'tcx>,
+        machine: &MiriMachine<'tcx>,
         global: &GlobalState,
         tag: BorTag,
+        alloc_id: AllocId, // diagnostics
     ) -> InterpResult<'tcx> {
         match self {
             AllocState::StackedBorrows(_sb) => Ok(()),
-            AllocState::TreeBorrows(tb) => tb.borrow_mut().release_protector(machine, global, tag),
+            AllocState::TreeBorrows(tb) =>
+                tb.borrow_mut().release_protector(machine, global, tag, alloc_id),
         }
     }
 }

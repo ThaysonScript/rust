@@ -10,6 +10,7 @@ use rustc_ast::ast;
 use rustc_attr::DeprecatedSince;
 use rustc_hir::{def::CtorKind, def::DefKind, def_id::DefId};
 use rustc_metadata::rendered_const;
+use rustc_middle::bug;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::symbol::sym;
 use rustc_span::{Pos, Symbol};
@@ -153,9 +154,9 @@ impl FromWithTcx<clean::GenericArgs> for GenericArgs {
     fn from_tcx(args: clean::GenericArgs, tcx: TyCtxt<'_>) -> Self {
         use clean::GenericArgs::*;
         match args {
-            AngleBracketed { args, bindings } => GenericArgs::AngleBracketed {
+            AngleBracketed { args, constraints } => GenericArgs::AngleBracketed {
                 args: args.into_vec().into_tcx(tcx),
-                bindings: bindings.into_tcx(tcx),
+                bindings: constraints.into_tcx(tcx),
             },
             Parenthesized { inputs, output } => GenericArgs::Parenthesized {
                 inputs: inputs.into_vec().into_tcx(tcx),
@@ -183,26 +184,26 @@ impl FromWithTcx<clean::Constant> for Constant {
         let expr = constant.expr(tcx);
         let value = constant.value(tcx);
         let is_literal = constant.is_literal(tcx);
-        Constant { type_: (*constant.type_).into_tcx(tcx), expr, value, is_literal }
+        Constant { expr, value, is_literal }
     }
 }
 
-impl FromWithTcx<clean::TypeBinding> for TypeBinding {
-    fn from_tcx(binding: clean::TypeBinding, tcx: TyCtxt<'_>) -> Self {
+impl FromWithTcx<clean::AssocItemConstraint> for TypeBinding {
+    fn from_tcx(constraint: clean::AssocItemConstraint, tcx: TyCtxt<'_>) -> Self {
         TypeBinding {
-            name: binding.assoc.name.to_string(),
-            args: binding.assoc.args.into_tcx(tcx),
-            binding: binding.kind.into_tcx(tcx),
+            name: constraint.assoc.name.to_string(),
+            args: constraint.assoc.args.into_tcx(tcx),
+            binding: constraint.kind.into_tcx(tcx),
         }
     }
 }
 
-impl FromWithTcx<clean::TypeBindingKind> for TypeBindingKind {
-    fn from_tcx(kind: clean::TypeBindingKind, tcx: TyCtxt<'_>) -> Self {
-        use clean::TypeBindingKind::*;
+impl FromWithTcx<clean::AssocItemConstraintKind> for TypeBindingKind {
+    fn from_tcx(kind: clean::AssocItemConstraintKind, tcx: TyCtxt<'_>) -> Self {
+        use clean::AssocItemConstraintKind::*;
         match kind {
             Equality { term } => TypeBindingKind::Equality(term.into_tcx(tcx)),
-            Constraint { bounds } => TypeBindingKind::Constraint(bounds.into_tcx(tcx)),
+            Bound { bounds } => TypeBindingKind::Constraint(bounds.into_tcx(tcx)),
         }
     }
 }
@@ -310,18 +311,23 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
         EnumItem(e) => ItemEnum::Enum(e.into_tcx(tcx)),
         VariantItem(v) => ItemEnum::Variant(v.into_tcx(tcx)),
         FunctionItem(f) => ItemEnum::Function(from_function(f, true, header.unwrap(), tcx)),
-        ForeignFunctionItem(f) => ItemEnum::Function(from_function(f, false, header.unwrap(), tcx)),
+        ForeignFunctionItem(f, _) => {
+            ItemEnum::Function(from_function(f, false, header.unwrap(), tcx))
+        }
         TraitItem(t) => ItemEnum::Trait((*t).into_tcx(tcx)),
         TraitAliasItem(t) => ItemEnum::TraitAlias(t.into_tcx(tcx)),
         MethodItem(m, _) => ItemEnum::Function(from_function(m, true, header.unwrap(), tcx)),
         TyMethodItem(m) => ItemEnum::Function(from_function(m, false, header.unwrap(), tcx)),
         ImplItem(i) => ItemEnum::Impl((*i).into_tcx(tcx)),
         StaticItem(s) => ItemEnum::Static(s.into_tcx(tcx)),
-        ForeignStaticItem(s) => ItemEnum::Static(s.into_tcx(tcx)),
+        ForeignStaticItem(s, _) => ItemEnum::Static(s.into_tcx(tcx)),
         ForeignTypeItem => ItemEnum::ForeignType,
         TypeAliasItem(t) => ItemEnum::TypeAlias(t.into_tcx(tcx)),
         OpaqueTyItem(t) => ItemEnum::OpaqueTy(t.into_tcx(tcx)),
-        ConstantItem(c) => ItemEnum::Constant(c.into_tcx(tcx)),
+        // FIXME(generic_const_items): Add support for generic free consts
+        ConstantItem(_generics, t, c) => {
+            ItemEnum::Constant { type_: (*t).into_tcx(tcx), const_: c.into_tcx(tcx) }
+        }
         MacroItem(m) => ItemEnum::Macro(m.source),
         ProcMacroItem(m) => ItemEnum::ProcMacro(m.into_tcx(tcx)),
         PrimitiveItem(p) => {
@@ -461,7 +467,7 @@ impl FromWithTcx<clean::GenericParamDefKind> for GenericParamDefKind {
                 default: default.map(|x| (*x).into_tcx(tcx)),
                 synthetic,
             },
-            Const { ty, default, is_host_effect: _ } => GenericParamDefKind::Const {
+            Const { ty, default, synthetic: _ } => GenericParamDefKind::Const {
                 type_: (*ty).into_tcx(tcx),
                 default: default.map(|x| *x),
             },
@@ -496,22 +502,26 @@ impl FromWithTcx<clean::WherePredicate> for WherePredicate {
                                     synthetic,
                                 }
                             }
-                            clean::GenericParamDefKind::Const {
-                                ty,
-                                default,
-                                is_host_effect: _,
-                            } => GenericParamDefKind::Const {
-                                type_: (*ty).into_tcx(tcx),
-                                default: default.map(|d| *d),
-                            },
+                            clean::GenericParamDefKind::Const { ty, default, synthetic: _ } => {
+                                GenericParamDefKind::Const {
+                                    type_: (*ty).into_tcx(tcx),
+                                    default: default.map(|d| *d),
+                                }
+                            }
                         };
                         GenericParamDef { name, kind }
                     })
                     .collect(),
             },
-            RegionPredicate { lifetime, bounds } => WherePredicate::RegionPredicate {
+            RegionPredicate { lifetime, bounds } => WherePredicate::LifetimePredicate {
                 lifetime: convert_lifetime(lifetime),
-                bounds: bounds.into_tcx(tcx),
+                outlives: bounds
+                    .iter()
+                    .map(|bound| match bound {
+                        clean::GenericBound::Outlives(lt) => convert_lifetime(*lt),
+                        _ => bug!("found non-outlives-bound on lifetime predicate"),
+                    })
+                    .collect(),
             },
             EqPredicate { lhs, rhs } => {
                 WherePredicate::EqPredicate { lhs: lhs.into_tcx(tcx), rhs: rhs.into_tcx(tcx) }
@@ -532,6 +542,7 @@ impl FromWithTcx<clean::GenericBound> for GenericBound {
                 }
             }
             Outlives(lifetime) => GenericBound::Outlives(convert_lifetime(lifetime)),
+            Use(args) => GenericBound::Use(args.into_iter().map(|arg| arg.to_string()).collect()),
         }
     }
 }
@@ -573,6 +584,10 @@ impl FromWithTcx<clean::Type> for Type {
             Tuple(t) => Type::Tuple(t.into_tcx(tcx)),
             Slice(t) => Type::Slice(Box::new((*t).into_tcx(tcx))),
             Array(t, s) => Type::Array { type_: Box::new((*t).into_tcx(tcx)), len: s.to_string() },
+            clean::Type::Pat(t, p) => Type::Pat {
+                type_: Box::new((*t).into_tcx(tcx)),
+                __pat_unstable_do_not_use: p.to_string(),
+            },
             ImplTrait(g) => Type::ImplTrait(g.into_tcx(tcx)),
             Infer => Type::Infer,
             RawPointer(mutability, type_) => Type::RawPointer {
@@ -615,10 +630,10 @@ impl FromWithTcx<clean::Term> for Term {
 
 impl FromWithTcx<clean::BareFunctionDecl> for FunctionPointer {
     fn from_tcx(bare_decl: clean::BareFunctionDecl, tcx: TyCtxt<'_>) -> Self {
-        let clean::BareFunctionDecl { unsafety, generic_params, decl, abi } = bare_decl;
+        let clean::BareFunctionDecl { safety, generic_params, decl, abi } = bare_decl;
         FunctionPointer {
             header: Header {
-                unsafe_: matches!(unsafety, rustc_hir::Unsafety::Unsafe),
+                unsafe_: matches!(safety, rustc_hir::Safety::Unsafe),
                 const_: false,
                 async_: false,
                 abi: convert_abi(abi),
@@ -647,7 +662,7 @@ impl FromWithTcx<clean::FnDecl> for FnDecl {
 impl FromWithTcx<clean::Trait> for Trait {
     fn from_tcx(trait_: clean::Trait, tcx: TyCtxt<'_>) -> Self {
         let is_auto = trait_.is_auto(tcx);
-        let is_unsafe = trait_.unsafety(tcx) == rustc_hir::Unsafety::Unsafe;
+        let is_unsafe = trait_.safety(tcx) == rustc_hir::Safety::Unsafe;
         let is_object_safe = trait_.is_object_safe(tcx);
         let clean::Trait { items, generics, bounds, .. } = trait_;
         Trait {
@@ -674,7 +689,7 @@ impl FromWithTcx<clean::PolyTrait> for PolyTrait {
 impl FromWithTcx<clean::Impl> for Impl {
     fn from_tcx(impl_: clean::Impl, tcx: TyCtxt<'_>) -> Self {
         let provided_trait_methods = impl_.provided_trait_methods(tcx);
-        let clean::Impl { unsafety, generics, trait_, for_, items, polarity, kind } = impl_;
+        let clean::Impl { safety, generics, trait_, for_, items, polarity, kind } = impl_;
         // FIXME: use something like ImplKind in JSON?
         let (synthetic, blanket_impl) = match kind {
             clean::ImplKind::Normal | clean::ImplKind::FakeVariadic => (false, None),
@@ -686,7 +701,7 @@ impl FromWithTcx<clean::Impl> for Impl {
             ty::ImplPolarity::Negative => true,
         };
         Impl {
-            is_unsafe: unsafety == rustc_hir::Unsafety::Unsafe,
+            is_unsafe: safety == rustc_hir::Safety::Unsafe,
             generics: generics.into_tcx(tcx),
             provided_trait_methods: provided_trait_methods
                 .into_iter()
@@ -816,7 +831,10 @@ impl FromWithTcx<clean::Static> for Static {
         Static {
             type_: stat.type_.into_tcx(tcx),
             mutable: stat.mutability == ast::Mutability::Mut,
-            expr: stat.expr.map(|e| rendered_const(tcx, e)).unwrap_or_default(),
+            expr: stat
+                .expr
+                .map(|e| rendered_const(tcx, tcx.hir().body(e), tcx.hir().body_owner_def_id(e)))
+                .unwrap_or_default(),
         }
     }
 }

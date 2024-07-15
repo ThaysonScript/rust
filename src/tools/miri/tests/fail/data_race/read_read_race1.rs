@@ -1,4 +1,7 @@
 //@compile-flags: -Zmiri-preemption-rate=0.0
+// Avoid accidental synchronization via address reuse inside `thread::spawn`.
+//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
+
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread;
 
@@ -21,7 +24,7 @@ fn main() {
             unsafe { ptr.read() };
             // Then do the atomic access.
             a.load(Ordering::SeqCst);
-            //~^ ERROR: Data race detected between (1) non-atomic read on thread `<unnamed>` and (2) atomic load on thread `<unnamed>`
+            //~^ ERROR: Data race detected between (1) non-atomic read on thread `unnamed-1` and (2) atomic load on thread `unnamed-2`
         });
     });
 }

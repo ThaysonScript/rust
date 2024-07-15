@@ -3,8 +3,8 @@ use std::borrow::Cow;
 use rustc_ast::token::Token;
 use rustc_ast::{Path, Visibility};
 use rustc_errors::{
-    codes::*, AddToDiagnostic, Applicability, DiagCtxt, DiagnosticBuilder, EmissionGuarantee,
-    IntoDiagnostic, Level, SubdiagnosticMessageOp,
+    codes::*, Applicability, Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level,
+    SubdiagMessageOp, Subdiagnostic,
 };
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_session::errors::ExprParenthesesNeeded;
@@ -83,7 +83,7 @@ pub(crate) struct IncorrectSemicolon<'a> {
     #[suggestion(style = "short", code = "", applicability = "machine-applicable")]
     pub span: Span,
     #[help]
-    pub opt_help: Option<()>,
+    pub show_help: bool,
     pub name: &'a str,
 }
 
@@ -558,14 +558,6 @@ pub(crate) struct CatchAfterTry {
 }
 
 #[derive(Diagnostic)]
-#[diag(parse_gen_fn)]
-#[help]
-pub(crate) struct GenFn {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag(parse_comma_after_base_struct)]
 #[note]
 pub(crate) struct CommaAfterBaseStruct {
@@ -859,13 +851,6 @@ pub(crate) struct StructLiteralNotAllowedHereSugg {
 }
 
 #[derive(Diagnostic)]
-#[diag(parse_invalid_interpolated_expression)]
-pub(crate) struct InvalidInterpolatedExpression {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag(parse_invalid_literal_suffix_on_tuple_index)]
 pub(crate) struct InvalidLiteralSuffixOnTupleIndex {
     #[primary_span]
@@ -984,21 +969,13 @@ pub(crate) struct InvalidMetaItem {
     #[primary_span]
     pub span: Span,
     pub token: Token,
-}
-
-#[derive(Diagnostic)]
-#[diag(parse_invalid_meta_item_unquoted_ident)]
-pub(crate) struct InvalidMetaItemUnquotedIdent {
-    #[primary_span]
-    pub span: Span,
-    pub token: Token,
     #[subdiagnostic]
-    pub sugg: InvalidMetaItemSuggQuoteIdent,
+    pub quote_ident_sugg: Option<InvalidMetaItemQuoteIdentSugg>,
 }
 
 #[derive(Subdiagnostic)]
-#[multipart_suggestion(parse_suggestion, applicability = "machine-applicable")]
-pub(crate) struct InvalidMetaItemSuggQuoteIdent {
+#[multipart_suggestion(parse_quote_ident_sugg, applicability = "machine-applicable")]
+pub(crate) struct InvalidMetaItemQuoteIdentSugg {
     #[suggestion_part(code = "\"")]
     pub before: Span,
     #[suggestion_part(code = "\"")]
@@ -1073,12 +1050,12 @@ pub(crate) struct ExpectedIdentifier {
     pub help_cannot_start_number: Option<HelpIdentifierStartsWithNumber>,
 }
 
-impl<'a, G: EmissionGuarantee> IntoDiagnostic<'a, G> for ExpectedIdentifier {
+impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for ExpectedIdentifier {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &'a DiagCtxt, level: Level) -> DiagnosticBuilder<'a, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, G> {
         let token_descr = TokenDescription::from_token(&self.token);
 
-        let mut diag = DiagnosticBuilder::new(
+        let mut diag = Diag::new(
             dcx,
             level,
             match token_descr {
@@ -1101,17 +1078,17 @@ impl<'a, G: EmissionGuarantee> IntoDiagnostic<'a, G> for ExpectedIdentifier {
         diag.arg("token", self.token);
 
         if let Some(sugg) = self.suggest_raw {
-            sugg.add_to_diagnostic(&mut diag);
+            sugg.add_to_diag(&mut diag);
         }
 
-        ExpectedIdentifierFound::new(token_descr, self.span).add_to_diagnostic(&mut diag);
+        ExpectedIdentifierFound::new(token_descr, self.span).add_to_diag(&mut diag);
 
         if let Some(sugg) = self.suggest_remove_comma {
-            sugg.add_to_diagnostic(&mut diag);
+            sugg.add_to_diag(&mut diag);
         }
 
         if let Some(help) = self.help_cannot_start_number {
-            help.add_to_diagnostic(&mut diag);
+            help.add_to_diag(&mut diag);
         }
 
         diag
@@ -1133,12 +1110,12 @@ pub(crate) struct ExpectedSemi {
     pub sugg: ExpectedSemiSugg,
 }
 
-impl<'a, G: EmissionGuarantee> IntoDiagnostic<'a, G> for ExpectedSemi {
+impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for ExpectedSemi {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &'a DiagCtxt, level: Level) -> DiagnosticBuilder<'a, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, G> {
         let token_descr = TokenDescription::from_token(&self.token);
 
-        let mut diag = DiagnosticBuilder::new(
+        let mut diag = Diag::new(
             dcx,
             level,
             match token_descr {
@@ -1162,7 +1139,7 @@ impl<'a, G: EmissionGuarantee> IntoDiagnostic<'a, G> for ExpectedSemi {
             diag.span_label(unexpected_token_label, fluent::parse_label_unexpected_token);
         }
 
-        self.sugg.add_to_diagnostic(&mut diag);
+        self.sugg.add_to_diag(&mut diag);
 
         diag
     }
@@ -1474,11 +1451,11 @@ pub(crate) struct FnTraitMissingParen {
     pub machine_applicable: bool,
 }
 
-impl AddToDiagnostic for FnTraitMissingParen {
-    fn add_to_diagnostic_with<G: EmissionGuarantee, F: SubdiagnosticMessageOp<G>>(
+impl Subdiagnostic for FnTraitMissingParen {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
         self,
-        diag: &mut DiagnosticBuilder<'_, G>,
-        _: F,
+        diag: &mut Diag<'_, G>,
+        _: &F,
     ) {
         diag.span_label(self.span, crate::fluent_generated::parse_fn_trait_missing_paren);
         let applicability = if self.machine_applicable {
@@ -1635,28 +1612,44 @@ pub(crate) struct DefaultNotFollowedByItem {
 
 #[derive(Diagnostic)]
 pub(crate) enum MissingKeywordForItemDefinition {
+    #[diag(parse_missing_enum_for_enum_definition)]
+    Enum {
+        #[primary_span]
+        span: Span,
+        #[suggestion(style = "verbose", applicability = "maybe-incorrect", code = "enum ")]
+        insert_span: Span,
+        ident: Ident,
+    },
+    #[diag(parse_missing_enum_or_struct_for_item_definition)]
+    EnumOrStruct {
+        #[primary_span]
+        span: Span,
+    },
     #[diag(parse_missing_struct_for_struct_definition)]
     Struct {
         #[primary_span]
-        #[suggestion(style = "short", applicability = "maybe-incorrect", code = " struct ")]
         span: Span,
+        #[suggestion(style = "verbose", applicability = "maybe-incorrect", code = "struct ")]
+        insert_span: Span,
         ident: Ident,
     },
     #[diag(parse_missing_fn_for_function_definition)]
     Function {
         #[primary_span]
-        #[suggestion(style = "short", applicability = "maybe-incorrect", code = " fn ")]
         span: Span,
+        #[suggestion(style = "verbose", applicability = "maybe-incorrect", code = "fn ")]
+        insert_span: Span,
         ident: Ident,
     },
     #[diag(parse_missing_fn_for_method_definition)]
     Method {
         #[primary_span]
-        #[suggestion(style = "short", applicability = "maybe-incorrect", code = " fn ")]
         span: Span,
+        #[suggestion(style = "verbose", applicability = "maybe-incorrect", code = "fn ")]
+        insert_span: Span,
         ident: Ident,
     },
-    #[diag(parse_ambiguous_missing_keyword_for_item_definition)]
+    #[diag(parse_missing_fn_or_struct_for_item_definition)]
     Ambiguous {
         #[primary_span]
         span: Span,
@@ -1667,7 +1660,12 @@ pub(crate) enum MissingKeywordForItemDefinition {
 
 #[derive(Subdiagnostic)]
 pub(crate) enum AmbiguousMissingKwForItemSub {
-    #[suggestion(parse_suggestion, applicability = "maybe-incorrect", code = "{snippet}!")]
+    #[suggestion(
+        parse_suggestion,
+        style = "verbose",
+        applicability = "maybe-incorrect",
+        code = "{snippet}!"
+    )]
     SuggestMacro {
         #[primary_span]
         span: Span,
@@ -2002,6 +2000,17 @@ pub enum UnknownPrefixSugg {
         style = "verbose"
     )]
     Whitespace(#[primary_span] Span),
+    #[multipart_suggestion(
+        parse_suggestion_str,
+        applicability = "maybe-incorrect",
+        style = "verbose"
+    )]
+    MeantStr {
+        #[suggestion_part(code = "\"")]
+        start: Span,
+        #[suggestion_part(code = "\"")]
+        end: Span,
+    },
 }
 
 #[derive(Diagnostic)]
@@ -2213,11 +2222,20 @@ pub enum MoreThanOneCharSugg {
         ch: String,
     },
     #[suggestion(parse_use_double_quotes, code = "{sugg}", applicability = "machine-applicable")]
-    Quotes {
+    QuotesFull {
         #[primary_span]
         span: Span,
         is_byte: bool,
         sugg: String,
+    },
+    #[multipart_suggestion(parse_use_double_quotes, applicability = "machine-applicable")]
+    Quotes {
+        #[suggestion_part(code = "{prefix}\"")]
+        start: Span,
+        #[suggestion_part(code = "\"")]
+        end: Span,
+        is_byte: bool,
+        prefix: &'static str,
     },
 }
 
@@ -2357,14 +2375,6 @@ pub(crate) struct UnexpectedLifetimeInPattern {
     #[suggestion(code = "", applicability = "machine-applicable")]
     pub span: Span,
     pub symbol: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag(parse_ref_mut_order_incorrect)]
-pub(crate) struct RefMutOrderIncorrect {
-    #[primary_span]
-    #[suggestion(code = "ref mut", applicability = "machine-applicable")]
-    pub span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -2579,14 +2589,6 @@ pub(crate) struct BadReturnTypeNotationOutput {
 }
 
 #[derive(Diagnostic)]
-#[diag(parse_bad_return_type_notation_dotdot)]
-pub(crate) struct BadReturnTypeNotationDotDot {
-    #[primary_span]
-    #[suggestion(code = "", applicability = "maybe-incorrect")]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag(parse_bad_assoc_type_bounds)]
 pub(crate) struct BadAssocTypeBounds {
     #[primary_span]
@@ -2626,13 +2628,22 @@ pub(crate) struct GenericsInPath {
 }
 
 #[derive(Diagnostic)]
-#[diag(parse_assoc_lifetime)]
+#[diag(parse_lifetime_in_eq_constraint)]
 #[help]
-pub(crate) struct AssocLifetime {
+pub(crate) struct LifetimeInEqConstraint {
     #[primary_span]
-    pub span: Span,
     #[label]
-    pub lifetime: Span,
+    pub span: Span,
+    pub lifetime: Ident,
+    #[label(parse_context_label)]
+    pub binding_label: Span,
+    #[suggestion(
+        parse_colon_sugg,
+        style = "verbose",
+        applicability = "maybe-incorrect",
+        code = ": "
+    )]
+    pub colon_sugg: Span,
 }
 
 #[derive(Diagnostic)]
@@ -2701,12 +2712,13 @@ pub(crate) struct SingleColonImportPath {
 
 #[derive(Diagnostic)]
 #[diag(parse_bad_item_kind)]
-#[help]
 pub(crate) struct BadItemKind {
     #[primary_span]
     pub span: Span,
     pub descr: &'static str,
     pub ctx: &'static str,
+    #[help]
+    pub help: Option<()>,
 }
 
 #[derive(Diagnostic)]
@@ -2981,4 +2993,51 @@ pub(crate) struct InvalidOffsetOf(#[primary_span] pub Span);
 pub(crate) struct AsyncImpl {
     #[primary_span]
     pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_expr_rarrow_call)]
+#[help]
+pub(crate) struct ExprRArrowCall {
+    #[primary_span]
+    #[suggestion(style = "short", applicability = "machine-applicable", code = ".")]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_dot_dot_range_attribute)]
+pub(crate) struct DotDotRangeAttribute {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_invalid_attr_unsafe)]
+#[note]
+pub struct InvalidAttrUnsafe {
+    #[primary_span]
+    pub span: Span,
+    pub name: Path,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_unsafe_attr_outside_unsafe)]
+pub struct UnsafeAttrOutsideUnsafe {
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    #[subdiagnostic]
+    pub suggestion: UnsafeAttrOutsideUnsafeSuggestion,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(
+    parse_unsafe_attr_outside_unsafe_suggestion,
+    applicability = "machine-applicable"
+)]
+pub struct UnsafeAttrOutsideUnsafeSuggestion {
+    #[suggestion_part(code = "unsafe(")]
+    pub left: Span,
+    #[suggestion_part(code = ")")]
+    pub right: Span,
 }

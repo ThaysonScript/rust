@@ -135,6 +135,7 @@ use crate::MirPass;
 use rustc_data_structures::fx::{FxIndexMap, IndexEntry, IndexOccupiedEntry};
 use rustc_index::bit_set::BitSet;
 use rustc_index::interval::SparseIntervalMatrix;
+use rustc_middle::bug;
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
 use rustc_middle::mir::HasLocalDecls;
 use rustc_middle::mir::{dump_mir, PassWhere};
@@ -563,7 +564,7 @@ impl WriteInfo {
                     | Rvalue::ShallowInitBox(op, _) => {
                         self.add_operand(op);
                     }
-                    Rvalue::BinaryOp(_, ops) | Rvalue::CheckedBinaryOp(_, ops) => {
+                    Rvalue::BinaryOp(_, ops) => {
                         for op in [&ops.0, &ops.1] {
                             self.add_operand(op);
                         }
@@ -627,6 +628,12 @@ impl WriteInfo {
                     self.add_operand(&arg.node);
                 }
             }
+            TerminatorKind::TailCall { func, args, .. } => {
+                self.add_operand(func);
+                for arg in args {
+                    self.add_operand(&arg.node);
+                }
+            }
             TerminatorKind::InlineAsm { operands, .. } => {
                 for asm_operand in operands {
                     match asm_operand {
@@ -648,7 +655,8 @@ impl WriteInfo {
                         }
                         InlineAsmOperand::Const { .. }
                         | InlineAsmOperand::SymFn { .. }
-                        | InlineAsmOperand::SymStatic { .. } => (),
+                        | InlineAsmOperand::SymStatic { .. }
+                        | InlineAsmOperand::Label { .. } => {}
                     }
                 }
             }

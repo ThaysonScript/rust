@@ -13,6 +13,7 @@ use rustc_hir::def_id::{LocalDefId, LocalModDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::query::Providers;
+use rustc_middle::span_bug;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::parse::feature_err;
 use rustc_span::{sym, Span, Symbol};
@@ -48,7 +49,7 @@ impl NonConstExpr {
             Self::Match(TryDesugar(_)) => &[sym::const_try],
 
             // All other expressions are allowed.
-            Self::Loop(Loop | While) | Self::Match(Normal | FormatArgs) => &[],
+            Self::Loop(Loop | While) | Self::Match(Normal | Postfix | FormatArgs) => &[],
         };
 
         Some(gates)
@@ -77,6 +78,7 @@ impl<'tcx> CheckConstVisitor<'tcx> {
     }
 
     /// Emits an error when an unsupported expression is found in a const context.
+    #[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
     fn const_check_violated(&self, expr: NonConstExpr, span: Span) {
         let Self { tcx, def_id, const_kind } = *self;
 
@@ -154,16 +156,11 @@ impl<'tcx> CheckConstVisitor<'tcx> {
                 //
                 // FIXME(ecstaticmorse): Maybe this could be incorporated into `feature_err`? This
                 // is a pretty narrow case, however.
-                if tcx.sess.is_nightly_build() {
-                    for gate in missing_secondary {
-                        // FIXME: make this translatable
-                        #[allow(rustc::diagnostic_outside_of_impl)]
-                        #[allow(rustc::untranslatable_diagnostic)]
-                        err.help(format!(
-                            "add `#![feature({gate})]` to the crate attributes to enable"
-                        ));
-                    }
-                }
+                tcx.disabled_nightly_features(
+                    &mut err,
+                    def_id.map(|id| tcx.local_def_id_to_hir_id(id)),
+                    missing_secondary.into_iter().map(|gate| (String::new(), *gate)),
+                );
 
                 err.emit();
             }
@@ -204,7 +201,7 @@ impl<'tcx> Visitor<'tcx> for CheckConstVisitor<'tcx> {
         self.recurse_into(kind, None, |this| intravisit::walk_inline_const(this, block));
     }
 
-    fn visit_body(&mut self, body: &'tcx hir::Body<'tcx>) {
+    fn visit_body(&mut self, body: &hir::Body<'tcx>) {
         let owner = self.tcx.hir().body_owner_def_id(body.id());
         let kind = self.tcx.hir().body_const_context(owner);
         self.recurse_into(kind, Some(owner), |this| intravisit::walk_body(this, body));

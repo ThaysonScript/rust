@@ -3,6 +3,8 @@ use super::OverlapError;
 use crate::traits;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
+use rustc_macros::extension;
+use rustc_middle::bug;
 use rustc_middle::ty::fast_reject::{self, SimplifiedType, TreatParams};
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 
@@ -10,7 +12,7 @@ pub use rustc_middle::traits::specialization_graph::*;
 
 #[derive(Copy, Clone, Debug)]
 pub enum FutureCompatOverlapErrorKind {
-    Issue33140,
+    OrderDepTraitObjects,
     LeakCheck,
 }
 
@@ -103,6 +105,7 @@ impl<'tcx> Children {
                     self_ty: self_ty.has_concrete_skeleton().then_some(self_ty),
                     intercrate_ambiguity_causes: overlap.intercrate_ambiguity_causes,
                     involves_placeholder: overlap.involves_placeholder,
+                    overflowing_predicates: overlap.overflowing_predicates,
                 }
             };
 
@@ -148,10 +151,10 @@ impl<'tcx> Children {
                 {
                     match overlap_kind {
                         ty::ImplOverlapKind::Permitted { marker: _ } => {}
-                        ty::ImplOverlapKind::Issue33140 => {
+                        ty::ImplOverlapKind::FutureCompatOrderDepTraitObjects => {
                             *last_lint_mut = Some(FutureCompatOverlapError {
                                 error: create_overlap_error(overlap),
-                                kind: FutureCompatOverlapErrorKind::Issue33140,
+                                kind: FutureCompatOverlapErrorKind::OrderDepTraitObjects,
                             });
                         }
                     }
@@ -197,7 +200,7 @@ impl<'tcx> Children {
     }
 }
 
-fn iter_children(children: &mut Children) -> impl Iterator<Item = DefId> + '_ {
+fn iter_children(children: &Children) -> impl Iterator<Item = DefId> + '_ {
     let nonblanket = children.non_blanket_impls.iter().flat_map(|(_, v)| v.iter());
     children.blanket_impls.iter().chain(nonblanket).cloned()
 }
@@ -395,7 +398,7 @@ pub(crate) fn assoc_def(
         // associated type. Normally this situation
         // could only arise through a compiler bug --
         // if the user wrote a bad item name, it
-        // should have failed in astconv.
+        // should have failed during HIR ty lowering.
         bug!(
             "No associated type `{}` for {}",
             tcx.item_name(assoc_def_id),

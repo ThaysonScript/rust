@@ -233,8 +233,7 @@ pub const PREC_JUMP: i8 = -30;
 pub const PREC_RANGE: i8 = -10;
 // The range 2..=14 is reserved for AssocOp binary operator precedences.
 pub const PREC_PREFIX: i8 = 50;
-pub const PREC_POSTFIX: i8 = 60;
-pub const PREC_PAREN: i8 = 99;
+pub const PREC_UNAMBIGUOUS: i8 = 60;
 pub const PREC_FORCE_PAREN: i8 = 100;
 
 #[derive(Debug, Clone, Copy)]
@@ -281,6 +280,7 @@ pub enum ExprPrecedence {
     ForLoop,
     Loop,
     Match,
+    PostfixMatch,
     ConstBlock,
     Block,
     TryBlock,
@@ -324,36 +324,35 @@ impl ExprPrecedence {
             | ExprPrecedence::Let
             | ExprPrecedence::Unary => PREC_PREFIX,
 
-            // Unary, postfix
-            ExprPrecedence::Await
-            | ExprPrecedence::Call
-            | ExprPrecedence::MethodCall
-            | ExprPrecedence::Field
-            | ExprPrecedence::Index
-            | ExprPrecedence::Try
-            | ExprPrecedence::InlineAsm
-            | ExprPrecedence::Mac
-            | ExprPrecedence::FormatArgs
-            | ExprPrecedence::OffsetOf => PREC_POSTFIX,
-
             // Never need parens
             ExprPrecedence::Array
-            | ExprPrecedence::Repeat
-            | ExprPrecedence::Tup
-            | ExprPrecedence::Lit
-            | ExprPrecedence::Path
-            | ExprPrecedence::Paren
-            | ExprPrecedence::If
-            | ExprPrecedence::While
-            | ExprPrecedence::ForLoop
-            | ExprPrecedence::Loop
-            | ExprPrecedence::Match
-            | ExprPrecedence::ConstBlock
+            | ExprPrecedence::Await
             | ExprPrecedence::Block
-            | ExprPrecedence::TryBlock
+            | ExprPrecedence::Call
+            | ExprPrecedence::ConstBlock
+            | ExprPrecedence::Field
+            | ExprPrecedence::ForLoop
+            | ExprPrecedence::FormatArgs
             | ExprPrecedence::Gen
+            | ExprPrecedence::If
+            | ExprPrecedence::Index
+            | ExprPrecedence::InlineAsm
+            | ExprPrecedence::Lit
+            | ExprPrecedence::Loop
+            | ExprPrecedence::Mac
+            | ExprPrecedence::Match
+            | ExprPrecedence::MethodCall
+            | ExprPrecedence::OffsetOf
+            | ExprPrecedence::Paren
+            | ExprPrecedence::Path
+            | ExprPrecedence::PostfixMatch
+            | ExprPrecedence::Repeat
             | ExprPrecedence::Struct
-            | ExprPrecedence::Err => PREC_PAREN,
+            | ExprPrecedence::Try
+            | ExprPrecedence::TryBlock
+            | ExprPrecedence::Tup
+            | ExprPrecedence::While
+            | ExprPrecedence::Err => PREC_UNAMBIGUOUS,
         }
     }
 }
@@ -390,7 +389,8 @@ pub fn contains_exterior_struct_lit(value: &ast::Expr) -> bool {
         | ast::ExprKind::Cast(x, _)
         | ast::ExprKind::Type(x, _)
         | ast::ExprKind::Field(x, _)
-        | ast::ExprKind::Index(x, _, _) => {
+        | ast::ExprKind::Index(x, _, _)
+        | ast::ExprKind::Match(x, _, ast::MatchKind::Postfix) => {
             // &X { y: 1 }, X { y: 1 }.y
             contains_exterior_struct_lit(x)
         }

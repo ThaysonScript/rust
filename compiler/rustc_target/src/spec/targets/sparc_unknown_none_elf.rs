@@ -20,6 +20,12 @@ pub fn target() -> Target {
     Target {
         data_layout: "E-m:e-p:32:32-i64:64-f128:64-n32-S64".into(),
         llvm_target: "sparc-unknown-none-elf".into(),
+        metadata: crate::spec::TargetMetadata {
+            description: Some("Bare 32-bit SPARC V7+".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(false),
+        },
         pointer_width: 32,
         arch: "sparc".into(),
         options,

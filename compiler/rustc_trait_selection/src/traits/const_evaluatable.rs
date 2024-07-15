@@ -8,16 +8,15 @@
 //! In this case we try to build an abstract representation of this constant using
 //! `thir_abstract_const` which can then be checked for structural equality with other
 //! generic constants mentioned in the `caller_bounds` of the current environment.
+
 use rustc_hir::def::DefKind;
 use rustc_infer::infer::InferCtxt;
+use rustc_middle::bug;
 use rustc_middle::mir::interpret::ErrorHandled;
-
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::abstract_const::NotConstEvaluatable;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitable, TypeVisitableExt, TypeVisitor};
-
-use rustc_span::Span;
-use std::ops::ControlFlow;
+use rustc_span::{Span, DUMMY_SP};
 
 use crate::traits::ObligationCtxt;
 
@@ -35,7 +34,7 @@ pub fn is_const_evaluatable<'tcx>(
         ty::ConstKind::Param(_)
         | ty::ConstKind::Bound(_, _)
         | ty::ConstKind::Placeholder(_)
-        | ty::ConstKind::Value(_)
+        | ty::ConstKind::Value(_, _)
         | ty::ConstKind::Error(_) => return Ok(()),
         ty::ConstKind::Infer(_) => return Err(NotConstEvaluatable::MentionsInfer),
     };
@@ -69,7 +68,7 @@ pub fn is_const_evaluatable<'tcx>(
                 tcx.dcx().span_bug(span, "evaluating `ConstKind::Expr` is not currently supported");
             }
             ty::ConstKind::Unevaluated(uv) => {
-                let concrete = infcx.const_eval_resolve(param_env, uv, Some(span));
+                let concrete = infcx.const_eval_resolve(param_env, uv, span);
                 match concrete {
                     Err(ErrorHandled::TooGeneric(_)) => {
                         Err(NotConstEvaluatable::Error(infcx.dcx().span_delayed_bug(
@@ -100,7 +99,7 @@ pub fn is_const_evaluatable<'tcx>(
         // and hopefully soon change this to an error.
         //
         // See #74595 for more details about this.
-        let concrete = infcx.const_eval_resolve(param_env, uv, Some(span));
+        let concrete = infcx.const_eval_resolve(param_env, uv, span);
         match concrete {
             // If we're evaluating a generic foreign constant, under a nightly compiler while
             // the current crate does not enable `feature(generic_const_exprs)`, abort
@@ -117,12 +116,12 @@ pub fn is_const_evaluatable<'tcx>(
                 tcx.dcx()
                     .struct_span_fatal(
                         // Slightly better span than just using `span` alone
-                        if span == rustc_span::DUMMY_SP { tcx.def_span(uv.def) } else { span },
+                        if span == DUMMY_SP { tcx.def_span(uv.def) } else { span },
                         "failed to evaluate generic const expression",
                     )
                     .with_note("the crate this constant originates from uses `#![feature(generic_const_exprs)]`")
                     .with_span_suggestion_verbose(
-                        rustc_span::DUMMY_SP,
+                        DUMMY_SP,
                         "consider enabling this feature",
                         "#![feature(generic_const_exprs)]\n",
                         rustc_errors::Applicability::MaybeIncorrect,
@@ -170,13 +169,11 @@ fn satisfied_from_param_env<'tcx>(
     }
 
     impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for Visitor<'a, 'tcx> {
-        type BreakTy = ();
-        fn visit_const(&mut self, c: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
+        fn visit_const(&mut self, c: ty::Const<'tcx>) {
             debug!("is_const_evaluatable: candidate={:?}", c);
             if self.infcx.probe(|_| {
                 let ocx = ObligationCtxt::new(self.infcx);
-                ocx.eq(&ObligationCause::dummy(), self.param_env, c.ty(), self.ct.ty()).is_ok()
-                    && ocx.eq(&ObligationCause::dummy(), self.param_env, c, self.ct).is_ok()
+                ocx.eq(&ObligationCause::dummy(), self.param_env, c, self.ct).is_ok()
                     && ocx.select_all_or_error().is_empty()
             }) {
                 self.single_match = match self.single_match {
@@ -187,7 +184,7 @@ fn satisfied_from_param_env<'tcx>(
             }
 
             if let ty::ConstKind::Expr(e) = c.kind() {
-                e.visit_with(self)
+                e.visit_with(self);
             } else {
                 // FIXME(generic_const_exprs): This doesn't recurse into `<T as Trait<U>>::ASSOC`'s args.
                 // This is currently unobservable as `<T as Trait<{ U + 1 }>>::ASSOC` creates an anon const
@@ -196,7 +193,6 @@ fn satisfied_from_param_env<'tcx>(
                 // If we start allowing directly writing `ConstKind::Expr` without an intermediate anon const
                 // this will be incorrect. It might be worth investigating making `predicates_of` elaborate
                 // all of the `ConstEvaluatable` bounds rather than having a visitor here.
-                ControlFlow::Continue(())
             }
         }
     }
@@ -218,7 +214,6 @@ fn satisfied_from_param_env<'tcx>(
 
     if let Some(Ok(c)) = single_match {
         let ocx = ObligationCtxt::new(infcx);
-        assert!(ocx.eq(&ObligationCause::dummy(), param_env, c.ty(), ct.ty()).is_ok());
         assert!(ocx.eq(&ObligationCause::dummy(), param_env, c, ct).is_ok());
         assert!(ocx.select_all_or_error().is_empty());
         return true;

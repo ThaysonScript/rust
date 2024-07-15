@@ -6,11 +6,11 @@
 
 use crate::borrow::{Borrow, BorrowMut};
 use crate::cmp::Ordering;
-use crate::convert::{Infallible, TryFrom};
+use crate::convert::Infallible;
 use crate::error::Error;
 use crate::fmt;
 use crate::hash::{self, Hash};
-use crate::iter::UncheckedIterator;
+use crate::iter::{repeat_n, UncheckedIterator};
 use crate::mem::{self, MaybeUninit};
 use crate::ops::{
     ChangeOutputType, ControlFlow, FromResidual, Index, IndexMut, NeverShortCircuit, Residual, Try,
@@ -26,6 +26,33 @@ pub(crate) use drain::drain_array_with;
 
 #[stable(feature = "array_value_iter", since = "1.51.0")]
 pub use iter::IntoIter;
+
+/// Creates an array of type `[T; N]` by repeatedly cloning a value.
+///
+/// This is the same as `[val; N]`, but it also works for types that do not
+/// implement [`Copy`].
+///
+/// The provided value will be used as an element of the resulting array and
+/// will be cloned N - 1 times to fill up the rest. If N is zero, the value
+/// will be dropped.
+///
+/// # Example
+///
+/// Creating muliple copies of a `String`:
+/// ```rust
+/// #![feature(array_repeat)]
+///
+/// use std::array;
+///
+/// let string = "Hello there!".to_string();
+/// let strings = array::repeat(string);
+/// assert_eq!(strings, ["Hello there!", "Hello there!"]);
+/// ```
+#[inline]
+#[unstable(feature = "array_repeat", issue = "126695")]
+pub fn repeat<T: Clone, const N: usize>(val: T) -> [T; N] {
+    from_trusted_iterator(repeat_n(val, N))
+}
 
 /// Creates an array of type [T; N], where each element `T` is the returned value from `cb`
 /// using that element's index.
@@ -100,7 +127,7 @@ where
     R: Try,
     R::Residual: Residual<[R::Output; N]>,
 {
-    let mut array = MaybeUninit::uninit_array::<N>();
+    let mut array = [const { MaybeUninit::uninit() }; N];
     match try_from_fn_erased(&mut array, cb) {
         ControlFlow::Break(r) => FromResidual::from_residual(r),
         ControlFlow::Continue(()) => {
@@ -360,6 +387,7 @@ where
     }
 }
 
+/// Implements comparison of arrays [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: PartialOrd, const N: usize> PartialOrd for [T; N] {
     #[inline]
@@ -511,7 +539,8 @@ impl<T, const N: usize> [T; N] {
     /// # Examples
     ///
     /// ```
-    /// #![feature(array_try_map, generic_nonzero)]
+    /// #![feature(array_try_map)]
+    ///
     /// let a = ["1", "2", "3"];
     /// let b = a.try_map(|v| v.parse::<u32>()).unwrap().map(|v| v + 1);
     /// assert_eq!(b, [2, 3, 4]);
@@ -521,19 +550,19 @@ impl<T, const N: usize> [T; N] {
     /// assert!(b.is_err());
     ///
     /// use std::num::NonZero;
+    ///
     /// let z = [1, 2, 0, 3, 4];
     /// assert_eq!(z.try_map(NonZero::new), None);
+    ///
     /// let a = [1, 2, 3];
     /// let b = a.try_map(NonZero::new);
     /// let c = b.map(|x| x.map(NonZero::get));
     /// assert_eq!(c, Some(a));
     /// ```
     #[unstable(feature = "array_try_map", issue = "79711")]
-    pub fn try_map<F, R>(self, f: F) -> ChangeOutputType<R, [R::Output; N]>
+    pub fn try_map<R>(self, f: impl FnMut(T) -> R) -> ChangeOutputType<R, [R::Output; N]>
     where
-        F: FnMut(T) -> R,
-        R: Try,
-        R::Residual: Residual<[R::Output; N]>,
+        R: Try<Residual: Residual<[R::Output; N]>>,
     {
         drain_array_with(self, |iter| try_from_trusted_iterator(iter.map(f)))
     }
@@ -889,7 +918,7 @@ impl<T> Drop for Guard<'_, T> {
 pub(crate) fn iter_next_chunk<T, const N: usize>(
     iter: &mut impl Iterator<Item = T>,
 ) -> Result<[T; N], IntoIter<T, N>> {
-    let mut array = MaybeUninit::uninit_array::<N>();
+    let mut array = [const { MaybeUninit::uninit() }; N];
     let r = iter_next_chunk_erased(&mut array, iter);
     match r {
         Ok(()) => {

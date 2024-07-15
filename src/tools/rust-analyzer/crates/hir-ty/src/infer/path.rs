@@ -11,15 +11,14 @@ use stdx::never;
 
 use crate::{
     builder::ParamKind,
-    consteval,
+    consteval, error_lifetime,
+    generics::generics,
     method_resolution::{self, VisibleFromModule},
-    to_chalk_trait_id,
-    utils::generics,
-    InferenceDiagnostic, Interner, Substitution, TraitRefExt, Ty, TyBuilder, TyExt, TyKind,
-    ValueTyDefId,
+    to_chalk_trait_id, InferenceDiagnostic, Interner, Substitution, TraitRef, TraitRefExt, Ty,
+    TyBuilder, TyExt, TyKind, ValueTyDefId,
 };
 
-use super::{ExprOrPatId, InferenceContext, TraitRef};
+use super::{ExprOrPatId, InferenceContext};
 
 impl InferenceContext<'_> {
     pub(super) fn infer_path(&mut self, path: &Path, id: ExprOrPatId) -> Option<Ty> {
@@ -64,7 +63,7 @@ impl InferenceContext<'_> {
                 it.into()
             }
             ValueNs::ImplSelf(impl_id) => {
-                let generics = crate::utils::generics(self.db.upcast(), impl_id.into());
+                let generics = crate::generics::generics(self.db.upcast(), impl_id.into());
                 let substs = generics.placeholder_subst(self.db);
                 let ty = self.db.impl_self_ty(impl_id).substitute(Interner, &substs);
                 if let Some((AdtId::StructId(struct_id), substs)) = ty.as_adt() {
@@ -111,6 +110,7 @@ impl InferenceContext<'_> {
                 it.next().unwrap_or_else(|| match x {
                     ParamKind::Type => self.result.standard_types.unknown.clone().cast(Interner),
                     ParamKind::Const(ty) => consteval::unknown_const_as_generic(ty.clone()),
+                    ParamKind::Lifetime => error_lifetime().cast(Interner),
                 })
             })
             .build();
@@ -321,7 +321,7 @@ impl InferenceContext<'_> {
 
         let mut not_visible = None;
         let res = method_resolution::iterate_method_candidates(
-            &canonical_ty.value,
+            &canonical_ty,
             self.db,
             self.table.trait_env.clone(),
             self.get_traits_in_scope().as_ref().left_or_else(|&it| it),

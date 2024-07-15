@@ -8,6 +8,12 @@ pub fn target() -> Target {
     base.crt_static_default = false;
     Target {
         llvm_target: "mipsel-unknown-linux-musl".into(),
+        metadata: crate::spec::TargetMetadata {
+            description: Some("MIPS (little endian) Linux with musl 1.2.3".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(true),
+        },
         pointer_width: 32,
         data_layout: "e-m:m-p:32:32-i8:8:32-i16:16:32-i64:64-n32-S64".into(),
         arch: "mips".into(),

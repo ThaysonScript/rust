@@ -27,7 +27,7 @@ use crate::errors;
 use rustc_ast as ast;
 use rustc_data_structures::unord::UnordMap;
 use rustc_data_structures::unord::UnordSet;
-use rustc_errors::{DiagnosticArgValue, IntoDiagnosticArg};
+use rustc_errors::{DiagArgValue, IntoDiagArg};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::mono::CodegenUnitNameBuilder;
 use rustc_middle::ty::TyCtxt;
@@ -37,6 +37,7 @@ use rustc_span::{Span, Symbol};
 use std::borrow::Cow;
 use std::fmt;
 use thin_vec::ThinVec;
+use tracing::debug;
 
 #[allow(missing_docs)]
 pub fn assert_module_sources(tcx: TyCtxt<'_>, set_reuse: &dyn Fn(&mut CguReuseTracker)) {
@@ -176,7 +177,7 @@ impl<'tcx> AssertModuleSource<'tcx> {
     /// Scan for a `cfg="foo"` attribute and check whether we have a
     /// cfg flag called `foo`.
     fn check_config(&self, attr: &ast::Attribute) -> bool {
-        let config = &self.tcx.sess.parse_sess.config;
+        let config = &self.tcx.sess.psess.config;
         let value = self.field(attr, sym::cfg);
         debug!("check_config(config={:?}, value={:?})", config, value);
         if config.iter().any(|&(name, _)| name == value) {
@@ -205,9 +206,9 @@ impl fmt::Display for CguReuse {
     }
 }
 
-impl IntoDiagnosticArg for CguReuse {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
-        DiagnosticArgValue::Str(Cow::Owned(self.to_string()))
+impl IntoDiagArg for CguReuse {
+    fn into_diag_arg(self) -> DiagArgValue {
+        DiagArgValue::Str(Cow::Owned(self.to_string()))
     }
 }
 

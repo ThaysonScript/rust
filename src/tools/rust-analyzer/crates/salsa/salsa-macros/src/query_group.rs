@@ -1,4 +1,4 @@
-//!
+//! Implementation for `[salsa::query_group]` decorator.
 
 use crate::parenthesized::Parenthesized;
 use heck::ToUpperCamelCase;
@@ -20,7 +20,7 @@ pub(crate) fn query_group(args: TokenStream, input: TokenStream) -> TokenStream 
     let input_span = input.span();
     let (trait_attrs, salsa_attrs) = filter_attrs(input.attrs);
     if !salsa_attrs.is_empty() {
-        return Error::new(input_span, format!("unsupported attributes: {:?}", salsa_attrs))
+        return Error::new(input_span, format!("unsupported attributes: {salsa_attrs:?}"))
             .to_compile_error()
             .into();
     }
@@ -78,7 +78,7 @@ pub(crate) fn query_group(args: TokenStream, input: TokenStream) -> TokenStream 
                         num_storages += 1;
                     }
                     _ => {
-                        return Error::new(span, format!("unknown salsa attribute `{}`", name))
+                        return Error::new(span, format!("unknown salsa attribute `{name}`"))
                             .to_compile_error()
                             .into();
                     }
@@ -111,7 +111,7 @@ pub(crate) fn query_group(args: TokenStream, input: TokenStream) -> TokenStream 
                 _ => {
                     return Error::new(
                         sig_span,
-                        format!("first argument of query `{}` must be `&self`", query_name),
+                        format!("first argument of query `{query_name}` must be `&self`"),
                     )
                     .to_compile_error()
                     .into();
@@ -130,7 +130,7 @@ pub(crate) fn query_group(args: TokenStream, input: TokenStream) -> TokenStream 
                     arg => {
                         return Error::new(
                             arg.span(),
-                            format!("unsupported argument `{:?}` of `{}`", arg, query_name,),
+                            format!("unsupported argument `{arg:?}` of `{query_name}`",),
                         )
                         .to_compile_error()
                         .into();
@@ -144,7 +144,7 @@ pub(crate) fn query_group(args: TokenStream, input: TokenStream) -> TokenStream 
                 ref ret => {
                     return Error::new(
                         ret.span(),
-                        format!("unsupported return type `{:?}` of `{}`", ret, query_name),
+                        format!("unsupported return type `{ret:?}` of `{query_name}`"),
                     )
                     .to_compile_error()
                     .into();
@@ -169,7 +169,7 @@ pub(crate) fn query_group(args: TokenStream, input: TokenStream) -> TokenStream 
                 let lookup_keys = vec![(parse_quote! { key }, value.clone())];
                 Some(Query {
                     query_type: lookup_query_type,
-                    query_name: format!("{}", lookup_fn_name),
+                    query_name: format!("{lookup_fn_name}"),
                     fn_name: lookup_fn_name,
                     receiver: self_receiver.clone(),
                     attrs: vec![], // FIXME -- some automatically generated docs on this method?
@@ -235,13 +235,24 @@ pub(crate) fn query_group(args: TokenStream, input: TokenStream) -> TokenStream 
 
         queries_with_storage.push(fn_name);
 
+        let tracing = if let QueryStorage::Memoized = query.storage {
+            let s = format!("{trait_name}::{fn_name}");
+            Some(quote! {
+                let _p = tracing::debug_span!(#s, #(#key_names = tracing::field::debug(&#key_names)),*).entered();
+            })
+        } else {
+            None
+        }
+        .into_iter();
+
         query_fn_definitions.extend(quote! {
             fn #fn_name(&self, #(#key_names: #keys),*) -> #value {
+                #(#tracing),*
                 // Create a shim to force the code to be monomorphized in the
                 // query crate. Our experiments revealed that this makes a big
                 // difference in total compilation time in rust-analyzer, though
                 // it's not totally obvious why that should be.
-                fn __shim(db: &(dyn #trait_name + '_),  #(#key_names: #keys),*) -> #value {
+                fn __shim(db: &(dyn #trait_name + '_), #(#key_names: #keys),*) -> #value {
                     salsa::plumbing::get_query_table::<#qt>(db).get((#(#key_names),*))
                 }
                 __shim(self, #(#key_names),*)
@@ -263,8 +274,7 @@ pub(crate) fn query_group(args: TokenStream, input: TokenStream) -> TokenStream 
                 *Note:* Setting values will trigger cancellation
                 of any ongoing queries; this method blocks until
                 those queries have been cancelled.
-            ",
-                fn_name = fn_name
+            "
             );
 
             let set_constant_fn_docs = format!(
@@ -279,8 +289,7 @@ pub(crate) fn query_group(args: TokenStream, input: TokenStream) -> TokenStream 
                 *Note:* Setting values will trigger cancellation
                 of any ongoing queries; this method blocks until
                 those queries have been cancelled.
-            ",
-                fn_name = fn_name
+            "
             );
 
             query_fn_declarations.extend(quote! {

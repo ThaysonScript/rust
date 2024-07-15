@@ -16,7 +16,7 @@
 use std::{iter, mem};
 
 use flycheck::{FlycheckConfig, FlycheckHandle};
-use hir::{db::DefDatabase, Change, ProcMacros};
+use hir::{db::DefDatabase, ChangeWithProcMacros, ProcMacros};
 use ide::CrateId;
 use ide_db::{
     base_db::{salsa::Durability, CrateGraph, ProcMacroPaths, Version},
@@ -24,9 +24,9 @@ use ide_db::{
 };
 use itertools::Itertools;
 use load_cargo::{load_proc_macro, ProjectFolders};
+use lsp_types::FileSystemWatcher;
 use proc_macro_api::ProcMacroServer;
-use project_model::{ProjectWorkspace, WorkspaceBuildScripts};
-use rustc_hash::FxHashSet;
+use project_model::{ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts};
 use stdx::{format_to, thread::ThreadIntent};
 use triomphe::Arc;
 use vfs::{AbsPath, AbsPathBuf, ChangeKind};
@@ -71,15 +71,14 @@ impl GlobalState {
     }
 
     pub(crate) fn update_configuration(&mut self, config: Config) {
-        let _p =
-            tracing::span!(tracing::Level::INFO, "GlobalState::update_configuration").entered();
+        let _p = tracing::info_span!("GlobalState::update_configuration").entered();
         let old_config = mem::replace(&mut self.config, Arc::new(config));
         if self.config.lru_parse_query_capacity() != old_config.lru_parse_query_capacity() {
             self.analysis_host.update_lru_capacity(self.config.lru_parse_query_capacity());
         }
-        if self.config.lru_query_capacities() != old_config.lru_query_capacities() {
+        if self.config.lru_query_capacities_config() != old_config.lru_query_capacities_config() {
             self.analysis_host.update_lru_capacities(
-                &self.config.lru_query_capacities().cloned().unwrap_or_default(),
+                &self.config.lru_query_capacities_config().cloned().unwrap_or_default(),
             );
         }
         if self.config.linked_or_discovered_projects() != old_config.linked_or_discovered_projects()
@@ -107,88 +106,52 @@ impl GlobalState {
         };
         let mut message = String::new();
 
+        if !self.config.cargo_autoreload()
+            && self.is_quiescent()
+            && self.fetch_workspaces_queue.op_requested()
+        {
+            status.health |= lsp_ext::Health::Warning;
+            message.push_str("Auto-reloading is disabled and the workspace has changed, a manual workspace reload is required.\n\n");
+        }
+
         if self.build_deps_changed {
-            status.health = lsp_ext::Health::Warning;
+            status.health |= lsp_ext::Health::Warning;
             message.push_str(
                 "Proc-macros and/or build scripts have changed and need to be rebuilt.\n\n",
             );
         }
         if self.fetch_build_data_error().is_err() {
-            status.health = lsp_ext::Health::Warning;
+            status.health |= lsp_ext::Health::Warning;
             message.push_str("Failed to run build scripts of some packages.\n\n");
         }
-        if self.proc_macro_clients.iter().any(|it| it.is_err()) {
-            status.health = lsp_ext::Health::Warning;
-            message.push_str("Failed to spawn one or more proc-macro servers.\n\n");
-            for err in self.proc_macro_clients.iter() {
-                if let Err(err) = err {
-                    format_to!(message, "- {err}\n");
-                }
-            }
-        }
-        if !self.config.cargo_autoreload()
-            && self.is_quiescent()
-            && self.fetch_workspaces_queue.op_requested()
-        {
-            status.health = lsp_ext::Health::Warning;
-            message.push_str("Auto-reloading is disabled and the workspace has changed, a manual workspace reload is required.\n\n");
-        }
-        if self.config.linked_or_discovered_projects().is_empty()
-            && self.config.detached_files().is_empty()
-            && self.config.notifications().cargo_toml_not_found
-        {
-            status.health = lsp_ext::Health::Warning;
-            message.push_str("Failed to discover workspace.\n");
-            message.push_str("Consider adding the `Cargo.toml` of the workspace to the [`linkedProjects`](https://rust-analyzer.github.io/manual.html#rust-analyzer.linkedProjects) setting.\n\n");
-        }
+
         if let Some(err) = &self.config_errors {
-            status.health = lsp_ext::Health::Warning;
+            status.health |= lsp_ext::Health::Warning;
             format_to!(message, "{err}\n");
         }
         if let Some(err) = &self.last_flycheck_error {
-            status.health = lsp_ext::Health::Warning;
+            status.health |= lsp_ext::Health::Warning;
             message.push_str(err);
             message.push('\n');
         }
 
-        for ws in self.workspaces.iter() {
-            let (ProjectWorkspace::Cargo { sysroot, .. }
-            | ProjectWorkspace::Json { sysroot, .. }
-            | ProjectWorkspace::DetachedFiles { sysroot, .. }) = ws;
-            match sysroot {
-                Err(None) => (),
-                Err(Some(e)) => {
-                    status.health = lsp_ext::Health::Warning;
-                    message.push_str(e);
-                    message.push_str("\n\n");
-                }
-                Ok(s) => {
-                    if let Some(e) = s.loading_warning() {
-                        status.health = lsp_ext::Health::Warning;
-                        message.push_str(&e);
-                        message.push_str("\n\n");
-                    }
-                }
-            }
-            if let ProjectWorkspace::Cargo { rustc: Err(Some(e)), .. } = ws {
-                status.health = lsp_ext::Health::Warning;
-                message.push_str(e);
-                message.push_str("\n\n");
-            }
+        if self.config.linked_or_discovered_projects().is_empty()
+            && self.config.detached_files().is_empty()
+        {
+            status.health |= lsp_ext::Health::Warning;
+            message.push_str("Failed to discover workspace.\n");
+            message.push_str("Consider adding the `Cargo.toml` of the workspace to the [`linkedProjects`](https://rust-analyzer.github.io/manual.html#rust-analyzer.linkedProjects) setting.\n\n");
         }
-
         if self.fetch_workspace_error().is_err() {
-            status.health = lsp_ext::Health::Error;
+            status.health |= lsp_ext::Health::Error;
             message.push_str("Failed to load workspaces.");
 
             if self.config.has_linked_projects() {
                 message.push_str(
                     "`rust-analyzer.linkedProjects` have been specified, which may be incorrect. Specified project paths:\n",
                 );
-                message.push_str(&format!(
-                    "    {}",
-                    self.config.linked_manifests().map(|it| it.display()).format("\n    ")
-                ));
+                message
+                    .push_str(&format!("    {}", self.config.linked_manifests().format("\n    ")));
                 if self.config.has_linked_project_jsons() {
                     message.push_str("\nAdditionally, one or more project jsons are specified")
                 }
@@ -196,9 +159,47 @@ impl GlobalState {
             message.push_str("\n\n");
         }
 
+        if !self.workspaces.is_empty() {
+            let proc_macro_clients =
+                self.proc_macro_clients.iter().map(Some).chain(iter::repeat_with(|| None));
+
+            for (ws, proc_macro_client) in self.workspaces.iter().zip(proc_macro_clients) {
+                if let Some(err) = ws.sysroot.error() {
+                    status.health |= lsp_ext::Health::Warning;
+                    format_to!(
+                        message,
+                        "Workspace `{}` has sysroot errors: ",
+                        ws.manifest_or_root()
+                    );
+                    message.push_str(err);
+                    message.push_str("\n\n");
+                }
+                if let ProjectWorkspaceKind::Cargo { rustc: Err(Some(err)), .. } = &ws.kind {
+                    status.health |= lsp_ext::Health::Warning;
+                    format_to!(
+                        message,
+                        "Failed loading rustc_private crates for workspace `{}`: ",
+                        ws.manifest_or_root()
+                    );
+                    message.push_str(err);
+                    message.push_str("\n\n");
+                };
+                if let Some(Err(err)) = proc_macro_client {
+                    status.health |= lsp_ext::Health::Warning;
+                    format_to!(
+                        message,
+                        "Failed spawning proc-macro server for workspace `{}`: {err}",
+                        ws.manifest_or_root()
+                    );
+                    message.push_str("\n\n");
+                }
+            }
+        }
+
         if !message.is_empty() {
             status.message = Some(message.trim_end().to_owned());
         }
+
         status
     }
 
@@ -207,7 +208,14 @@ impl GlobalState {
 
         self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {
             let linked_projects = self.config.linked_or_discovered_projects();
-            let detached_files = self.config.detached_files().to_vec();
+            let detached_files: Vec<_> = self
+                .config
+                .detached_files()
+                .iter()
+                .cloned()
+                .map(ManifestPath::try_from)
+                .filter_map(Result::ok)
+                .collect();
             let cargo_config = self.config.cargo();
 
             move |sender| {
@@ -237,6 +245,7 @@ impl GlobalState {
                                 it.clone(),
                                 cargo_config.target.as_deref(),
                                 &cargo_config.extra_env,
+                                &cargo_config.cfg_overrides,
                             ))
                         }
                     })
@@ -257,7 +266,7 @@ impl GlobalState {
                 }
 
                 if !detached_files.is_empty() {
-                    workspaces.push(project_model::ProjectWorkspace::load_detached_files(
+                    workspaces.extend(project_model::ProjectWorkspace::load_detached_files(
                         detached_files,
                         &cargo_config,
                     ));
@@ -357,13 +366,13 @@ impl GlobalState {
     }
 
     pub(crate) fn set_proc_macros(&mut self, proc_macros: ProcMacros) {
-        let mut change = Change::new();
+        let mut change = ChangeWithProcMacros::new();
         change.set_proc_macros(proc_macros);
         self.analysis_host.apply_change(change);
     }
 
     pub(crate) fn switch_workspaces(&mut self, cause: Cause) {
-        let _p = tracing::span!(tracing::Level::INFO, "GlobalState::switch_workspaces").entered();
+        let _p = tracing::info_span!("GlobalState::switch_workspaces").entered();
         tracing::info!(%cause, "will switch workspaces");
 
         let Some((workspaces, force_reload_crate_graph)) =
@@ -431,27 +440,70 @@ impl GlobalState {
         }
 
         if let FilesWatcher::Client = self.config.files().watcher {
-            let registration_options = lsp_types::DidChangeWatchedFilesRegistrationOptions {
-                watchers: self
-                    .workspaces
-                    .iter()
-                    .flat_map(|ws| ws.to_roots())
-                    .filter(|it| it.is_local)
-                    .flat_map(|root| {
-                        root.include.into_iter().flat_map(|it| {
-                            [
-                                format!("{it}/**/*.rs"),
-                                format!("{it}/**/Cargo.toml"),
-                                format!("{it}/**/Cargo.lock"),
-                            ]
+            let filter = self
+                .workspaces
+                .iter()
+                .flat_map(|ws| ws.to_roots())
+                .filter(|it| it.is_local)
+                .map(|it| it.include);
+
+            let mut watchers: Vec<FileSystemWatcher> =
+                if self.config.did_change_watched_files_relative_pattern_support() {
+                    // When relative patterns are supported by the client, prefer using them
+                    filter
+                        .flat_map(|include| {
+                            include.into_iter().flat_map(|base| {
+                                [
+                                    (base.clone(), "**/*.rs"),
+                                    (base.clone(), "**/Cargo.{lock,toml}"),
+                                    (base, "**/rust-analyzer.toml"),
+                                ]
+                            })
                         })
-                    })
+                        .map(|(base, pat)| lsp_types::FileSystemWatcher {
+                            glob_pattern: lsp_types::GlobPattern::Relative(
+                                lsp_types::RelativePattern {
+                                    base_uri: lsp_types::OneOf::Right(
+                                        lsp_types::Url::from_file_path(base).unwrap(),
+                                    ),
+                                    pattern: pat.to_owned(),
+                                },
+                            ),
+                            kind: None,
+                        })
+                        .collect()
+                } else {
+                    // When they're not, integrate the base to make them into absolute patterns
+                    filter
+                        .flat_map(|include| {
+                            include.into_iter().flat_map(|base| {
+                                [
+                                    format!("{base}/**/*.rs"),
+                                    format!("{base}/**/Cargo.{{toml,lock}}"),
+                                    format!("{base}/**/rust-analyzer.toml"),
+                                ]
+                            })
+                        })
+                        .map(|glob_pattern| lsp_types::FileSystemWatcher {
+                            glob_pattern: lsp_types::GlobPattern::String(glob_pattern),
+                            kind: None,
+                        })
+                        .collect()
+                };
+
+            watchers.extend(
+                iter::once(self.config.user_config_path().as_path())
+                    .chain(iter::once(self.config.root_ratoml_path().as_path()))
+                    .chain(self.workspaces.iter().map(|ws| ws.manifest().map(ManifestPath::as_ref)))
+                    .flatten()
                     .map(|glob_pattern| lsp_types::FileSystemWatcher {
-                        glob_pattern: lsp_types::GlobPattern::String(glob_pattern),
+                        glob_pattern: lsp_types::GlobPattern::String(glob_pattern.to_string()),
                         kind: None,
-                    })
-                    .collect(),
-            };
+                    }),
+            );
+
+            let registration_options =
+                lsp_types::DidChangeWatchedFilesRegistrationOptions { watchers };
             let registration = lsp_types::Registration {
                 id: "workspace/didChangeWatchedFiles".to_owned(),
                 method: "workspace/didChangeWatchedFiles".to_owned(),
@@ -477,23 +529,28 @@ impl GlobalState {
                     None => ws.find_sysroot_proc_macro_srv()?,
                 };
 
-                let env =
-                    match ws {
-                        ProjectWorkspace::Cargo { cargo_config_extra_env, sysroot, .. } => {
-                            cargo_config_extra_env
-                                .iter()
-                                .chain(self.config.extra_env())
-                                .map(|(a, b)| (a.clone(), b.clone()))
-                                .chain(sysroot.as_ref().map(|it| {
-                                    ("RUSTUP_TOOLCHAIN".to_owned(), it.root().to_string())
-                                }))
-                                .collect()
-                        }
-                        _ => Default::default(),
-                    };
+                let env = match &ws.kind {
+                    ProjectWorkspaceKind::Cargo { cargo_config_extra_env, .. }
+                    | ProjectWorkspaceKind::DetachedFile {
+                        cargo: Some(_),
+                        cargo_config_extra_env,
+                        ..
+                    } => cargo_config_extra_env
+                        .iter()
+                        .chain(self.config.extra_env())
+                        .map(|(a, b)| (a.clone(), b.clone()))
+                        .chain(
+                            ws.sysroot
+                                .root()
+                                .map(|it| ("RUSTUP_TOOLCHAIN".to_owned(), it.to_string())),
+                        )
+                        .collect(),
+
+                    _ => Default::default(),
+                };
                 tracing::info!("Using proc-macro server at {path}");
 
-                ProcMacroServer::spawn(path.clone(), &env).map_err(|err| {
+                ProcMacroServer::spawn(&path, &env).map_err(|err| {
                     tracing::error!(
                         "Failed to run proc-macro server from path {path}, error: {err:?}",
                     );
@@ -515,6 +572,7 @@ impl GlobalState {
             version: self.vfs_config_version,
         });
         self.source_root_config = project_folders.source_root_config;
+        self.local_roots_parent_map = Arc::new(self.source_root_config.source_root_parent_map());
 
         self.recreate_crate_graph(cause);
 
@@ -522,33 +580,39 @@ impl GlobalState {
     }
 
     fn recreate_crate_graph(&mut self, cause: String) {
+        self.report_progress(
+            "Building CrateGraph",
+            crate::lsp::utils::Progress::Begin,
+            None,
+            None,
+            None,
+        );
+
         // crate graph construction relies on these paths, record them so when one of them gets
         // deleted or created we trigger a reconstruction of the crate graph
-        let mut crate_graph_file_dependencies = FxHashSet::default();
+        self.crate_graph_file_dependencies.clear();
+        self.detached_files = self
+            .workspaces
+            .iter()
+            .filter_map(|ws| match &ws.kind {
+                ProjectWorkspaceKind::DetachedFile { file, .. } => Some(file.clone()),
+                _ => None,
+            })
+            .collect();
 
         let (crate_graph, proc_macro_paths, layouts, toolchains) = {
             // Create crate graph from all the workspaces
             let vfs = &mut self.vfs.write().0;
-            let loader = &mut self.loader;
 
             let load = |path: &AbsPath| {
-                let _p = tracing::span!(tracing::Level::DEBUG, "switch_workspaces::load").entered();
                 let vfs_path = vfs::VfsPath::from(path.to_path_buf());
-                crate_graph_file_dependencies.insert(vfs_path.clone());
-                match vfs.file_id(&vfs_path) {
-                    Some(file_id) => Some(file_id),
-                    None => {
-                        // FIXME: Consider not loading this here?
-                        let contents = loader.handle.load_sync(path);
-                        vfs.set_file_contents(vfs_path.clone(), contents);
-                        vfs.file_id(&vfs_path)
-                    }
-                }
+                self.crate_graph_file_dependencies.insert(vfs_path.clone());
+                vfs.file_id(&vfs_path)
             };
 
             ws_to_crate_graph(&self.workspaces, self.config.extra_env(), load)
         };
-        let mut change = Change::new();
+        let mut change = ChangeWithProcMacros::new();
         if self.config.expand_proc_macros() {
             change.set_proc_macros(
                 crate_graph
@@ -562,7 +626,13 @@ impl GlobalState {
         change.set_target_data_layouts(layouts);
         change.set_toolchains(toolchains);
         self.analysis_host.apply_change(change);
-        self.crate_graph_file_dependencies = crate_graph_file_dependencies;
+        self.report_progress(
+            "Building CrateGraph",
+            crate::lsp::utils::Progress::End,
+            None,
+            None,
+            None,
+        );
 
         self.process_changes();
         self.reload_flycheck();
@@ -614,7 +684,7 @@ impl GlobalState {
     }
 
     fn reload_flycheck(&mut self) {
-        let _p = tracing::span!(tracing::Level::INFO, "GlobalState::reload_flycheck").entered();
+        let _p = tracing::info_span!("GlobalState::reload_flycheck").entered();
         let config = self.config.flycheck();
         let sender = self.flycheck_sender.clone();
         let invocation_strategy = match config {
@@ -629,32 +699,37 @@ impl GlobalState {
                 config,
                 None,
                 self.config.root_path().clone(),
+                None,
             )],
             flycheck::InvocationStrategy::PerWorkspace => {
                 self.workspaces
                     .iter()
                     .enumerate()
-                    .filter_map(|(id, w)| match w {
-                        ProjectWorkspace::Cargo { cargo, sysroot, .. } => Some((
+                    .filter_map(|(id, ws)| {
+                        Some((
                             id,
-                            cargo.workspace_root(),
-                            sysroot.as_ref().ok().map(|sysroot| sysroot.root().to_owned()),
-                        )),
-                        ProjectWorkspace::Json { project, sysroot, .. } => {
-                            // Enable flychecks for json projects if a custom flycheck command was supplied
-                            // in the workspace configuration.
-                            match config {
-                                FlycheckConfig::CustomCommand { .. } => Some((
-                                    id,
-                                    project.path(),
-                                    sysroot.as_ref().ok().map(|sysroot| sysroot.root().to_owned()),
-                                )),
-                                _ => None,
-                            }
-                        }
-                        ProjectWorkspace::DetachedFiles { .. } => None,
+                            match &ws.kind {
+                                ProjectWorkspaceKind::Cargo { cargo, .. }
+                                | ProjectWorkspaceKind::DetachedFile {
+                                    cargo: Some((cargo, _)),
+                                    ..
+                                } => (cargo.workspace_root(), Some(cargo.manifest_path())),
+                                ProjectWorkspaceKind::Json(project) => {
+                                    // Enable flychecks for json projects if a custom flycheck command was supplied
+                                    // in the workspace configuration.
+                                    match config {
+                                        FlycheckConfig::CustomCommand { .. } => {
+                                            (project.path(), None)
+                                        }
+                                        _ => return None,
+                                    }
+                                }
+                                ProjectWorkspaceKind::DetachedFile { .. } => return None,
+                            },
+                            ws.sysroot.root().map(ToOwned::to_owned),
+                        ))
                     })
-                    .map(|(id, root, sysroot_root)| {
+                    .map(|(id, (root, manifest_path), sysroot_root)| {
                         let sender = sender.clone();
                         FlycheckHandle::spawn(
                             id,
@@ -662,6 +737,7 @@ impl GlobalState {
                             config.clone(),
                             sysroot_root,
                             root.to_path_buf(),
+                            manifest_path.map(|it| it.to_path_buf()),
                         )
                     })
                     .collect()
@@ -691,15 +767,7 @@ pub fn ws_to_crate_graph(
         let (other, mut crate_proc_macros) = ws.to_crate_graph(&mut load, extra_env);
         let num_layouts = layouts.len();
         let num_toolchains = toolchains.len();
-        let (toolchain, layout) = match ws {
-            ProjectWorkspace::Cargo { toolchain, target_layout, .. }
-            | ProjectWorkspace::Json { toolchain, target_layout, .. } => {
-                (toolchain.clone(), target_layout.clone())
-            }
-            ProjectWorkspace::DetachedFiles { .. } => {
-                (None, Err("detached files have no layout".into()))
-            }
-        };
+        let ProjectWorkspace { toolchain, target_layout, .. } = ws;
 
         let mapping = crate_graph.extend(
             other,
@@ -708,7 +776,7 @@ pub fn ws_to_crate_graph(
                 // if the newly created crate graph's layout is equal to the crate of the merged graph, then
                 // we can merge the crates.
                 let id = cg_id.into_raw().into_u32() as usize;
-                layouts[id] == layout && toolchains[id] == toolchain && cg_data == o_data
+                layouts[id] == *target_layout && toolchains[id] == *toolchain && cg_data == o_data
             },
         );
         // Populate the side tables for the newly merged crates
@@ -720,17 +788,19 @@ pub fn ws_to_crate_graph(
                 if layouts.len() <= idx {
                     layouts.resize(idx + 1, e.clone());
                 }
-                layouts[idx] = layout.clone();
+                layouts[idx].clone_from(target_layout);
             }
             if idx >= num_toolchains {
                 if toolchains.len() <= idx {
                     toolchains.resize(idx + 1, None);
                 }
-                toolchains[idx] = toolchain.clone();
+                toolchains[idx].clone_from(toolchain);
             }
         });
         proc_macro_paths.push(crate_proc_macros);
     }
+    crate_graph.shrink_to_fit();
+    proc_macro_paths.shrink_to_fit();
     (crate_graph, proc_macro_paths, layouts, toolchains)
 }
 
@@ -738,7 +808,7 @@ pub(crate) fn should_refresh_for_change(path: &AbsPath, change_kind: ChangeKind)
     const IMPLICIT_TARGET_FILES: &[&str] = &["build.rs", "src/main.rs", "src/lib.rs"];
     const IMPLICIT_TARGET_DIRS: &[&str] = &["src/bin", "examples", "tests", "benches"];
 
-    let file_name = match path.file_name().unwrap_or_default().to_str() {
+    let file_name = match path.file_name() {
         Some(it) => it,
         None => return false,
     };
@@ -753,18 +823,18 @@ pub(crate) fn should_refresh_for_change(path: &AbsPath, change_kind: ChangeKind)
     // .cargo/config{.toml}
     if path.extension().unwrap_or_default() != "rs" {
         let is_cargo_config = matches!(file_name, "config.toml" | "config")
-            && path.parent().map(|parent| parent.as_ref().ends_with(".cargo")).unwrap_or(false);
+            && path.parent().map(|parent| parent.as_str().ends_with(".cargo")).unwrap_or(false);
         return is_cargo_config;
     }
 
-    if IMPLICIT_TARGET_FILES.iter().any(|it| path.as_ref().ends_with(it)) {
+    if IMPLICIT_TARGET_FILES.iter().any(|it| path.as_str().ends_with(it)) {
         return true;
     }
     let parent = match path.parent() {
         Some(it) => it,
         None => return false,
     };
-    if IMPLICIT_TARGET_DIRS.iter().any(|it| parent.as_ref().ends_with(it)) {
+    if IMPLICIT_TARGET_DIRS.iter().any(|it| parent.as_str().ends_with(it)) {
         return true;
     }
     if file_name == "main.rs" {
@@ -772,7 +842,7 @@ pub(crate) fn should_refresh_for_change(path: &AbsPath, change_kind: ChangeKind)
             Some(it) => it,
             None => return false,
         };
-        if IMPLICIT_TARGET_DIRS.iter().any(|it| grand_parent.as_ref().ends_with(it)) {
+        if IMPLICIT_TARGET_DIRS.iter().any(|it| grand_parent.as_str().ends_with(it)) {
             return true;
         }
     }

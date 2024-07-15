@@ -135,6 +135,44 @@
 //! is not allowed. For more guidance on working with box from unsafe code, see
 //! [rust-lang/unsafe-code-guidelines#326][ucg#326].
 //!
+//! # Editions
+//!
+//! A special case exists for the implementation of `IntoIterator` for arrays on the Rust 2021
+//! edition, as documented [here][array]. Unfortunately, it was later found that a similar
+//! workaround should be added for boxed slices, and this was applied in the 2024 edition.
+//!
+//! Specifically, `IntoIterator` is implemented for `Box<[T]>` on all editions, but specific calls
+//! to `into_iter()` for boxed slices will defer to the slice implementation on editions before
+//! 2024:
+//!
+//! ```rust,edition2021
+//! // Rust 2015, 2018, and 2021:
+//!
+//! # #![allow(boxed_slice_into_iter)] // override our `deny(warnings)`
+//! let boxed_slice: Box<[i32]> = vec![0; 3].into_boxed_slice();
+//!
+//! // This creates a slice iterator, producing references to each value.
+//! for item in boxed_slice.into_iter().enumerate() {
+//!     let (i, x): (usize, &i32) = item;
+//!     println!("boxed_slice[{i}] = {x}");
+//! }
+//!
+//! // The `boxed_slice_into_iter` lint suggests this change for future compatibility:
+//! for item in boxed_slice.iter().enumerate() {
+//!     let (i, x): (usize, &i32) = item;
+//!     println!("boxed_slice[{i}] = {x}");
+//! }
+//!
+//! // You can explicitly iterate a boxed slice by value using `IntoIterator::into_iter`
+//! for item in IntoIterator::into_iter(boxed_slice).enumerate() {
+//!     let (i, x): (usize, i32) = item;
+//!     println!("boxed_slice[{i}] = {x}");
+//! }
+//! ```
+//!
+//! Similar to the array implementation, this may be modified in the future to remove this override,
+//! and it's best to avoid relying on this edition-dependent behavior if you wish to preserve
+//! compatibility with future versions of the compiler.
 //!
 //! [ucg#198]: https://github.com/rust-lang/unsafe-code-guidelines/issues/198
 //! [ucg#326]: https://github.com/rust-lang/unsafe-code-guidelines/issues/326
@@ -150,6 +188,8 @@
 use core::any::Any;
 use core::async_iter::AsyncIterator;
 use core::borrow;
+#[cfg(not(no_global_oom_handling))]
+use core::clone::CloneToUninit;
 use core::cmp::Ordering;
 use core::error::Error;
 use core::fmt;
@@ -161,14 +201,15 @@ use core::marker::Unsize;
 use core::mem::{self, SizedTypeProperties};
 use core::ops::{AsyncFn, AsyncFnMut, AsyncFnOnce};
 use core::ops::{
-    CoerceUnsized, Coroutine, CoroutineState, Deref, DerefMut, DispatchFromDyn, Receiver,
+    CoerceUnsized, Coroutine, CoroutineState, Deref, DerefMut, DerefPure, DispatchFromDyn, Receiver,
 };
 use core::pin::Pin;
-use core::ptr::{self, NonNull, Unique};
+use core::ptr::{self, addr_of_mut, NonNull, Unique};
+use core::slice;
 use core::task::{Context, Poll};
 
 #[cfg(not(no_global_oom_handling))]
-use crate::alloc::{handle_alloc_error, WriteCloneIntoRaw};
+use crate::alloc::handle_alloc_error;
 use crate::alloc::{AllocError, Allocator, Global, Layout};
 #[cfg(not(no_global_oom_handling))]
 use crate::borrow::Cow;
@@ -177,6 +218,7 @@ use crate::raw_vec::RawVec;
 use crate::str::from_boxed_utf8_unchecked;
 #[cfg(not(no_global_oom_handling))]
 use crate::string::String;
+use crate::vec;
 #[cfg(not(no_global_oom_handling))]
 use crate::vec::Vec;
 
@@ -1058,7 +1100,8 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     #[stable(feature = "box_raw", since = "1.4.0")]
     #[inline]
     pub fn into_raw(b: Self) -> *mut T {
-        Self::into_raw_with_allocator(b).0
+        // Make sure Miri realizes that we transition from a noalias pointer to a raw pointer here.
+        unsafe { addr_of_mut!(*&mut *Self::into_raw_with_allocator(b).0) }
     }
 
     /// Consumes the `Box`, returning a wrapped raw pointer and the allocator.
@@ -1110,8 +1153,15 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     #[unstable(feature = "allocator_api", issue = "32838")]
     #[inline]
     pub fn into_raw_with_allocator(b: Self) -> (*mut T, A) {
-        let (leaked, alloc) = Box::into_unique(b);
-        (leaked.as_ptr(), alloc)
+        let mut b = mem::ManuallyDrop::new(b);
+        // We carefully get the raw pointer out in a way that Miri's aliasing model understands what
+        // is happening: using the primitive "deref" of `Box`. In case `A` is *not* `Global`, we
+        // want *no* aliasing requirements here!
+        // In case `A` *is* `Global`, this does not quite have the right behavior; `into_raw`
+        // works around that.
+        let ptr = addr_of_mut!(**b);
+        let alloc = unsafe { ptr::read(&b.1) };
+        (ptr, alloc)
     }
 
     #[unstable(
@@ -1122,13 +1172,8 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     #[inline]
     #[doc(hidden)]
     pub fn into_unique(b: Self) -> (Unique<T>, A) {
-        // Box is recognized as a "unique pointer" by Stacked Borrows, but internally it is a
-        // raw pointer for the type system. Turning it directly into a raw pointer would not be
-        // recognized as "releasing" the unique pointer to permit aliased raw accesses,
-        // so all raw pointer methods have to go through `Box::leak`. Turning *that* to a raw pointer
-        // behaves correctly.
-        let alloc = unsafe { ptr::read(&b.1) };
-        (Unique::from(Box::leak(b)), alloc)
+        let (ptr, alloc) = Box::into_raw_with_allocator(b);
+        unsafe { (Unique::from(&mut *ptr), alloc) }
     }
 
     /// Returns a reference to the underlying allocator.
@@ -1168,6 +1213,9 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     /// let static_ref: &'static mut usize = Box::leak(x);
     /// *static_ref += 1;
     /// assert_eq!(*static_ref, 42);
+    /// # // FIXME(https://github.com/rust-lang/miri/issues/3670):
+    /// # // use -Zmiri-disable-leak-check instead of unleaking in tests meant to leak.
+    /// # drop(unsafe { Box::from_raw(static_ref) });
     /// ```
     ///
     /// Unsized data:
@@ -1177,6 +1225,9 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     /// let static_ref = Box::leak(x);
     /// static_ref[0] = 4;
     /// assert_eq!(*static_ref, [4, 2, 3]);
+    /// # // FIXME(https://github.com/rust-lang/miri/issues/3670):
+    /// # // use -Zmiri-disable-leak-check instead of unleaking in tests meant to leak.
+    /// # drop(unsafe { Box::from_raw(static_ref) });
     /// ```
     #[stable(feature = "box_leak", since = "1.26.0")]
     #[inline]
@@ -1184,7 +1235,7 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     where
         A: 'a,
     {
-        unsafe { &mut *mem::ManuallyDrop::new(b).0.as_ptr() }
+        unsafe { &mut *Box::into_raw(b) }
     }
 
     /// Converts a `Box<T>` into a `Pin<Box<T>>`. If `T` does not implement [`Unpin`], then
@@ -1303,7 +1354,7 @@ impl<T: Clone, A: Allocator + Clone> Clone for Box<T, A> {
         // Pre-allocate memory to allow writing the cloned value directly.
         let mut boxed = Self::new_uninit_in(self.1.clone());
         unsafe {
-            (**self).write_clone_into_raw(boxed.as_mut_ptr());
+            (**self).clone_to_uninit(boxed.as_mut_ptr());
             boxed.assume_init()
         }
     }
@@ -1940,6 +1991,9 @@ impl<T: ?Sized, A: Allocator> DerefMut for Box<T, A> {
     }
 }
 
+#[unstable(feature = "deref_pure_trait", issue = "87121")]
+unsafe impl<T: ?Sized, A: Allocator> DerefPure for Box<T, A> {}
+
 #[unstable(feature = "receiver_trait", issue = "none")]
 impl<T: ?Sized, A: Allocator> Receiver for Box<T, A> {}
 
@@ -2043,18 +2097,16 @@ impl<Args: Tuple, F: AsyncFnOnce<Args> + ?Sized, A: Allocator> AsyncFnOnce<Args>
 
 #[unstable(feature = "async_fn_traits", issue = "none")]
 impl<Args: Tuple, F: AsyncFnMut<Args> + ?Sized, A: Allocator> AsyncFnMut<Args> for Box<F, A> {
-    type CallMutFuture<'a> = F::CallMutFuture<'a> where Self: 'a;
+    type CallRefFuture<'a> = F::CallRefFuture<'a> where Self: 'a;
 
-    extern "rust-call" fn async_call_mut(&mut self, args: Args) -> Self::CallMutFuture<'_> {
+    extern "rust-call" fn async_call_mut(&mut self, args: Args) -> Self::CallRefFuture<'_> {
         F::async_call_mut(self, args)
     }
 }
 
 #[unstable(feature = "async_fn_traits", issue = "none")]
 impl<Args: Tuple, F: AsyncFn<Args> + ?Sized, A: Allocator> AsyncFn<Args> for Box<F, A> {
-    type CallFuture<'a> = F::CallFuture<'a> where Self: 'a;
-
-    extern "rust-call" fn async_call(&self, args: Args) -> Self::CallFuture<'_> {
+    extern "rust-call" fn async_call(&self, args: Args) -> Self::CallRefFuture<'_> {
         F::async_call(self, args)
     }
 }
@@ -2062,6 +2114,9 @@ impl<Args: Tuple, F: AsyncFn<Args> + ?Sized, A: Allocator> AsyncFn<Args> for Box
 #[unstable(feature = "coerce_unsized", issue = "18598")]
 impl<T: ?Sized + Unsize<U>, U: ?Sized, A: Allocator> CoerceUnsized<Box<U, A>> for Box<T, A> {}
 
+// It is quite crucial that we only allow the `Global` allocator here.
+// Handling arbitrary custom allocators (which can affect the `Box` layout heavily!)
+// would need a lot of codegen and interpreter adjustments.
 #[unstable(feature = "dispatch_from_dyn", issue = "none")]
 impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Box<U>> for Box<T, Global> {}
 
@@ -2073,6 +2128,99 @@ impl<I> FromIterator<I> for Box<[I]> {
     }
 }
 
+/// This implementation is required to make sure that the `Box<[I]>: IntoIterator`
+/// implementation doesn't overlap with `IntoIterator for T where T: Iterator` blanket.
+#[stable(feature = "boxed_slice_into_iter", since = "1.80.0")]
+impl<I, A: Allocator> !Iterator for Box<[I], A> {}
+
+/// This implementation is required to make sure that the `&Box<[I]>: IntoIterator`
+/// implementation doesn't overlap with `IntoIterator for T where T: Iterator` blanket.
+#[stable(feature = "boxed_slice_into_iter", since = "1.80.0")]
+impl<'a, I, A: Allocator> !Iterator for &'a Box<[I], A> {}
+
+/// This implementation is required to make sure that the `&mut Box<[I]>: IntoIterator`
+/// implementation doesn't overlap with `IntoIterator for T where T: Iterator` blanket.
+#[stable(feature = "boxed_slice_into_iter", since = "1.80.0")]
+impl<'a, I, A: Allocator> !Iterator for &'a mut Box<[I], A> {}
+
+// Note: the `#[rustc_skip_during_method_dispatch(boxed_slice)]` on `trait IntoIterator`
+// hides this implementation from explicit `.into_iter()` calls on editions < 2024,
+// so those calls will still resolve to the slice implementation, by reference.
+#[stable(feature = "boxed_slice_into_iter", since = "1.80.0")]
+impl<I, A: Allocator> IntoIterator for Box<[I], A> {
+    type IntoIter = vec::IntoIter<I, A>;
+    type Item = I;
+    fn into_iter(self) -> vec::IntoIter<I, A> {
+        self.into_vec().into_iter()
+    }
+}
+
+#[stable(feature = "boxed_slice_into_iter", since = "1.80.0")]
+impl<'a, I, A: Allocator> IntoIterator for &'a Box<[I], A> {
+    type IntoIter = slice::Iter<'a, I>;
+    type Item = &'a I;
+    fn into_iter(self) -> slice::Iter<'a, I> {
+        self.iter()
+    }
+}
+
+#[stable(feature = "boxed_slice_into_iter", since = "1.80.0")]
+impl<'a, I, A: Allocator> IntoIterator for &'a mut Box<[I], A> {
+    type IntoIter = slice::IterMut<'a, I>;
+    type Item = &'a mut I;
+    fn into_iter(self) -> slice::IterMut<'a, I> {
+        self.iter_mut()
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "boxed_str_from_iter", since = "1.80.0")]
+impl FromIterator<char> for Box<str> {
+    fn from_iter<T: IntoIterator<Item = char>>(iter: T) -> Self {
+        String::from_iter(iter).into_boxed_str()
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "boxed_str_from_iter", since = "1.80.0")]
+impl<'a> FromIterator<&'a char> for Box<str> {
+    fn from_iter<T: IntoIterator<Item = &'a char>>(iter: T) -> Self {
+        String::from_iter(iter).into_boxed_str()
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "boxed_str_from_iter", since = "1.80.0")]
+impl<'a> FromIterator<&'a str> for Box<str> {
+    fn from_iter<T: IntoIterator<Item = &'a str>>(iter: T) -> Self {
+        String::from_iter(iter).into_boxed_str()
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "boxed_str_from_iter", since = "1.80.0")]
+impl FromIterator<String> for Box<str> {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        String::from_iter(iter).into_boxed_str()
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "boxed_str_from_iter", since = "1.80.0")]
+impl<A: Allocator> FromIterator<Box<str, A>> for Box<str> {
+    fn from_iter<T: IntoIterator<Item = Box<str, A>>>(iter: T) -> Self {
+        String::from_iter(iter).into_boxed_str()
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "boxed_str_from_iter", since = "1.80.0")]
+impl<'a> FromIterator<Cow<'a, str>> for Box<str> {
+    fn from_iter<T: IntoIterator<Item = Cow<'a, str>>>(iter: T) -> Self {
+        String::from_iter(iter).into_boxed_str()
+    }
+}
+
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "box_slice_clone", since = "1.3.0")]
 impl<T: Clone, A: Allocator + Clone> Clone for Box<[T], A> {
@@ -2081,11 +2229,29 @@ impl<T: Clone, A: Allocator + Clone> Clone for Box<[T], A> {
         self.to_vec_in(alloc).into_boxed_slice()
     }
 
-    fn clone_from(&mut self, other: &Self) {
-        if self.len() == other.len() {
-            self.clone_from_slice(&other);
+    /// Copies `source`'s contents into `self` without creating a new allocation,
+    /// so long as the two are of the same length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let x = Box::new([5, 6, 7]);
+    /// let mut y = Box::new([8, 9, 10]);
+    /// let yp: *const [i32] = &*y;
+    ///
+    /// y.clone_from(&x);
+    ///
+    /// // The value is the same
+    /// assert_eq!(x, y);
+    ///
+    /// // And no allocation occurred
+    /// assert_eq!(yp, &*y);
+    /// ```
+    fn clone_from(&mut self, source: &Self) {
+        if self.len() == source.len() {
+            self.clone_from_slice(&source);
         } else {
-            *self = other.clone();
+            *self = source.clone();
         }
     }
 }
@@ -2214,7 +2380,7 @@ impl dyn Error + Send {
         let err: Box<dyn Error> = self;
         <dyn Error>::downcast(err).map_err(|s| unsafe {
             // Reapply the `Send` marker.
-            Box::from_raw(Box::into_raw(s) as *mut (dyn Error + Send))
+            mem::transmute::<Box<dyn Error>, Box<dyn Error + Send>>(s)
         })
     }
 }
@@ -2227,8 +2393,8 @@ impl dyn Error + Send + Sync {
     pub fn downcast<T: Error + 'static>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
         let err: Box<dyn Error> = self;
         <dyn Error>::downcast(err).map_err(|s| unsafe {
-            // Reapply the `Send + Sync` marker.
-            Box::from_raw(Box::into_raw(s) as *mut (dyn Error + Send + Sync))
+            // Reapply the `Send + Sync` markers.
+            mem::transmute::<Box<dyn Error>, Box<dyn Error + Send + Sync>>(s)
         })
     }
 }

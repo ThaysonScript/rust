@@ -1,12 +1,14 @@
 use std::ops::Range;
 
-use pulldown_cmark::{BrokenLink, CowStr, Event, LinkType, OffsetIter, Parser, Tag};
+use pulldown_cmark::{
+    BrokenLink, BrokenLinkCallback, CowStr, Event, LinkType, OffsetIter, Parser, Tag,
+};
 use rustc_ast::NodeId;
 use rustc_errors::SuggestionStyle;
 use rustc_hir::def::{DefKind, DocLinkResMap, Namespace, Res};
 use rustc_hir::HirId;
 use rustc_lint_defs::Applicability;
-use rustc_resolve::rustdoc::source_span_for_markdown_range;
+use rustc_resolve::rustdoc::{prepare_to_doc_link_resolution, source_span_for_markdown_range};
 use rustc_span::def_id::DefId;
 use rustc_span::Symbol;
 
@@ -29,16 +31,13 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item) {
         return;
     };
 
-    let doc = item.doc_value();
-    if doc.is_empty() {
-        return;
-    }
-
-    if let Some(item_id) = item.def_id() {
-        check_redundant_explicit_link_for_did(cx, item, item_id, hir_id, &doc);
-    }
-    if let Some(item_id) = item.inline_stmt_id {
-        check_redundant_explicit_link_for_did(cx, item, item_id, hir_id, &doc);
+    let hunks = prepare_to_doc_link_resolution(&item.attrs.doc_strings);
+    for (item_id, doc) in hunks {
+        if let Some(item_id) = item_id.or(item.def_id())
+            && !doc.is_empty()
+        {
+            check_redundant_explicit_link_for_did(cx, item, item_id, hir_id, &doc);
+        }
     }
 }
 
@@ -90,7 +89,7 @@ fn check_redundant_explicit_link<'md>(
 ) -> Option<()> {
     let mut broken_line_callback = |link: BrokenLink<'md>| Some((link.reference, "".into()));
     let mut offset_iter = Parser::new_with_broken_link_callback(
-        &doc,
+        doc,
         main_body_opts(),
         Some(&mut broken_line_callback),
     )
@@ -98,7 +97,7 @@ fn check_redundant_explicit_link<'md>(
 
     while let Some((event, link_range)) = offset_iter.next() {
         match event {
-            Event::Start(Tag::Link(link_type, dest, _)) => {
+            Event::Start(Tag::Link { link_type, dest_url, .. }) => {
                 let link_data = collect_link_data(&mut offset_iter);
 
                 if let Some(resolvable_link) = link_data.resolvable_link.as_ref() {
@@ -111,7 +110,7 @@ fn check_redundant_explicit_link<'md>(
                     }
                 }
 
-                let explicit_link = dest.to_string();
+                let explicit_link = dest_url.to_string();
                 let display_link = link_data.resolvable_link.clone()?;
 
                 if explicit_link.ends_with(&display_link) || display_link.ends_with(&explicit_link)
@@ -125,7 +124,7 @@ fn check_redundant_explicit_link<'md>(
                                 doc,
                                 resolutions,
                                 link_range,
-                                dest.to_string(),
+                                dest_url.to_string(),
                                 link_data,
                                 if link_type == LinkType::Inline {
                                     (b'(', b')')
@@ -142,7 +141,7 @@ fn check_redundant_explicit_link<'md>(
                                 doc,
                                 resolutions,
                                 link_range,
-                                &dest,
+                                &dest_url,
                                 link_data,
                             );
                         }
@@ -191,8 +190,9 @@ fn check_inline_or_reference_unknown_redundancy(
             &item.attrs.doc_strings,
         )?;
 
-        cx.tcx.node_span_lint(crate::lint::REDUNDANT_EXPLICIT_LINKS, hir_id, explicit_span, "redundant explicit link target", |lint| {
-            lint.span_label(explicit_span, "explicit target is redundant")
+        cx.tcx.node_span_lint(crate::lint::REDUNDANT_EXPLICIT_LINKS, hir_id, explicit_span, |lint| {
+            lint.primary_message("redundant explicit link target")
+                .span_label(explicit_span, "explicit target is redundant")
                 .span_label(display_span, "because label contains path that resolves to same destination")
                 .note("when a link's destination is not specified,\nthe label is used to resolve intra-doc links")
                 .span_suggestion_with_style(link_span, "remove explicit link target", format!("[{}]", link_data.display_link), Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
@@ -241,8 +241,9 @@ fn check_reference_redundancy(
             &item.attrs.doc_strings,
         )?;
 
-        cx.tcx.node_span_lint(crate::lint::REDUNDANT_EXPLICIT_LINKS, hir_id, explicit_span, "redundant explicit link target", |lint| {
-            lint.span_label(explicit_span, "explicit target is redundant")
+        cx.tcx.node_span_lint(crate::lint::REDUNDANT_EXPLICIT_LINKS, hir_id, explicit_span, |lint| {
+            lint.primary_message("redundant explicit link target")
+            .span_label(explicit_span, "explicit target is redundant")
                 .span_label(display_span, "because label contains path that resolves to same destination")
                 .span_note(def_span, "referenced explicit link target defined here")
                 .note("when a link's destination is not specified,\nthe label is used to resolve intra-doc links")
@@ -260,10 +261,13 @@ fn find_resolution(resolutions: &DocLinkResMap, path: &str) -> Option<Res<NodeId
 }
 
 /// Collects all necessary data of link.
-fn collect_link_data(offset_iter: &mut OffsetIter<'_, '_>) -> LinkData {
+fn collect_link_data<'input, F: BrokenLinkCallback<'input>>(
+    offset_iter: &mut OffsetIter<'input, F>,
+) -> LinkData {
     let mut resolvable_link = None;
     let mut resolvable_link_range = None;
     let mut display_link = String::new();
+    let mut is_resolvable = true;
 
     while let Some((event, range)) = offset_iter.next() {
         match event {
@@ -281,11 +285,21 @@ fn collect_link_data(offset_iter: &mut OffsetIter<'_, '_>) -> LinkData {
                 resolvable_link = Some(code);
                 resolvable_link_range = Some(range);
             }
+            Event::Start(_) => {
+                // If there is anything besides backticks, it's not considered as an intra-doc link
+                // so we ignore it.
+                is_resolvable = false;
+            }
             Event::End(_) => {
                 break;
             }
             _ => {}
         }
+    }
+
+    if !is_resolvable {
+        resolvable_link_range = None;
+        resolvable_link = None;
     }
 
     LinkData { resolvable_link, resolvable_link_range, display_link }

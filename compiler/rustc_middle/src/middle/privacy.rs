@@ -1,8 +1,9 @@
 //! A pass that checks to make sure private fields and methods aren't used
 //! outside their scopes. This pass will also generate a set of exported items
 //! which are available for use externally when compiled as a library.
+
 use crate::ty::{TyCtxt, Visibility};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxIndexMap, IndexEntry};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir::def::DefKind;
 use rustc_macros::HashStable;
@@ -90,7 +91,7 @@ impl EffectiveVisibility {
 /// Holds a map of effective visibilities for reachable HIR nodes.
 #[derive(Clone, Debug)]
 pub struct EffectiveVisibilities<Id = LocalDefId> {
-    map: FxHashMap<Id, EffectiveVisibility>,
+    map: FxIndexMap<Id, EffectiveVisibility>,
 }
 
 impl EffectiveVisibilities {
@@ -130,9 +131,8 @@ impl EffectiveVisibilities {
         eff_vis: &EffectiveVisibility,
         tcx: TyCtxt<'_>,
     ) {
-        use std::collections::hash_map::Entry;
         match self.map.entry(def_id) {
-            Entry::Occupied(mut occupied) => {
+            IndexEntry::Occupied(mut occupied) => {
                 let old_eff_vis = occupied.get_mut();
                 for l in Level::all_levels() {
                     let vis_at_level = eff_vis.at_level(l);
@@ -145,7 +145,7 @@ impl EffectiveVisibilities {
                 }
                 old_eff_vis
             }
-            Entry::Vacant(vacant) => vacant.insert(*eff_vis),
+            IndexEntry::Vacant(vacant) => vacant.insert(*eff_vis),
         };
     }
 

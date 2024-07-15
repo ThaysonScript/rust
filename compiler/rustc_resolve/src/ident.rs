@@ -1,13 +1,17 @@
 use rustc_ast::{self as ast, NodeId};
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{DefKind, Namespace, NonMacroAttrKind, PartialRes, PerNS};
 use rustc_middle::bug;
 use rustc_middle::ty;
 use rustc_session::lint::builtin::PROC_MACRO_DERIVE_RESOLUTION_FALLBACK;
-use rustc_session::lint::BuiltinLintDiagnostics;
+use rustc_session::lint::BuiltinLintDiag;
+use rustc_session::parse::feature_err;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::hygiene::{ExpnId, ExpnKind, LocalExpnId, MacroKind, SyntaxContext};
+use rustc_span::sym;
 use rustc_span::symbol::{kw, Ident};
 use rustc_span::Span;
+use tracing::{debug, instrument};
 
 use crate::errors::{ParamKindInEnumDiscriminant, ParamKindInNonTrivialAnonConst};
 use crate::late::{ConstantHasGenerics, NoConstantGenericsReason, PathSource, Rib, RibKind};
@@ -520,18 +524,15 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         match binding {
                             Ok(binding) => {
                                 if let Some(lint_id) = derive_fallback_lint_id {
-                                    this.lint_buffer.buffer_lint_with_diagnostic(
+                                    this.lint_buffer.buffer_lint(
                                         PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
                                         lint_id,
                                         orig_ident.span,
-                                        format!(
-                                            "cannot find {} `{}` in this scope",
-                                            ns.descr(),
-                                            ident
-                                        ),
-                                        BuiltinLintDiagnostics::ProcMacroDeriveResolutionFallback(
-                                            orig_ident.span,
-                                        ),
+                                        BuiltinLintDiag::ProcMacroDeriveResolutionFallback {
+                                            span: orig_ident.span,
+                                            ns,
+                                            ident,
+                                        },
                                     );
                                 }
                                 let misc_flags = if module == this.graph_root {
@@ -597,7 +598,37 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         result
                     }
                     Scope::BuiltinTypes => match this.builtin_types_bindings.get(&ident.name) {
-                        Some(binding) => Ok((*binding, Flags::empty())),
+                        Some(binding) => {
+                            if matches!(ident.name, sym::f16)
+                                && !this.tcx.features().f16
+                                && !ident.span.allows_unstable(sym::f16)
+                                && finalize.is_some()
+                                && innermost_result.is_none()
+                            {
+                                feature_err(
+                                    this.tcx.sess,
+                                    sym::f16,
+                                    ident.span,
+                                    "the type `f16` is unstable",
+                                )
+                                .emit();
+                            }
+                            if matches!(ident.name, sym::f128)
+                                && !this.tcx.features().f128
+                                && !ident.span.allows_unstable(sym::f128)
+                                && finalize.is_some()
+                                && innermost_result.is_none()
+                            {
+                                feature_err(
+                                    this.tcx.sess,
+                                    sym::f128,
+                                    ident.span,
+                                    "the type `f128` is unstable",
+                                )
+                                .emit();
+                            }
+                            Ok((*binding, Flags::empty()))
+                        }
                         None => Err(Determinacy::Determined),
                     },
                 };
@@ -867,7 +898,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             .into_iter()
             .find_map(|binding| if binding == ignore_binding { None } else { binding });
 
-        if let Some(Finalize { path_span, report_private, used, .. }) = finalize {
+        if let Some(Finalize { path_span, report_private, used, root_span, .. }) = finalize {
             let Some(binding) = binding else {
                 return Err((Determined, Weak::No));
             };
@@ -880,6 +911,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         dedup_span: path_span,
                         outermost_res: None,
                         parent_scope: *parent_scope,
+                        single_nested: path_span != root_span,
                     });
                 } else {
                     return Err((Determined, Weak::No));
@@ -933,6 +965,21 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         // if it can then our result is not determined and can be invalidated.
         for single_import in &resolution.single_imports {
             let Some(import_vis) = single_import.vis.get() else {
+                // This branch handles a cycle in single imports, which occurs
+                // when we've previously **steal** the `vis` value during an import
+                // process.
+                //
+                // For example:
+                // ```
+                // use a::b;
+                // use b as a;
+                // ```
+                // 1. Steal the `vis` in `use a::b` and attempt to locate `a` in the
+                //    current module.
+                // 2. Encounter the import `use b as a`, which is a `single_import` for `a`,
+                //    and try to find `b` in the current module.
+                // 3. Re-encounter the `use a::b` import since it's a `single_import` of `b`.
+                //    This leads to entering this branch.
                 continue;
             };
             if !self.is_accessible_from(import_vis, parent_scope.module) {
@@ -947,15 +994,32 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 // named imports.
                 continue;
             }
+
             let Some(module) = single_import.imported_module.get() else {
                 return Err((Undetermined, Weak::No));
             };
-            let ImportKind::Single { source: ident, .. } = single_import.kind else {
+            let ImportKind::Single { source, target, target_bindings, .. } = &single_import.kind
+            else {
                 unreachable!();
             };
+            if source != target {
+                // This branch allows the binding to be defined or updated later if the target name
+                // can hide the source.
+                if target_bindings.iter().all(|binding| binding.get().is_none()) {
+                    // None of the target bindings are available, so we can't determine
+                    // if this binding is correct or not.
+                    // See more details in #124840
+                    return Err((Undetermined, Weak::No));
+                } else if target_bindings[ns].get().is_none() && binding.is_some() {
+                    // `binding.is_some()` avoids the condition where the binding
+                    // truly doesn't exist in this namespace and should return `Err(Determined)`.
+                    return Err((Undetermined, Weak::No));
+                }
+            }
+
             match self.resolve_ident_in_module(
                 module,
-                ident,
+                *source,
                 ns,
                 &single_import.parent_scope,
                 None,
@@ -1066,7 +1130,6 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         original_rib_ident_def: Ident,
         all_ribs: &[Rib<'a>],
     ) -> Res {
-        const CG_BUG_STR: &str = "min_const_generics resolve check didn't stop compilation";
         debug!("validate_res_from_ribs({:?})", res);
         let ribs = &all_ribs[rib_index + 1..];
 
@@ -1115,21 +1178,41 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                             if let Some(span) = finalize {
                                 let (span, resolution_error) = match item {
                                     None if rib_ident.as_str() == "self" => (span, LowercaseSelf),
-                                    None => (
-                                        rib_ident.span,
-                                        AttemptToUseNonConstantValueInConstant(
-                                            original_rib_ident_def,
-                                            "const",
-                                            "let",
-                                        ),
-                                    ),
+                                    None => {
+                                        // If we have a `let name = expr;`, we have the span for
+                                        // `name` and use that to see if it is followed by a type
+                                        // specifier. If not, then we know we need to suggest
+                                        // `const name: Ty = expr;`. This is a heuristic, it will
+                                        // break down in the presence of macros.
+                                        let sm = self.tcx.sess.source_map();
+                                        let type_span = match sm.span_look_ahead(
+                                            original_rib_ident_def.span,
+                                            ":",
+                                            None,
+                                        ) {
+                                            None => {
+                                                Some(original_rib_ident_def.span.shrink_to_hi())
+                                            }
+                                            Some(_) => None,
+                                        };
+                                        (
+                                            rib_ident.span,
+                                            AttemptToUseNonConstantValueInConstant {
+                                                ident: original_rib_ident_def,
+                                                suggestion: "const",
+                                                current: "let",
+                                                type_span,
+                                            },
+                                        )
+                                    }
                                     Some((ident, kind)) => (
                                         span,
-                                        AttemptToUseNonConstantValueInConstant(
+                                        AttemptToUseNonConstantValueInConstant {
                                             ident,
-                                            "let",
-                                            kind.as_str(),
-                                        ),
+                                            suggestion: "let",
+                                            current: kind.as_str(),
+                                            type_span: None,
+                                        },
                                     ),
                                 };
                                 self.report_error(span, resolution_error);
@@ -1209,8 +1292,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                                                 }
                                             }
                                         };
-                                        self.report_error(span, error);
-                                        self.dcx().span_delayed_bug(span, CG_BUG_STR);
+                                        let _: ErrorGuaranteed = self.report_error(span, error);
                                     }
 
                                     return Res::Err;

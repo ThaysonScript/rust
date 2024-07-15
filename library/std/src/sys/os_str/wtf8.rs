@@ -1,5 +1,6 @@
-/// The underlying OsString/OsStr implementation on Windows is a
-/// wrapper around the "WTF-8" encoding; see the `wtf8` module for more.
+//! The underlying OsString/OsStr implementation on Windows is a
+//! wrapper around the "WTF-8" encoding; see the `wtf8` module for more.
+
 use crate::borrow::Cow;
 use crate::collections::TryReserveError;
 use crate::fmt;
@@ -139,6 +140,11 @@ impl Buf {
     }
 
     #[inline]
+    pub fn leak<'a>(self) -> &'a mut Slice {
+        unsafe { mem::transmute(self.inner.leak()) }
+    }
+
+    #[inline]
     pub fn into_box(self) -> Box<Slice> {
         unsafe { mem::transmute(self.inner.into_box()) }
     }
@@ -157,6 +163,22 @@ impl Buf {
     #[inline]
     pub fn into_rc(&self) -> Rc<Slice> {
         self.as_slice().into_rc()
+    }
+
+    /// Provides plumbing to core `Vec::truncate`.
+    /// More well behaving alternative to allowing outer types
+    /// full mutable access to the core `Vec`.
+    #[inline]
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.inner.truncate(len);
+    }
+
+    /// Provides plumbing to core `Vec::extend_from_slice`.
+    /// More well behaving alternative to allowing outer types
+    /// full mutable access to the core `Vec`.
+    #[inline]
+    pub(crate) fn extend_from_slice(&mut self, other: &[u8]) {
+        self.inner.extend_from_slice(other);
     }
 }
 

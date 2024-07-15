@@ -8,22 +8,28 @@
 
 use std::assert_matches::assert_matches;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::ptr;
 
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
+use rustc_hir::def::DefKind;
+use rustc_middle::bug;
 use rustc_middle::mir::display_allocation;
 use rustc_middle::ty::{self, Instance, ParamEnv, Ty, TyCtxt};
 use rustc_target::abi::{Align, HasDataLayout, Size};
 
+use tracing::{debug, instrument, trace};
+
 use crate::fluent_generated as fluent;
 
 use super::{
-    alloc_range, AllocBytes, AllocId, AllocMap, AllocRange, Allocation, CheckAlignMsg,
-    CheckInAllocMsg, CtfeProvenance, GlobalAlloc, InterpCx, InterpResult, Machine, MayLeak,
-    Misalignment, Pointer, PointerArithmetic, Provenance, Scalar,
+    alloc_range, err_ub, err_ub_custom, throw_ub, throw_ub_custom, throw_unsup, throw_unsup_format,
+    AllocBytes, AllocId, AllocMap, AllocRange, Allocation, CheckAlignMsg, CheckInAllocMsg,
+    CtfeProvenance, GlobalAlloc, InterpCx, InterpResult, Machine, MayLeak, Misalignment, Pointer,
+    PointerArithmetic, Provenance, Scalar,
 };
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -90,7 +96,7 @@ impl<'tcx, Other> FnVal<'tcx, Other> {
 
 // `Memory` has to depend on the `Machine` because some of its operations
 // (e.g., `get`) call a `Machine` hook.
-pub struct Memory<'mir, 'tcx, M: Machine<'mir, 'tcx>> {
+pub struct Memory<'tcx, M: Machine<'tcx>> {
     /// Allocations local to this instance of the interpreter. The kind
     /// helps ensure that the same mechanism is used for allocation and
     /// deallocation. When an allocation is not found here, it is a
@@ -111,6 +117,11 @@ pub struct Memory<'mir, 'tcx, M: Machine<'mir, 'tcx>> {
     /// that do not exist any more.
     // FIXME: this should not be public, but interning currently needs access to it
     pub(super) dead_alloc_map: FxIndexMap<AllocId, (Size, Align)>,
+
+    /// This stores whether we are currently doing reads purely for the purpose of validation.
+    /// Those reads do not trigger the machine's hooks for memory reads.
+    /// Needless to say, this must only be set with great care!
+    validation_in_progress: Cell<bool>,
 }
 
 /// A reference to some allocation that was already bounds-checked for the given region
@@ -131,12 +142,13 @@ pub struct AllocRefMut<'a, 'tcx, Prov: Provenance, Extra, Bytes: AllocBytes = Bo
     alloc_id: AllocId,
 }
 
-impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Memory<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> Memory<'tcx, M> {
     pub fn new() -> Self {
         Memory {
             alloc_map: M::MemoryMap::default(),
             extra_fn_ptr_map: FxIndexMap::default(),
             dead_alloc_map: FxIndexMap::default(),
+            validation_in_progress: Cell::new(false),
         }
     }
 
@@ -146,7 +158,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Memory<'mir, 'tcx, M> {
     }
 }
 
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Call this to turn untagged "global" pointers (obtained via `tcx`) into
     /// the machine pointer to the allocation. Must never be used
     /// for any other pointers, nor for TLS statics.
@@ -157,7 +169,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     ///
     /// This function can fail only if `ptr` points to an `extern static`.
     #[inline]
-    pub fn global_base_pointer(
+    pub fn global_root_pointer(
         &self,
         ptr: Pointer<CtfeProvenance>,
     ) -> InterpResult<'tcx, Pointer<M::Provenance>> {
@@ -170,12 +182,18 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 bug!("global memory cannot point to thread-local static")
             }
             Some(GlobalAlloc::Static(def_id)) if self.tcx.is_foreign_item(def_id) => {
-                return M::extern_static_base_pointer(self, def_id);
+                return M::extern_static_pointer(self, def_id);
+            }
+            None => {
+                assert!(
+                    self.memory.extra_fn_ptr_map.contains_key(&alloc_id),
+                    "{alloc_id:?} is neither global nor a function pointer"
+                );
             }
             _ => {}
         }
         // And we need to get the provenance.
-        M::adjust_alloc_base_pointer(self, ptr)
+        M::adjust_alloc_root_pointer(self, ptr, M::GLOBAL_KIND.map(MemoryKind::Machine))
     }
 
     pub fn fn_ptr(&mut self, fn_val: FnVal<'tcx, M::ExtraFnVal>) -> Pointer<M::Provenance> {
@@ -189,9 +207,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 id
             }
         };
-        // Functions are global allocations, so make sure we get the right base pointer.
+        // Functions are global allocations, so make sure we get the right root pointer.
         // We know this is not an `extern static` so this cannot fail.
-        self.global_base_pointer(Pointer::from(id)).unwrap()
+        self.global_root_pointer(Pointer::from(id)).unwrap()
     }
 
     pub fn allocate_ptr(
@@ -219,10 +237,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         self.allocate_raw_ptr(alloc, kind)
     }
 
-    /// This can fail only if `alloc` contains provenance.
     pub fn allocate_raw_ptr(
         &mut self,
-        alloc: Allocation,
+        alloc: Allocation<M::Provenance, (), M::Bytes>,
         kind: MemoryKind<M::MemoryKind>,
     ) -> InterpResult<'tcx, Pointer<M::Provenance>> {
         let id = self.tcx.reserve_alloc_id();
@@ -231,9 +248,12 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             M::GLOBAL_KIND.map(MemoryKind::Machine),
             "dynamically allocating global memory"
         );
-        let alloc = M::adjust_allocation(self, id, Cow::Owned(alloc), Some(kind))?;
-        self.memory.alloc_map.insert(id, (kind, alloc.into_owned()));
-        M::adjust_alloc_base_pointer(self, Pointer::from(id))
+        // We have set things up so we don't need to call `adjust_from_tcx` here,
+        // so we avoid copying the entire allocation contents.
+        let extra = M::init_alloc_extra(self, id, kind, alloc.size(), alloc.align)?;
+        let alloc = alloc.with_extra(extra);
+        self.memory.alloc_map.insert(id, (kind, alloc));
+        M::adjust_alloc_root_pointer(self, Pointer::from(id), Some(kind))
     }
 
     pub fn reallocate_ptr(
@@ -288,7 +308,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         let Some((alloc_kind, mut alloc)) = self.memory.alloc_map.remove(&alloc_id) else {
             // Deallocating global memory -- always an error
             return Err(match self.tcx.try_get_global_alloc(alloc_id) {
-                Some(GlobalAlloc::Function(..)) => {
+                Some(GlobalAlloc::Function { .. }) => {
                     err_ub_custom!(
                         fluent::const_eval_invalid_dealloc,
                         alloc_id = alloc_id,
@@ -345,7 +365,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             &mut self.machine,
             &mut alloc.extra,
             (alloc_id, prov),
-            alloc_range(Size::ZERO, size),
+            size,
+            alloc.align,
+            kind,
         )?;
 
         // Don't forget to remember size and align of this now-dead allocation
@@ -396,6 +418,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// to the allocation it points to. Supports both shared and mutable references, as the actual
     /// checking is offloaded to a helper closure.
     ///
+    /// `alloc_size` will only get called for non-zero-sized accesses.
+    ///
     /// Returns `None` if and only if the size is 0.
     fn check_and_deref_ptr<T>(
         &self,
@@ -408,20 +432,21 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             M::ProvenanceExtra,
         ) -> InterpResult<'tcx, (Size, Align, T)>,
     ) -> InterpResult<'tcx, Option<T>> {
+        // Everything is okay with size 0.
+        if size.bytes() == 0 {
+            return Ok(None);
+        }
+
         Ok(match self.ptr_try_get_alloc_id(ptr) {
             Err(addr) => {
-                // We couldn't get a proper allocation. This is only okay if the access size is 0,
-                // and the address is not null.
-                if size.bytes() > 0 || addr == 0 {
-                    throw_ub!(DanglingIntPointer(addr, msg));
-                }
-                None
+                // We couldn't get a proper allocation.
+                throw_ub!(DanglingIntPointer(addr, msg));
             }
             Ok((alloc_id, offset, prov)) => {
                 let (alloc_size, _alloc_align, ret_val) = alloc_size(alloc_id, offset, prov)?;
-                // Test bounds. This also ensures non-null.
+                // Test bounds.
                 // It is sufficient to check this for the end pointer. Also check for overflow!
-                if offset.checked_add(size, &self.tcx).map_or(true, |end| end > alloc_size) {
+                if offset.checked_add(size, &self.tcx).is_none_or(|end| end > alloc_size) {
                     throw_ub!(PointerOutOfBounds {
                         alloc_id,
                         alloc_size,
@@ -430,14 +455,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                         msg,
                     })
                 }
-                // Ensure we never consider the null pointer dereferenceable.
-                if M::Provenance::OFFSET_IS_ADDR {
-                    assert_ne!(ptr.addr(), Size::ZERO);
-                }
 
-                // We can still be zero-sized in this branch, in which case we have to
-                // return `None`.
-                if size.bytes() == 0 { None } else { Some(ret_val) }
+                Some(ret_val)
             }
         })
     }
@@ -508,7 +527,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     }
 }
 
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// This function is used by Miri's provenance GC to remove unreachable entries from the dead_alloc_map.
     pub fn remove_unreachable_allocs(&mut self, reachable_allocs: &FxHashSet<AllocId>) {
         // Unlike all the other GC helpers where we check if an `AllocId` is found in the interpreter or
@@ -520,7 +539,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 }
 
 /// Allocation accessors
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Helper function to obtain a global (tcx) allocation.
     /// This attempts to return a reference to an existing allocation if
     /// one can be found in `tcx`. That, however, is only possible if `tcx` and
@@ -536,7 +555,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 // Memory of a constant or promoted or anonymous memory referenced by a static.
                 (mem, None)
             }
-            Some(GlobalAlloc::Function(..)) => throw_ub!(DerefFunctionPointer(id)),
+            Some(GlobalAlloc::Function { .. }) => throw_ub!(DerefFunctionPointer(id)),
             Some(GlobalAlloc::VTable(..)) => throw_ub!(DerefVTablePointer(id)),
             None => throw_ub!(PointerUseAfterFree(id, CheckInAllocMsg::MemoryAccessTest)),
             Some(GlobalAlloc::Static(def_id)) => {
@@ -567,11 +586,10 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         };
         M::before_access_global(self.tcx, &self.machine, id, alloc, def_id, is_write)?;
         // We got tcx memory. Let the machine initialize its "extra" stuff.
-        M::adjust_allocation(
+        M::adjust_global_allocation(
             self,
             id, // always use the ID we got as input, not the "hidden" one.
-            Cow::Borrowed(alloc.inner()),
-            M::GLOBAL_KIND.map(MemoryKind::Machine),
+            alloc.inner(),
         )
     }
 
@@ -612,6 +630,13 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         }
     }
 
+    /// Gives raw, immutable access to the `Allocation` address, without bounds or alignment checks.
+    /// The caller is responsible for calling the access hooks!
+    pub fn get_alloc_bytes_unchecked_raw(&self, id: AllocId) -> InterpResult<'tcx, *const u8> {
+        let alloc = self.get_alloc_raw(id)?;
+        Ok(alloc.get_bytes_unchecked_raw())
+    }
+
     /// Bounds-checked *but not align-checked* allocation access.
     pub fn get_ptr_alloc<'a>(
         &'a self,
@@ -624,18 +649,30 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             size,
             CheckInAllocMsg::MemoryAccessTest,
             |alloc_id, offset, prov| {
-                // We want to call the hook on *all* accesses that involve an AllocId,
-                // including zero-sized accesses. That means we have to do it here
-                // rather than below in the `Some` branch.
-                M::before_alloc_read(self, alloc_id)?;
                 let alloc = self.get_alloc_raw(alloc_id)?;
                 Ok((alloc.size(), alloc.align, (alloc_id, offset, prov, alloc)))
             },
         )?;
+        // We want to call the hook on *all* accesses that involve an AllocId, including zero-sized
+        // accesses. That means we cannot rely on the closure above or the `Some` branch below. We
+        // do this after `check_and_deref_ptr` to ensure some basic sanity has already been checked.
+        if !self.memory.validation_in_progress.get() {
+            if let Ok((alloc_id, ..)) = self.ptr_try_get_alloc_id(ptr) {
+                M::before_alloc_read(self, alloc_id)?;
+            }
+        }
 
         if let Some((alloc_id, offset, prov, alloc)) = ptr_and_alloc {
             let range = alloc_range(offset, size);
-            M::before_memory_read(self.tcx, &self.machine, &alloc.extra, (alloc_id, prov), range)?;
+            if !self.memory.validation_in_progress.get() {
+                M::before_memory_read(
+                    self.tcx,
+                    &self.machine,
+                    &alloc.extra,
+                    (alloc_id, prov),
+                    range,
+                )?;
+            }
             Ok(Some(AllocRef { alloc, range, tcx: *self.tcx, alloc_id }))
         } else {
             Ok(None)
@@ -681,6 +718,16 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             throw_ub!(WriteToReadOnly(id))
         }
         Ok((alloc, &mut self.machine))
+    }
+
+    /// Gives raw, mutable access to the `Allocation` address, without bounds or alignment checks.
+    /// The caller is responsible for calling the access hooks!
+    pub fn get_alloc_bytes_unchecked_raw_mut(
+        &mut self,
+        id: AllocId,
+    ) -> InterpResult<'tcx, *mut u8> {
+        let alloc = self.get_alloc_raw_mut(id)?.0;
+        Ok(alloc.get_bytes_unchecked_raw_mut())
     }
 
     /// Bounds-checked *but not align-checked* allocation access.
@@ -744,19 +791,36 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         // be held throughout the match.
         match self.tcx.try_get_global_alloc(id) {
             Some(GlobalAlloc::Static(def_id)) => {
-                assert!(self.tcx.is_static(def_id));
                 // Thread-local statics do not have a constant address. They *must* be accessed via
                 // `ThreadLocalRef`; we can never have a pointer to them as a regular constant value.
                 assert!(!self.tcx.is_thread_local_static(def_id));
-                // Use size and align of the type.
-                let ty = self
-                    .tcx
-                    .type_of(def_id)
-                    .no_bound_vars()
-                    .expect("statics should not have generic parameters");
-                let layout = self.tcx.layout_of(ParamEnv::empty().and(ty)).unwrap();
-                assert!(layout.is_sized());
-                (layout.size, layout.align.abi, AllocKind::LiveData)
+
+                let DefKind::Static { nested, .. } = self.tcx.def_kind(def_id) else {
+                    bug!("GlobalAlloc::Static is not a static")
+                };
+
+                let (size, align) = if nested {
+                    // Nested anonymous statics are untyped, so let's get their
+                    // size and alignment from the allocaiton itself. This always
+                    // succeeds, as the query is fed at DefId creation time, so no
+                    // evaluation actually occurs.
+                    let alloc = self.tcx.eval_static_initializer(def_id).unwrap();
+                    (alloc.0.size(), alloc.0.align)
+                } else {
+                    // Use size and align of the type for everything else. We need
+                    // to do that to
+                    // * avoid cycle errors in case of self-referential statics,
+                    // * be able to get information on extern statics.
+                    let ty = self
+                        .tcx
+                        .type_of(def_id)
+                        .no_bound_vars()
+                        .expect("statics should not have generic parameters");
+                    let layout = self.tcx.layout_of(ParamEnv::empty().and(ty)).unwrap();
+                    assert!(layout.is_sized());
+                    (layout.size, layout.align.abi)
+                };
+                (size, align, AllocKind::LiveData)
             }
             Some(GlobalAlloc::Memory(alloc)) => {
                 // Need to duplicate the logic here, because the global allocations have
@@ -764,7 +828,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let alloc = alloc.inner();
                 (alloc.size(), alloc.align, AllocKind::LiveData)
             }
-            Some(GlobalAlloc::Function(_)) => bug!("We already checked function pointers above"),
+            Some(GlobalAlloc::Function { .. }) => {
+                bug!("We already checked function pointers above")
+            }
             Some(GlobalAlloc::VTable(..)) => {
                 // No data to be accessed here. But vtables are pointer-aligned.
                 return (Size::ZERO, self.tcx.data_layout.pointer_align.abi, AllocKind::VTable);
@@ -801,7 +867,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             Some(FnVal::Other(*extra))
         } else {
             match self.tcx.try_get_global_alloc(id) {
-                Some(GlobalAlloc::Function(instance)) => Some(FnVal::Instance(instance)),
+                Some(GlobalAlloc::Function { instance, .. }) => Some(FnVal::Instance(instance)),
                 _ => None,
             }
         }
@@ -820,19 +886,26 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             .ok_or_else(|| err_ub!(InvalidFunctionPointer(Pointer::new(alloc_id, offset))).into())
     }
 
-    pub fn get_ptr_vtable(
+    /// Get the dynamic type of the given vtable pointer.
+    /// If `expected_trait` is `Some`, it must be a vtable for the given trait.
+    pub fn get_ptr_vtable_ty(
         &self,
         ptr: Pointer<Option<M::Provenance>>,
-    ) -> InterpResult<'tcx, (Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>)> {
+        expected_trait: Option<&'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>>,
+    ) -> InterpResult<'tcx, Ty<'tcx>> {
         trace!("get_ptr_vtable({:?})", ptr);
         let (alloc_id, offset, _tag) = self.ptr_get_alloc_id(ptr)?;
         if offset.bytes() != 0 {
             throw_ub!(InvalidVTablePointer(Pointer::new(alloc_id, offset)))
         }
-        match self.tcx.try_get_global_alloc(alloc_id) {
-            Some(GlobalAlloc::VTable(ty, trait_ref)) => Ok((ty, trait_ref)),
-            _ => throw_ub!(InvalidVTablePointer(Pointer::new(alloc_id, offset))),
+        let Some(GlobalAlloc::VTable(ty, vtable_trait)) = self.tcx.try_get_global_alloc(alloc_id)
+        else {
+            throw_ub!(InvalidVTablePointer(Pointer::new(alloc_id, offset)))
+        };
+        if let Some(expected_trait) = expected_trait {
+            self.check_vtable_for_type(vtable_trait, expected_trait)?;
         }
+        Ok(ty)
     }
 
     pub fn alloc_mark_immutable(&mut self, id: AllocId) -> InterpResult<'tcx> {
@@ -843,14 +916,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// Create a lazy debug printer that prints the given allocation and all allocations it points
     /// to, recursively.
     #[must_use]
-    pub fn dump_alloc<'a>(&'a self, id: AllocId) -> DumpAllocs<'a, 'mir, 'tcx, M> {
+    pub fn dump_alloc<'a>(&'a self, id: AllocId) -> DumpAllocs<'a, 'tcx, M> {
         self.dump_allocs(vec![id])
     }
 
     /// Create a lazy debug printer for a list of allocations and all allocations they point to,
     /// recursively.
     #[must_use]
-    pub fn dump_allocs<'a>(&'a self, mut allocs: Vec<AllocId>) -> DumpAllocs<'a, 'mir, 'tcx, M> {
+    pub fn dump_allocs<'a>(&'a self, mut allocs: Vec<AllocId>) -> DumpAllocs<'a, 'tcx, M> {
         allocs.sort();
         allocs.dedup();
         DumpAllocs { ecx: self, allocs }
@@ -909,16 +982,33 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             }
         })
     }
+
+    /// Runs the close in "validation" mode, which means the machine's memory read hooks will be
+    /// suppressed. Needless to say, this must only be set with great care! Cannot be nested.
+    pub(super) fn run_for_validation<R>(&self, f: impl FnOnce() -> R) -> R {
+        // This deliberately uses `==` on `bool` to follow the pattern
+        // `assert!(val.replace(new) == old)`.
+        assert!(
+            self.memory.validation_in_progress.replace(true) == false,
+            "`validation_in_progress` was already set"
+        );
+        let res = f();
+        assert!(
+            self.memory.validation_in_progress.replace(false) == true,
+            "`validation_in_progress` was unset by someone else"
+        );
+        res
+    }
 }
 
 #[doc(hidden)]
 /// There's no way to use this directly, it's just a helper struct for the `dump_alloc(s)` methods.
-pub struct DumpAllocs<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> {
-    ecx: &'a InterpCx<'mir, 'tcx, M>,
+pub struct DumpAllocs<'a, 'tcx, M: Machine<'tcx>> {
+    ecx: &'a InterpCx<'tcx, M>,
     allocs: Vec<AllocId>,
 }
 
-impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> std::fmt::Debug for DumpAllocs<'a, 'mir, 'tcx, M> {
+impl<'a, 'tcx, M: Machine<'tcx>> std::fmt::Debug for DumpAllocs<'a, 'tcx, M> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Cannot be a closure because it is generic in `Prov`, `Extra`.
         fn write_allocation_track_relocs<'tcx, Prov: Provenance, Extra, Bytes: AllocBytes>(
@@ -968,8 +1058,8 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> std::fmt::Debug for DumpAllocs<'a, 
                                 alloc.inner(),
                             )?;
                         }
-                        Some(GlobalAlloc::Function(func)) => {
-                            write!(fmt, " (fn: {func})")?;
+                        Some(GlobalAlloc::Function { instance, .. }) => {
+                            write!(fmt, " (fn: {instance})")?;
                         }
                         Some(GlobalAlloc::VTable(ty, Some(trait_ref))) => {
                             write!(fmt, " (vtable: impl {trait_ref} for {ty})")?;
@@ -1063,7 +1153,7 @@ impl<'tcx, 'a, Prov: Provenance, Extra, Bytes: AllocBytes> AllocRef<'a, 'tcx, Pr
     }
 }
 
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Reads the given number of bytes from memory, and strips their provenance if possible.
     /// Returns them as a slice.
     ///
@@ -1106,11 +1196,11 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         };
 
         // Side-step AllocRef and directly access the underlying bytes more efficiently.
-        // (We are staying inside the bounds here so all is good.)
+        // (We are staying inside the bounds here and all bytes do get overwritten so all is good.)
         let alloc_id = alloc_ref.alloc_id;
         let bytes = alloc_ref
             .alloc
-            .get_bytes_mut(&alloc_ref.tcx, alloc_ref.range)
+            .get_bytes_unchecked_for_overwrite(&alloc_ref.tcx, alloc_ref.range)
             .map_err(move |e| e.to_interp_error(alloc_id))?;
         // `zip` would stop when the first iterator ends; we want to definitely
         // cover all of `bytes`.
@@ -1131,6 +1221,11 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         self.mem_copy_repeatedly(src, dest, size, 1, nonoverlapping)
     }
 
+    /// Performs `num_copies` many copies of `size` many bytes from `src` to `dest + i*size` (where
+    /// `i` is the index of the copy).
+    ///
+    /// Either `nonoverlapping` must be true or `num_copies` must be 1; doing repeated copies that
+    /// may overlap is not supported.
     pub fn mem_copy_repeatedly(
         &mut self,
         src: Pointer<Option<M::Provenance>>,
@@ -1154,6 +1249,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         };
         let src_alloc = self.get_alloc_raw(src_alloc_id)?;
         let src_range = alloc_range(src_offset, size);
+        assert!(!self.memory.validation_in_progress.get(), "we can't be copying during validation");
         M::before_memory_read(
             tcx,
             &self.machine,
@@ -1191,8 +1287,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             (dest_alloc_id, dest_prov),
             dest_range,
         )?;
+        // Yes we do overwrite all bytes in `dest_bytes`.
         let dest_bytes = dest_alloc
-            .get_bytes_mut_ptr(&tcx, dest_range)
+            .get_bytes_unchecked_for_overwrite_ptr(&tcx, dest_range)
             .map_err(|e| e.to_interp_error(dest_alloc_id))?
             .as_mut_ptr();
 
@@ -1226,6 +1323,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     }
                 }
             }
+            if num_copies > 1 {
+                assert!(nonoverlapping, "multi-copy only supported in non-overlapping mode");
+            }
 
             let size_in_bytes = size.bytes_usize();
             // For particularly large arrays (where this is perf-sensitive) it's common that
@@ -1238,6 +1338,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             } else if src_alloc_id == dest_alloc_id {
                 let mut dest_ptr = dest_bytes;
                 for _ in 0..num_copies {
+                    // Here we rely on `src` and `dest` being non-overlapping if there is more than
+                    // one copy.
                     ptr::copy(src_bytes, dest_ptr, size_in_bytes);
                     dest_ptr = dest_ptr.add(size_in_bytes);
                 }
@@ -1264,11 +1366,11 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 }
 
 /// Machine pointer introspection.
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Test if this value might be null.
     /// If the machine does not support ptr-to-int casts, this is conservative.
     pub fn scalar_may_be_null(&self, scalar: Scalar<M::Provenance>) -> InterpResult<'tcx, bool> {
-        Ok(match scalar.try_to_int() {
+        Ok(match scalar.try_to_scalar_int() {
             Ok(int) => int.is_null(),
             Err(_) => {
                 // Can only happen during CTFE.

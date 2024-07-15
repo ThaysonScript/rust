@@ -6,12 +6,11 @@ ARM64e iOS (12.0+)
 
 ## Target maintainers
 
-- Artyom Tetyukhin ([@arttet](https://github.com/https://github.com/arttet))
+- Artyom Tetyukhin ([@arttet](https://github.com/arttet))
 
 ## Requirements
 
-These targets only support cross-compilation.
-The targets do support `std`.
+See the docs on [`*-apple-ios`](apple-ios.md) for general iOS requirements.
 
 ## Building the target
 

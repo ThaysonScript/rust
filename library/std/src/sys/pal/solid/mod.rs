@@ -33,9 +33,6 @@ pub mod pipe;
 pub mod process;
 pub mod stdio;
 pub use self::itron::thread;
-pub mod memchr;
-pub mod thread_local_dtor;
-pub mod thread_local_key;
 pub use self::itron::thread_parking;
 pub mod time;
 
@@ -51,10 +48,7 @@ pub fn unsupported<T>() -> crate::io::Result<T> {
 }
 
 pub fn unsupported_err() -> crate::io::Error {
-    crate::io::const_io_error!(
-        crate::io::ErrorKind::Unsupported,
-        "operation not supported on this platform",
-    )
+    crate::io::Error::UNSUPPORTED_PLATFORM
 }
 
 #[inline]

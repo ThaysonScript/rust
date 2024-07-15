@@ -1,5 +1,6 @@
 // We want to control preemption here.
-//@compile-flags: -Zmiri-preemption-rate=0
+// Avoid accidental synchronization via address reuse.
+//@compile-flags: -Zmiri-preemption-rate=0 -Zmiri-address-reuse-cross-thread-rate=0
 
 #![feature(core_intrinsics)]
 
@@ -31,7 +32,7 @@ pub fn main() {
         let x_split = split_u32_ptr(x_ptr);
         unsafe {
             let hi = ptr::addr_of!((*x_split)[0]);
-            std::intrinsics::atomic_load_relaxed(hi); //~ ERROR: (1) 4-byte atomic store on thread `<unnamed>` and (2) 2-byte atomic load
+            std::intrinsics::atomic_load_relaxed(hi); //~ ERROR: (1) 4-byte atomic store on thread `unnamed-1` and (2) 2-byte atomic load
         }
     });
 

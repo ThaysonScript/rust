@@ -19,7 +19,7 @@ use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::sync::Lock;
 #[cfg(parallel_compiler)]
 use rustc_data_structures::{outline, sync};
-use rustc_errors::{DiagnosticBuilder, FatalError, StashKey};
+use rustc_errors::{Diag, FatalError, StashKey};
 use rustc_span::{Span, DUMMY_SP};
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
@@ -27,6 +27,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::mem;
 use thin_vec::ThinVec;
+use tracing::instrument;
 
 use super::QueryConfig;
 
@@ -124,7 +125,7 @@ fn handle_cycle_error<Q, Qcx>(
     query: Q,
     qcx: Qcx,
     cycle_error: &CycleError,
-    error: DiagnosticBuilder<'_>,
+    error: Diag<'_>,
 ) -> Q::Value
 where
     Q: QueryConfig<Qcx>,
@@ -149,8 +150,7 @@ where
             let guar = if let Some(root) = cycle_error.cycle.first()
                 && let Some(span) = root.query.span
             {
-                error.stash(span, StashKey::Cycle);
-                qcx.dep_context().sess().dcx().span_delayed_bug(span, "delayed cycle error")
+                error.stash(span, StashKey::Cycle).unwrap()
             } else {
                 error.emit()
             };
@@ -286,9 +286,8 @@ where
                     let lock = query.query_state(qcx).active.get_shard_by_value(&key).lock();
 
                     match lock.get(&key) {
-                        Some(QueryResult::Poisoned) => {
-                            panic!("query '{}' not cached due to poisoning", query.name())
-                        }
+                        // The query we waited on panicked. Continue unwinding here.
+                        Some(QueryResult::Poisoned) => FatalError.raise(),
                         _ => panic!(
                             "query '{}' result must be in the cache or the query must be poisoned after a wait",
                             query.name()

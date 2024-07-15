@@ -2,7 +2,7 @@
 
 #![allow(clippy::disallowed_types)]
 
-use std::path::PathBuf;
+use std::ops;
 
 use ide_db::line_index::WideEncoding;
 use lsp_types::request::Request;
@@ -11,11 +11,26 @@ use lsp_types::{
     PartialResultParams, Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 use lsp_types::{PositionEncodingKind, Url};
+use paths::Utf8PathBuf;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::line_index::PositionEncoding;
 
+pub enum InternalTestingFetchConfig {}
+
+impl Request for InternalTestingFetchConfig {
+    type Params = InternalTestingFetchConfigParams;
+    type Result = serde_json::Value;
+    const METHOD: &'static str = "rust-analyzer-internal/internalTestingFetchConfig";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct InternalTestingFetchConfigParams {
+    pub text_document: Option<TextDocumentIdentifier>,
+    pub config: String,
+}
 pub enum AnalyzerStatus {}
 
 impl Request for AnalyzerStatus {
@@ -161,6 +176,116 @@ impl Request for ViewItemTree {
     type Params = ViewItemTreeParams;
     type Result = String;
     const METHOD: &'static str = "rust-analyzer/viewItemTree";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverTestParams {
+    pub test_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum TestItemKind {
+    Package,
+    Module,
+    Test,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TestItem {
+    pub id: String,
+    pub label: String,
+    pub kind: TestItemKind,
+    pub can_resolve_children: bool,
+    pub parent: Option<String>,
+    pub text_document: Option<TextDocumentIdentifier>,
+    pub range: Option<Range>,
+    pub runnable: Option<Runnable>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverTestResults {
+    pub tests: Vec<TestItem>,
+    pub scope: Option<Vec<String>>,
+    pub scope_file: Option<Vec<TextDocumentIdentifier>>,
+}
+
+pub enum DiscoverTest {}
+
+impl Request for DiscoverTest {
+    type Params = DiscoverTestParams;
+    type Result = DiscoverTestResults;
+    const METHOD: &'static str = "experimental/discoverTest";
+}
+
+pub enum DiscoveredTests {}
+
+impl Notification for DiscoveredTests {
+    type Params = DiscoverTestResults;
+    const METHOD: &'static str = "experimental/discoveredTests";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RunTestParams {
+    pub include: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
+}
+
+pub enum RunTest {}
+
+impl Request for RunTest {
+    type Params = RunTestParams;
+    type Result = ();
+    const METHOD: &'static str = "experimental/runTest";
+}
+
+pub enum EndRunTest {}
+
+impl Notification for EndRunTest {
+    type Params = ();
+    const METHOD: &'static str = "experimental/endRunTest";
+}
+
+pub enum AppendOutputToRunTest {}
+
+impl Notification for AppendOutputToRunTest {
+    type Params = String;
+    const METHOD: &'static str = "experimental/appendOutputToRunTest";
+}
+
+pub enum AbortRunTest {}
+
+impl Notification for AbortRunTest {
+    type Params = ();
+    const METHOD: &'static str = "experimental/abortRunTest";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase", tag = "tag")]
+pub enum TestState {
+    Passed,
+    Failed { message: String },
+    Skipped,
+    Started,
+    Enqueued,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeTestStateParams {
+    pub test_id: String,
+    pub state: TestState,
+}
+
+pub enum ChangeTestState {}
+
+impl Notification for ChangeTestState {
+    type Params = ChangeTestStateParams;
+    const METHOD: &'static str = "experimental/changeTestState";
 }
 
 pub enum ExpandMacro {}
@@ -314,22 +439,33 @@ pub struct Runnable {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<lsp_types::LocationLink>,
     pub kind: RunnableKind,
-    pub args: CargoRunnable,
+    pub args: RunnableArgs,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+pub enum RunnableArgs {
+    Cargo(CargoRunnableArgs),
+    Shell(ShellRunnableArgs),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum RunnableKind {
     Cargo,
+    Shell,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct CargoRunnable {
+pub struct CargoRunnableArgs {
     // command to be executed instead of cargo
     pub override_cargo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_root: Option<PathBuf>,
+    pub workspace_root: Option<Utf8PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<Utf8PathBuf>,
     // command, --package and --lib stuff
     pub cargo_args: Vec<String>,
     // user-specified additional cargo args, like `--release`.
@@ -338,6 +474,14 @@ pub struct CargoRunnable {
     pub executable_args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expect_test: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellRunnableArgs {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: Utf8PathBuf,
 }
 
 pub enum RelatedTests {}
@@ -351,13 +495,6 @@ impl Request for RelatedTests {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TestInfo {
     pub runnable: Runnable,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct InlayHintsParams {
-    pub text_document: TextDocumentIdentifier,
-    pub range: Option<lsp_types::Range>,
 }
 
 pub enum Ssr {}
@@ -391,6 +528,7 @@ impl Notification for ServerStatusNotification {
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Eq, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerStatusParams {
     pub health: Health,
     pub quiescent: bool,
@@ -403,6 +541,16 @@ pub enum Health {
     Ok,
     Warning,
     Error,
+}
+
+impl ops::BitOrAssign for Health {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = match (*self, rhs) {
+            (Health::Error, _) | (_, Health::Error) => Health::Error,
+            (Health::Warning, _) | (_, Health::Warning) => Health::Warning,
+            _ => Health::Ok,
+        }
+    }
 }
 
 pub enum CodeActionRequest {}
@@ -445,6 +593,7 @@ pub struct CodeAction {
 pub struct CodeActionData {
     pub code_action_params: lsp_types::CodeActionParams,
     pub id: String,
+    pub version: Option<i32>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Default, Deserialize, Serialize)]
@@ -686,11 +835,15 @@ impl Request for OnTypeFormatting {
 pub struct CompletionResolveData {
     pub position: lsp_types::TextDocumentPositionParams,
     pub imports: Vec<CompletionImport>,
+    pub version: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InlayHintResolveData {
     pub file_id: u32,
+    // This is a string instead of a u64 as javascript can't represent u64 fully
+    pub hash: String,
+    pub version: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

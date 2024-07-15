@@ -77,7 +77,7 @@ const BASE_SYSROOT_SUITE: &[TestCase] = &[
     ),
     TestCase::build_lib("build.alloc_system", "example/alloc_system.rs", "lib"),
     TestCase::build_bin_and_run("aot.alloc_example", "example/alloc_example.rs", &[]),
-    TestCase::jit_bin("jit.std_example", "example/std_example.rs", ""),
+    TestCase::jit_bin("jit.std_example", "example/std_example.rs", "arg"),
     TestCase::build_bin_and_run("aot.std_example", "example/std_example.rs", &["arg"]),
     TestCase::build_bin_and_run("aot.dst_field_align", "example/dst-field-align.rs", &[]),
     TestCase::build_bin_and_run(
@@ -130,16 +130,10 @@ pub(crate) static REGEX_REPO: GitRepo = GitRepo::github(
 
 pub(crate) static REGEX: CargoProject = CargoProject::new(&REGEX_REPO.source_dir(), "regex_target");
 
-pub(crate) static PORTABLE_SIMD_REPO: GitRepo = GitRepo::github(
-    "rust-lang",
-    "portable-simd",
-    "97007cc2e70df8c97326ce896a79e2f0ce4dd98b",
-    "e54a16035cedf205",
-    "portable-simd",
-);
+pub(crate) static PORTABLE_SIMD_SRC: RelPath = RelPath::BUILD.join("coretests");
 
 pub(crate) static PORTABLE_SIMD: CargoProject =
-    CargoProject::new(&PORTABLE_SIMD_REPO.source_dir(), "portable-simd_target");
+    CargoProject::new(&PORTABLE_SIMD_SRC, "portable-simd_target");
 
 static LIBCORE_TESTS_SRC: RelPath = RelPath::BUILD.join("coretests");
 
@@ -221,7 +215,12 @@ const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
         }
     }),
     TestCase::custom("test.portable-simd", &|runner| {
-        PORTABLE_SIMD_REPO.patch(&runner.dirs);
+        apply_patches(
+            &runner.dirs,
+            "portable-simd",
+            &runner.stdlib_source.join("library/portable-simd"),
+            &PORTABLE_SIMD_SRC.to_path(&runner.dirs),
+        );
 
         PORTABLE_SIMD.clean(&runner.dirs);
 
@@ -291,7 +290,7 @@ pub(crate) fn run_tests(
         && !skip_tests.contains(&"testsuite.extended_sysroot");
 
     if run_base_sysroot || run_extended_sysroot {
-        let mut target_compiler = build_sysroot::build_sysroot(
+        let target_compiler = build_sysroot::build_sysroot(
             dirs,
             channel,
             sysroot_kind,
@@ -300,11 +299,8 @@ pub(crate) fn run_tests(
             rustup_toolchain_name,
             target_triple.clone(),
         );
-        // Rust's build system denies a couple of lints that trigger on several of the test
-        // projects. Changing the code to fix them is not worth it, so just silence all lints.
-        target_compiler.rustflags.push("--cap-lints=allow".to_owned());
 
-        let runner = TestRunner::new(
+        let mut runner = TestRunner::new(
             dirs.clone(),
             target_compiler,
             use_unstable_features,
@@ -320,6 +316,9 @@ pub(crate) fn run_tests(
         }
 
         if run_extended_sysroot {
+            // Rust's build system denies a couple of lints that trigger on several of the test
+            // projects. Changing the code to fix them is not worth it, so just silence all lints.
+            runner.target_compiler.rustflags.push("--cap-lints=allow".to_owned());
             runner.run_testsuite(EXTENDED_SYSROOT_SUITE);
         } else {
             eprintln!("[SKIP] extended_sysroot tests");
@@ -330,7 +329,6 @@ pub(crate) fn run_tests(
 struct TestRunner<'a> {
     is_native: bool,
     jit_supported: bool,
-    use_unstable_features: bool,
     skip_tests: &'a [&'a str],
     dirs: Dirs,
     target_compiler: Compiler,
@@ -362,15 +360,7 @@ impl<'a> TestRunner<'a> {
             && target_compiler.triple.contains("x86_64")
             && !target_compiler.triple.contains("windows");
 
-        Self {
-            is_native,
-            jit_supported,
-            use_unstable_features,
-            skip_tests,
-            dirs,
-            target_compiler,
-            stdlib_source,
-        }
+        Self { is_native, jit_supported, skip_tests, dirs, target_compiler, stdlib_source }
     }
 
     fn run_testsuite(&self, tests: &[TestCase]) {
@@ -394,31 +384,13 @@ impl<'a> TestRunner<'a> {
             match *cmd {
                 TestCaseCmd::Custom { func } => func(self),
                 TestCaseCmd::BuildLib { source, crate_types } => {
-                    if self.use_unstable_features {
-                        self.run_rustc([source, "--crate-type", crate_types]);
-                    } else {
-                        self.run_rustc([
-                            source,
-                            "--crate-type",
-                            crate_types,
-                            "--cfg",
-                            "no_unstable_features",
-                        ]);
-                    }
+                    self.run_rustc([source, "--crate-type", crate_types]);
                 }
                 TestCaseCmd::BuildBin { source } => {
-                    if self.use_unstable_features {
-                        self.run_rustc([source]);
-                    } else {
-                        self.run_rustc([source, "--cfg", "no_unstable_features"]);
-                    }
+                    self.run_rustc([source]);
                 }
                 TestCaseCmd::BuildBinAndRun { source, args } => {
-                    if self.use_unstable_features {
-                        self.run_rustc([source]);
-                    } else {
-                        self.run_rustc([source, "--cfg", "no_unstable_features"]);
-                    }
+                    self.run_rustc([source]);
                     self.run_out_command(
                         source.split('/').last().unwrap().split('.').next().unwrap(),
                         args,
@@ -473,7 +445,6 @@ impl<'a> TestRunner<'a> {
         cmd.arg(&self.target_compiler.triple);
         cmd.arg("-Cpanic=abort");
         cmd.arg("-Zunstable-options");
-        cmd.arg("--check-cfg=cfg(no_unstable_features)");
         cmd.arg("--check-cfg=cfg(jit)");
         cmd.args(args);
         cmd

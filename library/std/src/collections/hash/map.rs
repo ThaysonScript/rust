@@ -1018,7 +1018,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        self.base.get_many_unchecked_mut(ks)
+        unsafe { self.base.get_many_unchecked_mut(ks) }
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -1101,7 +1101,7 @@ where
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_confusables("push", "append")]
+    #[rustc_confusables("push", "append", "put")]
     pub fn insert(&mut self, k: K, v: V) -> Option<V> {
         self.base.insert(k, v)
     }
@@ -1218,7 +1218,7 @@ where
     /// will cause the map to produce seemingly random results. Higher-level and
     /// more foolproof APIs like `entry` should be preferred when possible.
     ///
-    /// In particular, the hash used to initialized the raw entry must still be
+    /// In particular, the hash used to initialize the raw entry must still be
     /// consistent with the hash of the key that is ultimately stored in the entry.
     /// This is because implementations of HashMap may need to recompute hashes
     /// when resizing, at which point only the keys are available.
@@ -1271,8 +1271,8 @@ where
     }
 
     #[inline]
-    fn clone_from(&mut self, other: &Self) {
-        self.base.clone_from(&other.base);
+    fn clone_from(&mut self, source: &Self) {
+        self.base.clone_from(&source.base);
     }
 }
 

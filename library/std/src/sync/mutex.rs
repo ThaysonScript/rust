@@ -8,7 +8,7 @@ use crate::mem::ManuallyDrop;
 use crate::ops::{Deref, DerefMut};
 use crate::ptr::NonNull;
 use crate::sync::{poison, LockResult, TryLockError, TryLockResult};
-use crate::sys::locks as sys;
+use crate::sys::sync as sys;
 
 /// A mutual exclusion primitive useful for protecting shared data
 ///
@@ -369,26 +369,6 @@ impl<T: ?Sized> Mutex<T> {
         }
     }
 
-    /// Immediately drops the guard, and consequently unlocks the mutex.
-    ///
-    /// This function is equivalent to calling [`drop`] on the guard but is more self-documenting.
-    /// Alternately, the guard will be automatically dropped when it goes out of scope.
-    ///
-    /// ```
-    /// #![feature(mutex_unlock)]
-    ///
-    /// use std::sync::Mutex;
-    /// let mutex = Mutex::new(0);
-    ///
-    /// let mut guard = mutex.lock().unwrap();
-    /// *guard += 20;
-    /// Mutex::unlock(guard);
-    /// ```
-    #[unstable(feature = "mutex_unlock", issue = "81872")]
-    pub fn unlock(guard: MutexGuard<'_, T>) {
-        drop(guard);
-    }
-
     /// Determines whether the mutex is poisoned.
     ///
     /// If another thread is active, the mutex can still become poisoned at any
@@ -416,7 +396,7 @@ impl<T: ?Sized> Mutex<T> {
         self.poison.get()
     }
 
-    /// Clear the poisoned state from a mutex
+    /// Clear the poisoned state from a mutex.
     ///
     /// If the mutex is poisoned, it will remain poisoned until this function is called. This
     /// allows recovering from a poisoned state and marking that it has recovered. For example, if

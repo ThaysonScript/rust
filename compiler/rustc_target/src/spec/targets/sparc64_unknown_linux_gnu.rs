@@ -9,6 +9,12 @@ pub fn target() -> Target {
 
     Target {
         llvm_target: "sparc64-unknown-linux-gnu".into(),
+        metadata: crate::spec::TargetMetadata {
+            description: Some("SPARC Linux (kernel 4.4, glibc 2.23)".into()),
+            tier: Some(2),
+            host_tools: Some(false),
+            std: Some(true),
+        },
         pointer_width: 64,
         data_layout: "E-m:e-i64:64-n32:64-S128".into(),
         arch: "sparc64".into(),

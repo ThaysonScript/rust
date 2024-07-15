@@ -1,4 +1,5 @@
 //@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 #![feature(type_alias_impl_trait)]
 
@@ -8,9 +9,10 @@ type B = impl Foo;
 trait Foo {}
 
 fn muh(x: A) -> B {
+    //[current]~^ ERROR: item does not constrain `A::{opaque#0}`
+    //[next]~^^ ERROR: cannot satisfy `_ == A`
     x // B's hidden type is A (opaquely)
     //[current]~^ ERROR opaque type's hidden type cannot be another opaque type
-    //[next]~^^ ERROR type annotations needed: cannot satisfy `A == B`
 }
 
 struct Bar;

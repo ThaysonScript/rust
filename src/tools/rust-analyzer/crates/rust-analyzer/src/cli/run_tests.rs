@@ -20,9 +20,8 @@ impl flags::RunTests {
             with_proc_macro_server: ProcMacroServerChoice::Sysroot,
             prefill_caches: false,
         };
-        let (host, _vfs, _proc_macro) =
+        let (ref db, _vfs, _proc_macro) =
             load_workspace_at(&self.path, &cargo_config, &load_cargo_config, &|_| {})?;
-        let db = host.raw_database();
 
         let tests = all_modules(db)
             .into_iter()
@@ -50,7 +49,7 @@ impl flags::RunTests {
         let mut sw_all = StopWatch::start();
         for test in tests {
             let full_name = full_name_of_item(db, test.module(db), test.name(db));
-            println!("test {}", full_name);
+            println!("test {full_name}");
             if test.is_ignore(db) {
                 println!("ignored");
                 ignore_count += 1;
@@ -63,7 +62,7 @@ impl flags::RunTests {
             } else {
                 fail_count += 1;
             }
-            println!("{}", result);
+            println!("{result}");
             eprintln!("{:<20} {}", format!("test {}", full_name), sw_one.elapsed());
         }
         println!("{pass_count} passed, {fail_count} failed, {ignore_count} ignored");

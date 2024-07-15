@@ -10,6 +10,12 @@ pub fn target() -> Target {
 
     Target {
         llvm_target: "sparc64-unknown-openbsd".into(),
+        metadata: crate::spec::TargetMetadata {
+            description: Some("OpenBSD/sparc64".into()),
+            tier: Some(3),
+            host_tools: Some(true),
+            std: Some(true),
+        },
         pointer_width: 64,
         data_layout: "E-m:e-i64:64-n32:64-S128".into(),
         arch: "sparc64".into(),

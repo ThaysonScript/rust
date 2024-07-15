@@ -4,15 +4,13 @@
 #![feature(transmutability)]
 #![feature(marker_trait_attr)]
 #![allow(dead_code)]
-#![allow(incomplete_features)]
 
 mod assert {
     use std::mem::{Assume, BikeshedIntrinsicFrom};
-    pub struct Context;
 
     pub fn is_transmutable<Src, Dst>()
     where
-        Dst: BikeshedIntrinsicFrom<Src, Context, { Assume::SAFETY }>
+        Dst: BikeshedIntrinsicFrom<Src, { Assume::SAFETY }>
     {}
 }
 

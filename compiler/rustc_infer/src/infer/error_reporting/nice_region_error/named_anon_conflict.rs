@@ -1,18 +1,19 @@
 //! Error Reporting for Anonymous Region Lifetime Errors
 //! where one region is named and the other is anonymous.
+
 use crate::infer::error_reporting::nice_region_error::NiceRegionError;
 use crate::{
     errors::ExplicitLifetimeRequired,
     infer::error_reporting::nice_region_error::find_anon_type::find_anon_type,
 };
-use rustc_errors::DiagnosticBuilder;
+use rustc_errors::Diag;
 use rustc_middle::ty;
 use rustc_span::symbol::kw;
 
 impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
     /// When given a `ConcreteFailure` for a function with parameters containing a named region and
     /// an anonymous region, emit an descriptive diagnostic error.
-    pub(super) fn try_report_named_anon_conflict(&self) -> Option<DiagnosticBuilder<'tcx>> {
+    pub(super) fn try_report_named_anon_conflict(&self) -> Option<Diag<'tcx>> {
         let (span, sub, sup) = self.regions()?;
 
         debug!(
@@ -27,12 +28,12 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         // version new_ty of its type where the anonymous region is replaced
         // with the named one.
         let (named, anon, anon_param_info, region_info) = if sub.has_name()
-            && let Some(region_info) = self.tcx().is_suitable_region(sup)
+            && let Some(region_info) = self.tcx().is_suitable_region(self.generic_param_scope, sup)
             && let Some(anon_param_info) = self.find_param_with_region(sup, sub)
         {
             (sub, sup, anon_param_info, region_info)
         } else if sup.has_name()
-            && let Some(region_info) = self.tcx().is_suitable_region(sub)
+            && let Some(region_info) = self.tcx().is_suitable_region(self.generic_param_scope, sub)
             && let Some(anon_param_info) = self.find_param_with_region(sub, sup)
         {
             (sup, sub, anon_param_info, region_info)
@@ -72,7 +73,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             return None;
         }
 
-        if find_anon_type(self.tcx(), anon, &br).is_some()
+        if find_anon_type(self.tcx(), self.generic_param_scope, anon, &br).is_some()
             && self.is_self_anon(is_first, scope_def_id)
         {
             return None;

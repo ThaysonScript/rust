@@ -16,6 +16,9 @@ codegen_ssa_cgu_not_recorded =
 
 codegen_ssa_check_installed_visual_studio = please ensure that Visual Studio 2017 or later, or Build Tools for Visual Studio were installed with the Visual C++ option.
 
+codegen_ssa_compiler_builtins_cannot_call =
+    `compiler_builtins` cannot call functions through upstream monomorphizations; encountered invalid call from `{$caller}` to `{$callee}`
+
 codegen_ssa_copy_path = could not copy {$from} to {$to}: {$error}
 
 codegen_ssa_copy_path_buf = unable to copy {$source_file} to {$output_path}: {$error}
@@ -23,8 +26,6 @@ codegen_ssa_copy_path_buf = unable to copy {$source_file} to {$output_path}: {$e
 codegen_ssa_create_temp_dir = couldn't create a temp dir: {$error}
 
 codegen_ssa_error_creating_remark_dir = failed to create remark directory: {$error}
-
-codegen_ssa_expected_coverage_symbol = expected `coverage(off)` or `coverage(on)`
 
 codegen_ssa_expected_used_symbol = expected `used`, `used(compiler)` or `used(linker)`
 
@@ -208,6 +209,8 @@ codegen_ssa_rlib_not_found = could not find rlib for: `{$crate_name}`
 codegen_ssa_rlib_only_rmeta_found = could not find rlib for: `{$crate_name}`, found rmeta (metadata) file
 
 codegen_ssa_select_cpp_build_tool_workload = in the Visual Studio installer, ensure the "C++ build tools" workload is selected
+
+codegen_ssa_self_contained_linker_missing = the self-contained linker was requested, but it wasn't found in the target's sysroot, or in rustc's sysroot
 
 codegen_ssa_shuffle_indices_evaluation = could not evaluate shuffle_indices at compile time
 

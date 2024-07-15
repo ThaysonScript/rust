@@ -14,12 +14,14 @@ use rustc_attr as attr;
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
 use rustc_feature::Features;
 use rustc_feature::{ACCEPTED_FEATURES, REMOVED_FEATURES, UNSTABLE_FEATURES};
+use rustc_lint_defs::BuiltinLintDiag;
 use rustc_parse::validate_attr;
 use rustc_session::parse::feature_err;
 use rustc_session::Session;
 use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
 use thin_vec::ThinVec;
+use tracing::instrument;
 
 /// A folder that strips out items that do not belong in the current configuration.
 pub struct StripUnconfigured<'a> {
@@ -98,10 +100,11 @@ pub fn features(sess: &Session, krate_attrs: &[Attribute], crate_name: Symbol) -
             // If the declared feature is unstable, record it.
             if let Some(f) = UNSTABLE_FEATURES.iter().find(|f| name == f.feature.name) {
                 (f.set_enabled)(&mut features);
-                // When the ICE comes from core, alloc or std (approximation of the standard library), there's a chance
-                // that the person hitting the ICE may be using -Zbuild-std or similar with an untested target.
-                // The bug is probably in the standard library and not the compiler in that case, but that doesn't
-                // really matter - we want a bug report.
+                // When the ICE comes from core, alloc or std (approximation of the standard
+                // library), there's a chance that the person hitting the ICE may be using
+                // -Zbuild-std or similar with an untested target. The bug is probably in the
+                // standard library and not the compiler in that case, but that doesn't really
+                // matter - we want a bug report.
                 if features.internal(name)
                     && ![sym::core, sym::alloc, sym::std].contains(&crate_name)
                 {
@@ -169,7 +172,7 @@ impl<'a> StripUnconfigured<'a> {
     fn configure_tokens(&self, stream: &AttrTokenStream) -> AttrTokenStream {
         fn can_skip(stream: &AttrTokenStream) -> bool {
             stream.0.iter().all(|tree| match tree {
-                AttrTokenTree::Attributes(_) => false,
+                AttrTokenTree::AttrsTarget(_) => false,
                 AttrTokenTree::Token(..) => true,
                 AttrTokenTree::Delimited(.., inner) => can_skip(inner),
             })
@@ -182,31 +185,45 @@ impl<'a> StripUnconfigured<'a> {
         let trees: Vec<_> = stream
             .0
             .iter()
-            .flat_map(|tree| match tree.clone() {
-                AttrTokenTree::Attributes(mut data) => {
-                    data.attrs.flat_map_in_place(|attr| self.process_cfg_attr(&attr));
+            .filter_map(|tree| match tree.clone() {
+                AttrTokenTree::AttrsTarget(mut target) => {
+                    // Expand any `cfg_attr` attributes.
+                    target.attrs.flat_map_in_place(|attr| self.process_cfg_attr(&attr));
 
-                    if self.in_cfg(&data.attrs) {
-                        data.tokens = LazyAttrTokenStream::new(
-                            self.configure_tokens(&data.tokens.to_attr_token_stream()),
+                    if self.in_cfg(&target.attrs) {
+                        target.tokens = LazyAttrTokenStream::new(
+                            self.configure_tokens(&target.tokens.to_attr_token_stream()),
                         );
-                        Some(AttrTokenTree::Attributes(data)).into_iter()
+                        Some(AttrTokenTree::AttrsTarget(target))
                     } else {
-                        None.into_iter()
+                        // Remove the target if there's a `cfg` attribute and
+                        // the condition isn't satisfied.
+                        None
                     }
                 }
                 AttrTokenTree::Delimited(sp, spacing, delim, mut inner) => {
                     inner = self.configure_tokens(&inner);
-                    Some(AttrTokenTree::Delimited(sp, spacing, delim, inner)).into_iter()
+                    Some(AttrTokenTree::Delimited(sp, spacing, delim, inner))
                 }
-                AttrTokenTree::Token(ref token, _)
-                    if let TokenKind::Interpolated(nt) = &token.kind =>
-                {
-                    panic!("Nonterminal should have been flattened at {:?}: {:?}", token.span, nt);
+                AttrTokenTree::Token(
+                    Token {
+                        kind:
+                            TokenKind::NtIdent(..)
+                            | TokenKind::NtLifetime(..)
+                            | TokenKind::Interpolated(..),
+                        ..
+                    },
+                    _,
+                ) => {
+                    panic!("Nonterminal should have been flattened: {:?}", tree);
                 }
-                AttrTokenTree::Token(token, spacing) => {
-                    Some(AttrTokenTree::Token(token, spacing)).into_iter()
+                AttrTokenTree::Token(
+                    Token { kind: TokenKind::OpenDelim(_) | TokenKind::CloseDelim(_), .. },
+                    _,
+                ) => {
+                    panic!("Should be `AttrTokenTree::Delimited`, not delim tokens: {:?}", tree);
                 }
+                AttrTokenTree::Token(token, spacing) => Some(AttrTokenTree::Token(token, spacing)),
             })
             .collect();
         AttrTokenStream::new(trees)
@@ -239,20 +256,20 @@ impl<'a> StripUnconfigured<'a> {
     /// Gives a compiler warning when the `cfg_attr` contains no attributes and
     /// is in the original source file. Gives a compiler error if the syntax of
     /// the attribute is incorrect.
-    pub(crate) fn expand_cfg_attr(&self, attr: &Attribute, recursive: bool) -> Vec<Attribute> {
+    pub(crate) fn expand_cfg_attr(&self, cfg_attr: &Attribute, recursive: bool) -> Vec<Attribute> {
         let Some((cfg_predicate, expanded_attrs)) =
-            rustc_parse::parse_cfg_attr(attr, &self.sess.parse_sess)
+            rustc_parse::parse_cfg_attr(cfg_attr, &self.sess.psess)
         else {
             return vec![];
         };
 
         // Lint on zero attributes in source.
         if expanded_attrs.is_empty() {
-            self.sess.parse_sess.buffer_lint(
+            self.sess.psess.buffer_lint(
                 rustc_lint_defs::builtin::UNUSED_ATTRIBUTES,
-                attr.span,
+                cfg_attr.span,
                 ast::CRATE_NODE_ID,
-                "`#[cfg_attr]` does not expand to any attributes",
+                BuiltinLintDiag::CfgAttrNoAttributes,
             );
         }
 
@@ -266,20 +283,21 @@ impl<'a> StripUnconfigured<'a> {
             //  `#[cfg_attr(false, cfg_attr(true, some_attr))]`.
             expanded_attrs
                 .into_iter()
-                .flat_map(|item| self.process_cfg_attr(&self.expand_cfg_attr_item(attr, item)))
+                .flat_map(|item| self.process_cfg_attr(&self.expand_cfg_attr_item(cfg_attr, item)))
                 .collect()
         } else {
-            expanded_attrs.into_iter().map(|item| self.expand_cfg_attr_item(attr, item)).collect()
+            expanded_attrs
+                .into_iter()
+                .map(|item| self.expand_cfg_attr_item(cfg_attr, item))
+                .collect()
         }
     }
 
     fn expand_cfg_attr_item(
         &self,
-        attr: &Attribute,
+        cfg_attr: &Attribute,
         (item, item_span): (ast::AttrItem, Span),
     ) -> Attribute {
-        let orig_tokens = attr.tokens();
-
         // We are taking an attribute of the form `#[cfg_attr(pred, attr)]`
         // and producing an attribute of the form `#[attr]`. We
         // have captured tokens for `attr` itself, but we need to
@@ -288,18 +306,17 @@ impl<'a> StripUnconfigured<'a> {
 
         // Use the `#` in `#[cfg_attr(pred, attr)]` as the `#` token
         // for `attr` when we expand it to `#[attr]`
-        let mut orig_trees = orig_tokens.trees();
+        let mut orig_trees = cfg_attr.token_trees().into_iter();
         let TokenTree::Token(pound_token @ Token { kind: TokenKind::Pound, .. }, _) =
             orig_trees.next().unwrap().clone()
         else {
-            panic!("Bad tokens for attribute {attr:?}");
+            panic!("Bad tokens for attribute {cfg_attr:?}");
         };
-        let pound_span = pound_token.span;
 
         // We don't really have a good span to use for the synthesized `[]`
         // in `#[attr]`, so just use the span of the `#` token.
         let bracket_group = AttrTokenTree::Delimited(
-            DelimSpan::from_single(pound_span),
+            DelimSpan::from_single(pound_token.span),
             DelimSpacing::new(Spacing::JointHidden, Spacing::Alone),
             Delimiter::Bracket,
             item.tokens
@@ -307,12 +324,12 @@ impl<'a> StripUnconfigured<'a> {
                 .unwrap_or_else(|| panic!("Missing tokens for {item:?}"))
                 .to_attr_token_stream(),
         );
-        let trees = if attr.style == AttrStyle::Inner {
+        let trees = if cfg_attr.style == AttrStyle::Inner {
             // For inner attributes, we do the same thing for the `!` in `#![some_attr]`
             let TokenTree::Token(bang_token @ Token { kind: TokenKind::Not, .. }, _) =
                 orig_trees.next().unwrap().clone()
             else {
-                panic!("Bad tokens for attribute {attr:?}");
+                panic!("Bad tokens for attribute {cfg_attr:?}");
             };
             vec![
                 AttrTokenTree::Token(pound_token, Spacing::Joint),
@@ -324,26 +341,26 @@ impl<'a> StripUnconfigured<'a> {
         };
         let tokens = Some(LazyAttrTokenStream::new(AttrTokenStream::new(trees)));
         let attr = attr::mk_attr_from_item(
-            &self.sess.parse_sess.attr_id_generator,
+            &self.sess.psess.attr_id_generator,
             item,
             tokens,
-            attr.style,
+            cfg_attr.style,
             item_span,
         );
         if attr.has_name(sym::crate_type) {
-            self.sess.parse_sess.buffer_lint(
+            self.sess.psess.buffer_lint(
                 rustc_lint_defs::builtin::DEPRECATED_CFG_ATTR_CRATE_TYPE_NAME,
                 attr.span,
                 ast::CRATE_NODE_ID,
-                "`crate_type` within an `#![cfg_attr] attribute is deprecated`",
+                BuiltinLintDiag::CrateTypeInCfgAttr,
             );
         }
         if attr.has_name(sym::crate_name) {
-            self.sess.parse_sess.buffer_lint(
+            self.sess.psess.buffer_lint(
                 rustc_lint_defs::builtin::DEPRECATED_CFG_ATTR_CRATE_TYPE_NAME,
                 attr.span,
                 ast::CRATE_NODE_ID,
-                "`crate_name` within an `#![cfg_attr] attribute is deprecated`",
+                BuiltinLintDiag::CrateNameInCfgAttr,
             );
         }
         attr
@@ -355,7 +372,7 @@ impl<'a> StripUnconfigured<'a> {
     }
 
     pub(crate) fn cfg_true(&self, attr: &Attribute) -> (bool, Option<MetaItem>) {
-        let meta_item = match validate_attr::parse_meta(&self.sess.parse_sess, attr) {
+        let meta_item = match validate_attr::parse_meta(&self.sess.psess, attr) {
             Ok(meta_item) => meta_item,
             Err(err) => {
                 err.emit();
@@ -380,12 +397,15 @@ impl<'a> StripUnconfigured<'a> {
                 &self.sess,
                 sym::stmt_expr_attributes,
                 attr.span,
-                "attributes on expressions are experimental",
+                crate::fluent_generated::expand_attributes_on_expressions_experimental,
             );
 
             if attr.is_doc_comment() {
-                #[allow(rustc::untranslatable_diagnostic)]
-                err.help("`///` is for documentation comments. For a plain comment, use `//`.");
+                err.help(if attr.style == AttrStyle::Outer {
+                    crate::fluent_generated::expand_help_outer_doc
+                } else {
+                    crate::fluent_generated::expand_help_inner_doc
+                });
             }
 
             err.emit();

@@ -2,8 +2,8 @@
 
 use std::iter;
 
-use hir_expand::{span_map::SpanMapRef, InFile};
 use la_arena::ArenaMap;
+use span::SyntaxContextId;
 use syntax::ast;
 use triomphe::Arc;
 
@@ -27,43 +27,29 @@ pub enum RawVisibility {
 
 impl RawVisibility {
     pub(crate) const fn private() -> RawVisibility {
-        RawVisibility::Module(
-            ModPath::from_kind(PathKind::Super(0)),
-            VisibilityExplicitness::Implicit,
-        )
+        RawVisibility::Module(ModPath::from_kind(PathKind::SELF), VisibilityExplicitness::Implicit)
     }
 
     pub(crate) fn from_ast(
         db: &dyn DefDatabase,
-        node: InFile<Option<ast::Visibility>>,
-    ) -> RawVisibility {
-        let node = match node.transpose() {
-            None => return RawVisibility::private(),
-            Some(node) => node,
-        };
-        Self::from_ast_with_span_map(db, node.value, db.span_map(node.file_id).as_ref())
-    }
-
-    pub(crate) fn from_opt_ast_with_span_map(
-        db: &dyn DefDatabase,
         node: Option<ast::Visibility>,
-        span_map: SpanMapRef<'_>,
+        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContextId,
     ) -> RawVisibility {
         let node = match node {
             None => return RawVisibility::private(),
             Some(node) => node,
         };
-        Self::from_ast_with_span_map(db, node, span_map)
+        Self::from_ast_with_span_map(db, node, span_for_range)
     }
 
     fn from_ast_with_span_map(
         db: &dyn DefDatabase,
         node: ast::Visibility,
-        span_map: SpanMapRef<'_>,
+        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContextId,
     ) -> RawVisibility {
         let path = match node.kind() {
             ast::VisibilityKind::In(path) => {
-                let path = ModPath::from_src(db.upcast(), path, span_map);
+                let path = ModPath::from_src(db.upcast(), path, span_for_range);
                 match path {
                     None => return RawVisibility::private(),
                     Some(path) => path,
@@ -71,7 +57,7 @@ impl RawVisibility {
             }
             ast::VisibilityKind::PubCrate => ModPath::from_kind(PathKind::Crate),
             ast::VisibilityKind::PubSuper => ModPath::from_kind(PathKind::Super(1)),
-            ast::VisibilityKind::PubSelf => ModPath::from_kind(PathKind::Super(0)),
+            ast::VisibilityKind::PubSelf => ModPath::from_kind(PathKind::SELF),
             ast::VisibilityKind::Pub => return RawVisibility::Public,
         };
         RawVisibility::Module(path, VisibilityExplicitness::Explicit)

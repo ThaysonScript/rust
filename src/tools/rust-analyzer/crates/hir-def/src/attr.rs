@@ -1,11 +1,6 @@
 //! A higher level attributes based on TokenTree, with also some shortcuts.
 
-pub mod builtin;
-
-#[cfg(test)]
-mod tests;
-
-use std::{hash::Hash, ops, slice::Iter as SliceIter};
+use std::{borrow::Cow, hash::Hash, ops, slice::Iter as SliceIter};
 
 use base_db::CrateId;
 use cfg::{CfgExpr, CfgOptions};
@@ -75,7 +70,7 @@ impl Attrs {
         db: &dyn DefDatabase,
         v: VariantId,
     ) -> Arc<ArenaMap<LocalFieldId, Attrs>> {
-        let _p = tracing::span!(tracing::Level::INFO, "fields_attrs_query").entered();
+        let _p = tracing::info_span!("fields_attrs_query").entered();
         // FIXME: There should be some proper form of mapping between item tree field ids and hir field ids
         let mut res = ArenaMap::default();
 
@@ -141,6 +136,10 @@ impl Attrs {
         }
     }
 
+    pub fn cfgs(&self) -> impl Iterator<Item = CfgExpr> + '_ {
+        self.by_key("cfg").tt_values().map(CfgExpr::parse)
+    }
+
     pub(crate) fn is_cfg_enabled(&self, cfg_options: &CfgOptions) -> bool {
         match self.cfg() {
             None => true,
@@ -148,12 +147,12 @@ impl Attrs {
         }
     }
 
-    pub fn lang(&self) -> Option<&SmolStr> {
+    pub fn lang(&self) -> Option<&str> {
         self.by_key("lang").string_value()
     }
 
     pub fn lang_item(&self) -> Option<LangItem> {
-        self.by_key("lang").string_value().and_then(|it| LangItem::from_str(it))
+        self.by_key("lang").string_value().and_then(LangItem::from_str)
     }
 
     pub fn has_doc_hidden(&self) -> bool {
@@ -178,7 +177,7 @@ impl Attrs {
         self.doc_exprs().flat_map(|doc_expr| doc_expr.aliases().to_vec())
     }
 
-    pub fn export_name(&self) -> Option<&SmolStr> {
+    pub fn export_name(&self) -> Option<&str> {
         self.by_key("export_name").string_value()
     }
 
@@ -322,7 +321,7 @@ impl AttrsWithOwner {
     }
 
     pub(crate) fn attrs_query(db: &dyn DefDatabase, def: AttrDefId) -> Attrs {
-        let _p = tracing::span!(tracing::Level::INFO, "attrs_query").entered();
+        let _p = tracing::info_span!("attrs_query").entered();
         // FIXME: this should use `Trace` to avoid duplication in `source_map` below
         let raw_attrs = match def {
             AttrDefId::ModuleId(module) => {
@@ -348,7 +347,7 @@ impl AttrsWithOwner {
                         .raw_attrs(AttrOwner::ModItem(definition_tree_id.value.into()))
                         .clone(),
                     ModuleOrigin::BlockExpr { id, .. } => {
-                        let tree = db.block_item_tree_query(id);
+                        let tree = db.block_item_tree(id);
                         tree.raw_attrs(AttrOwner::TopLevel).clone()
                     }
                 }
@@ -565,8 +564,12 @@ impl<'attr> AttrQuery<'attr> {
         self.attrs().filter_map(|attr| attr.token_tree_value())
     }
 
-    pub fn string_value(self) -> Option<&'attr SmolStr> {
+    pub fn string_value(self) -> Option<&'attr str> {
         self.attrs().find_map(|attr| attr.string_value())
+    }
+
+    pub fn string_value_unescape(self) -> Option<Cow<'attr, str>> {
+        self.attrs().find_map(|attr| attr.string_value_unescape())
     }
 
     pub fn exists(self) -> bool {
@@ -637,4 +640,56 @@ pub(crate) fn fields_attrs_source_map(
     }
 
     Arc::new(res)
+}
+
+#[cfg(test)]
+mod tests {
+    //! This module contains tests for doc-expression parsing.
+    //! Currently, it tests `#[doc(hidden)]` and `#[doc(alias)]`.
+
+    use triomphe::Arc;
+
+    use base_db::FileId;
+    use hir_expand::span_map::{RealSpanMap, SpanMap};
+    use mbe::{syntax_node_to_token_tree, DocCommentDesugarMode};
+    use syntax::{ast, AstNode, TextRange};
+
+    use crate::attr::{DocAtom, DocExpr};
+
+    fn assert_parse_result(input: &str, expected: DocExpr) {
+        let source_file = ast::SourceFile::parse(input, span::Edition::CURRENT).ok().unwrap();
+        let tt = source_file.syntax().descendants().find_map(ast::TokenTree::cast).unwrap();
+        let map = SpanMap::RealSpanMap(Arc::new(RealSpanMap::absolute(FileId::from_raw(0))));
+        let tt = syntax_node_to_token_tree(
+            tt.syntax(),
+            map.as_ref(),
+            map.span_for_range(TextRange::empty(0.into())),
+            DocCommentDesugarMode::ProcMacro,
+        );
+        let cfg = DocExpr::parse(&tt);
+        assert_eq!(cfg, expected);
+    }
+
+    #[test]
+    fn test_doc_expr_parser() {
+        assert_parse_result("#![doc(hidden)]", DocAtom::Flag("hidden".into()).into());
+
+        assert_parse_result(
+            r#"#![doc(alias = "foo")]"#,
+            DocAtom::KeyValue { key: "alias".into(), value: "foo".into() }.into(),
+        );
+
+        assert_parse_result(r#"#![doc(alias("foo"))]"#, DocExpr::Alias(["foo".into()].into()));
+        assert_parse_result(
+            r#"#![doc(alias("foo", "bar", "baz"))]"#,
+            DocExpr::Alias(["foo".into(), "bar".into(), "baz".into()].into()),
+        );
+
+        assert_parse_result(
+            r#"
+        #[doc(alias("Bar", "Qux"))]
+        struct Foo;"#,
+            DocExpr::Alias(["Bar".into(), "Qux".into()].into()),
+        );
+    }
 }

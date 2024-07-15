@@ -1,4 +1,4 @@
-use super::{Parser, PathStyle, TokenType, Trailing};
+use super::{Parser, PathStyle, SeqSep, TokenType, Trailing};
 
 use crate::errors::{
     self, DynAfterMut, ExpectedFnPathFoundFnKeyword, ExpectedMutOrConstInRawPointerType,
@@ -9,16 +9,16 @@ use crate::errors::{
 use crate::{maybe_recover_from_interpolated_ty_qpath, maybe_whole};
 
 use rustc_ast::ptr::P;
-use rustc_ast::token::{self, Delimiter, Token, TokenKind};
+use rustc_ast::token::{self, BinOpToken, Delimiter, Token, TokenKind};
 use rustc_ast::util::case::Case;
 use rustc_ast::{
     self as ast, BareFnTy, BoundAsyncness, BoundConstness, BoundPolarity, FnRetTy, GenericBound,
     GenericBounds, GenericParam, Generics, Lifetime, MacCall, MutTy, Mutability, PolyTraitRef,
-    TraitBoundModifiers, TraitObjectSyntax, Ty, TyKind, DUMMY_NODE_ID,
+    PreciseCapturingArg, TraitBoundModifiers, TraitObjectSyntax, Ty, TyKind, DUMMY_NODE_ID,
 };
 use rustc_errors::{Applicability, PResult};
 use rustc_span::symbol::{kw, sym, Ident};
-use rustc_span::{Span, Symbol};
+use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use thin_vec::{thin_vec, ThinVec};
 
 #[derive(Copy, Clone, PartialEq)]
@@ -82,7 +82,7 @@ enum AllowCVariadic {
 /// Types can also be of the form `IDENT(u8, u8) -> u8`, however this assumes
 /// that `IDENT` is not the ident of a fn trait.
 fn can_continue_type_after_non_fn_ident(t: &Token) -> bool {
-    t == &token::ModSep || t == &token::Lt || t == &token::BinOp(token::Shl)
+    t == &token::PathSep || t == &token::Lt || t == &token::BinOp(token::Shl)
 }
 
 fn can_begin_dyn_bound_in_edition_2015(t: &Token) -> bool {
@@ -127,7 +127,7 @@ impl<'a> Parser<'a> {
     /// Parse a type suitable for a field definition.
     /// The difference from `parse_ty` is that this version
     /// allows anonymous structs and unions.
-    pub fn parse_ty_for_field_def(&mut self) -> PResult<'a, P<Ty>> {
+    pub(super) fn parse_ty_for_field_def(&mut self) -> PResult<'a, P<Ty>> {
         if self.can_begin_anon_struct_or_union() {
             self.parse_anon_struct_or_union()
         } else {
@@ -194,7 +194,7 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_ty_for_where_clause(&mut self) -> PResult<'a, P<Ty>> {
         self.parse_ty_common(
             AllowPlus::Yes,
-            AllowCVariadic::Yes,
+            AllowCVariadic::No,
             RecoverQPath::Yes,
             RecoverReturnSign::OnlyFatArrow,
             None,
@@ -250,7 +250,7 @@ impl<'a> Parser<'a> {
     ) -> PResult<'a, P<Ty>> {
         let allow_qpath_recovery = recover_qpath == RecoverQPath::Yes;
         maybe_recover_from_interpolated_ty_qpath!(self, allow_qpath_recovery);
-        maybe_whole!(self, NtTy, |x| x);
+        maybe_whole!(self, NtTy, |ty| ty);
 
         let lo = self.token.span;
         let mut impl_dyn_multi = false;
@@ -280,7 +280,7 @@ impl<'a> Parser<'a> {
             // Function pointer type or bound list (trait object type) starting with a poly-trait.
             //   `for<'lt> [unsafe] [extern "ABI"] fn (&'lt S) -> T`
             //   `for<'lt> Trait1<'lt> + Trait2 + 'a`
-            let lifetime_defs = self.parse_late_bound_lifetime_defs()?;
+            let (lifetime_defs, _) = self.parse_late_bound_lifetime_defs()?;
             if self.check_fn_front_matter(false, Case::Sensitive) {
                 self.parse_ty_bare_fn(
                     lo,
@@ -344,8 +344,9 @@ impl<'a> Parser<'a> {
             match allow_c_variadic {
                 AllowCVariadic::Yes => TyKind::CVarArgs,
                 AllowCVariadic::No => {
-                    // FIXME(Centril): Should we just allow `...` syntactically
+                    // FIXME(c_variadic): Should we just allow `...` syntactically
                     // anywhere in a type and use semantic restrictions instead?
+                    // NOTE: This may regress certain MBE calls if done incorrectly.
                     let guar = self
                         .dcx()
                         .emit_err(NestedCVariadicType { span: lo.to(self.prev_token.span) });
@@ -397,7 +398,7 @@ impl<'a> Parser<'a> {
         let (fields, _recovered) =
             self.parse_record_struct_body(if is_union { "union" } else { "struct" }, lo, false)?;
         let span = lo.to(self.prev_token.span);
-        self.sess.gated_spans.gate(sym::unnamed_fields, span);
+        self.psess.gated_spans.gate(sym::unnamed_fields, span);
         let id = ast::DUMMY_NODE_ID;
         let kind =
             if is_union { TyKind::AnonUnion(id, fields) } else { TyKind::AnonStruct(id, fields) };
@@ -590,7 +591,7 @@ impl<'a> Parser<'a> {
             tokens: None,
         };
         let span_start = self.token.span;
-        let ast::FnHeader { ext, unsafety, constness, coroutine_kind } =
+        let ast::FnHeader { ext, safety, constness, coroutine_kind } =
             self.parse_fn_front_matter(&inherited_vis, Case::Sensitive)?;
         if self.may_recover() && self.token.kind == TokenKind::Lt {
             self.recover_fn_ptr_with_generics(lo, &mut params, param_insertion_point)?;
@@ -607,8 +608,8 @@ impl<'a> Parser<'a> {
             self.dcx().emit_err(FnPointerCannotBeAsync { span: whole_span, qualifier: span });
         }
         // FIXME(gen_blocks): emit a similar error for `gen fn()`
-        let decl_span = span_start.to(self.token.span);
-        Ok(TyKind::BareFn(P(BareFnTy { ext, unsafety, generic_params: params, decl, decl_span })))
+        let decl_span = span_start.to(self.prev_token.span);
+        Ok(TyKind::BareFn(P(BareFnTy { ext, safety, generic_params: params, decl, decl_span })))
     }
 
     /// Recover from function pointer types with a generic parameter list (e.g. `fn<'a>(&'a str)`).
@@ -655,7 +656,6 @@ impl<'a> Parser<'a> {
 
     /// Parses an `impl B0 + ... + Bn` type.
     fn parse_impl_ty(&mut self, impl_dyn_multi: &mut bool) -> PResult<'a, TyKind> {
-        // Always parse bounds greedily for better error recovery.
         if self.token.is_lifetime() {
             self.look_ahead(1, |t| {
                 if let token::Ident(sym, _) = t.kind {
@@ -669,9 +669,49 @@ impl<'a> Parser<'a> {
                 }
             })
         }
+
+        // Always parse bounds greedily for better error recovery.
         let bounds = self.parse_generic_bounds()?;
+
         *impl_dyn_multi = bounds.len() > 1 || self.prev_token.kind == TokenKind::BinOp(token::Plus);
+
         Ok(TyKind::ImplTrait(ast::DUMMY_NODE_ID, bounds))
+    }
+
+    fn parse_precise_capturing_args(
+        &mut self,
+    ) -> PResult<'a, (ThinVec<PreciseCapturingArg>, Span)> {
+        let lo = self.token.span;
+        self.expect_lt()?;
+        let (args, _, _) = self.parse_seq_to_before_tokens(
+            &[&TokenKind::Gt],
+            &[
+                &TokenKind::Ge,
+                &TokenKind::BinOp(BinOpToken::Shr),
+                &TokenKind::BinOpEq(BinOpToken::Shr),
+            ],
+            SeqSep::trailing_allowed(token::Comma),
+            |self_| {
+                if self_.check_keyword(kw::SelfUpper) {
+                    self_.bump();
+                    Ok(PreciseCapturingArg::Arg(
+                        ast::Path::from_ident(self_.prev_token.ident().unwrap().0),
+                        DUMMY_NODE_ID,
+                    ))
+                } else if self_.check_ident() {
+                    Ok(PreciseCapturingArg::Arg(
+                        ast::Path::from_ident(self_.parse_ident()?),
+                        DUMMY_NODE_ID,
+                    ))
+                } else if self_.check_lifetime() {
+                    Ok(PreciseCapturingArg::Lifetime(self_.expect_lifetime()))
+                } else {
+                    self_.unexpected_any()
+                }
+            },
+        )?;
+        self.expect_gt()?;
+        Ok((args, lo.to(self.prev_token.span)))
     }
 
     /// Is a `dyn B0 + ... + Bn` type allowed here?
@@ -694,7 +734,7 @@ impl<'a> Parser<'a> {
 
         // parse dyn* types
         let syntax = if self.eat(&TokenKind::BinOp(token::Star)) {
-            self.sess.gated_spans.gate(sym::dyn_star, lo.to(self.prev_token.span));
+            self.psess.gated_spans.gate(sym::dyn_star, lo.to(self.prev_token.span));
             TraitObjectSyntax::DynStar
         } else {
             TraitObjectSyntax::Dyn
@@ -782,6 +822,7 @@ impl<'a> Parser<'a> {
             || self.check(&token::OpenDelim(Delimiter::Parenthesis))
             || self.check_keyword(kw::Const)
             || self.check_keyword(kw::Async)
+            || self.check_keyword(kw::Use)
     }
 
     /// Parses a bound according to the grammar:
@@ -792,14 +833,19 @@ impl<'a> Parser<'a> {
         let lo = self.token.span;
         let leading_token = self.prev_token.clone();
         let has_parens = self.eat(&token::OpenDelim(Delimiter::Parenthesis));
-        let inner_lo = self.token.span;
 
-        let modifiers = self.parse_trait_bound_modifiers()?;
         let bound = if self.token.is_lifetime() {
-            self.error_lt_bound_with_modifiers(modifiers);
-            self.parse_generic_lt_bound(lo, inner_lo, has_parens)?
+            self.parse_generic_lt_bound(lo, has_parens)?
+        } else if self.eat_keyword(kw::Use) {
+            // parse precise captures, if any. This is `use<'lt, 'lt, P, P>`; a list of
+            // lifetimes and ident params (including SelfUpper). These are validated later
+            // for order, duplication, and whether they actually reference params.
+            let use_span = self.prev_token.span;
+            self.psess.gated_spans.gate(sym::precise_capturing, use_span);
+            let (args, args_span) = self.parse_precise_capturing_args()?;
+            GenericBound::Use(args, use_span.to(args_span))
         } else {
-            self.parse_generic_ty_bound(lo, has_parens, modifiers, &leading_token)?
+            self.parse_generic_ty_bound(lo, has_parens, &leading_token)?
         };
 
         Ok(bound)
@@ -809,50 +855,64 @@ impl<'a> Parser<'a> {
     /// ```ebnf
     /// LT_BOUND = LIFETIME
     /// ```
-    fn parse_generic_lt_bound(
-        &mut self,
-        lo: Span,
-        inner_lo: Span,
-        has_parens: bool,
-    ) -> PResult<'a, GenericBound> {
-        let bound = GenericBound::Outlives(self.expect_lifetime());
+    fn parse_generic_lt_bound(&mut self, lo: Span, has_parens: bool) -> PResult<'a, GenericBound> {
+        let lt = self.expect_lifetime();
+        let bound = GenericBound::Outlives(lt);
         if has_parens {
             // FIXME(Centril): Consider not erroring here and accepting `('lt)` instead,
             // possibly introducing `GenericBound::Paren(P<GenericBound>)`?
-            self.recover_paren_lifetime(lo, inner_lo)?;
+            self.recover_paren_lifetime(lo, lt.ident.span)?;
         }
         Ok(bound)
     }
 
     /// Emits an error if any trait bound modifiers were present.
-    fn error_lt_bound_with_modifiers(&self, modifiers: TraitBoundModifiers) {
-        match modifiers.constness {
+    fn error_lt_bound_with_modifiers(
+        &self,
+        modifiers: TraitBoundModifiers,
+        binder_span: Option<Span>,
+    ) -> ErrorGuaranteed {
+        let TraitBoundModifiers { constness, asyncness, polarity } = modifiers;
+
+        match constness {
             BoundConstness::Never => {}
             BoundConstness::Always(span) | BoundConstness::Maybe(span) => {
-                self.dcx().emit_err(errors::ModifierLifetime {
-                    span,
-                    modifier: modifiers.constness.as_str(),
-                });
+                return self
+                    .dcx()
+                    .emit_err(errors::ModifierLifetime { span, modifier: constness.as_str() });
             }
         }
 
-        match modifiers.polarity {
+        match polarity {
             BoundPolarity::Positive => {}
             BoundPolarity::Negative(span) | BoundPolarity::Maybe(span) => {
-                self.dcx().emit_err(errors::ModifierLifetime {
-                    span,
-                    modifier: modifiers.polarity.as_str(),
-                });
+                return self
+                    .dcx()
+                    .emit_err(errors::ModifierLifetime { span, modifier: polarity.as_str() });
             }
         }
+
+        match asyncness {
+            BoundAsyncness::Normal => {}
+            BoundAsyncness::Async(span) => {
+                return self
+                    .dcx()
+                    .emit_err(errors::ModifierLifetime { span, modifier: asyncness.as_str() });
+            }
+        }
+
+        if let Some(span) = binder_span {
+            return self.dcx().emit_err(errors::ModifierLifetime { span, modifier: "for<...>" });
+        }
+
+        unreachable!("lifetime bound intercepted in `parse_generic_ty_bound` but no modifiers?")
     }
 
     /// Recover on `('lifetime)` with `(` already eaten.
-    fn recover_paren_lifetime(&mut self, lo: Span, inner_lo: Span) -> PResult<'a, ()> {
-        let inner_span = inner_lo.to(self.prev_token.span);
+    fn recover_paren_lifetime(&mut self, lo: Span, lt_span: Span) -> PResult<'a, ()> {
         self.expect(&token::CloseDelim(Delimiter::Parenthesis))?;
         let span = lo.to(self.prev_token.span);
-        let (sugg, snippet) = if let Ok(snippet) = self.span_to_snippet(inner_span) {
+        let (sugg, snippet) = if let Ok(snippet) = self.span_to_snippet(lt_span) {
             (Some(span), snippet)
         } else {
             (None, String::new())
@@ -867,17 +927,17 @@ impl<'a> Parser<'a> {
     /// If no modifiers are present, this does not consume any tokens.
     ///
     /// ```ebnf
-    /// TRAIT_BOUND_MODIFIERS = [["~"] "const"] ["?" | "!"]
+    /// TRAIT_BOUND_MODIFIERS = [["~"] "const"] ["async"] ["?" | "!"]
     /// ```
     fn parse_trait_bound_modifiers(&mut self) -> PResult<'a, TraitBoundModifiers> {
         let constness = if self.eat(&token::Tilde) {
             let tilde = self.prev_token.span;
             self.expect_keyword(kw::Const)?;
             let span = tilde.to(self.prev_token.span);
-            self.sess.gated_spans.gate(sym::const_trait_impl, span);
+            self.psess.gated_spans.gate(sym::const_trait_impl, span);
             BoundConstness::Maybe(span)
         } else if self.eat_keyword(kw::Const) {
-            self.sess.gated_spans.gate(sym::const_trait_impl, self.prev_token.span);
+            self.psess.gated_spans.gate(sym::const_trait_impl, self.prev_token.span);
             BoundConstness::Always(self.prev_token.span)
         } else {
             BoundConstness::Never
@@ -886,7 +946,7 @@ impl<'a> Parser<'a> {
         let asyncness = if self.token.uninterpolated_span().at_least_rust_2018()
             && self.eat_keyword(kw::Async)
         {
-            self.sess.gated_spans.gate(sym::async_closure, self.prev_token.span);
+            self.psess.gated_spans.gate(sym::async_closure, self.prev_token.span);
             BoundAsyncness::Async(self.prev_token.span)
         } else if self.may_recover()
             && self.token.uninterpolated_span().is_rust_2015()
@@ -897,7 +957,7 @@ impl<'a> Parser<'a> {
                 span: self.prev_token.span,
                 help: HelpUseLatestEdition::new(),
             });
-            self.sess.gated_spans.gate(sym::async_closure, self.prev_token.span);
+            self.psess.gated_spans.gate(sym::async_closure, self.prev_token.span);
             BoundAsyncness::Async(self.prev_token.span)
         } else {
             BoundAsyncness::Normal
@@ -906,7 +966,7 @@ impl<'a> Parser<'a> {
         let polarity = if self.eat(&token::Question) {
             BoundPolarity::Maybe(self.prev_token.span)
         } else if self.eat(&token::Not) {
-            self.sess.gated_spans.gate(sym::negative_bounds, self.prev_token.span);
+            self.psess.gated_spans.gate(sym::negative_bounds, self.prev_token.span);
             BoundPolarity::Negative(self.prev_token.span)
         } else {
             BoundPolarity::Positive
@@ -921,15 +981,23 @@ impl<'a> Parser<'a> {
     /// TY_BOUND_NOPAREN = [TRAIT_BOUND_MODIFIERS] [for<LT_PARAM_DEFS>] SIMPLE_PATH
     /// ```
     ///
-    /// For example, this grammar accepts `~const ?for<'a: 'b> m::Trait<'a>`.
+    /// For example, this grammar accepts `for<'a: 'b> ~const ?m::Trait<'a>`.
     fn parse_generic_ty_bound(
         &mut self,
         lo: Span,
         has_parens: bool,
-        modifiers: TraitBoundModifiers,
         leading_token: &Token,
     ) -> PResult<'a, GenericBound> {
-        let mut lifetime_defs = self.parse_late_bound_lifetime_defs()?;
+        let modifiers = self.parse_trait_bound_modifiers()?;
+        let (mut lifetime_defs, binder_span) = self.parse_late_bound_lifetime_defs()?;
+
+        // Recover erroneous lifetime bound with modifiers or binder.
+        // e.g. `T: for<'a> 'a` or `T: ~const 'a`.
+        if self.token.is_lifetime() {
+            let _: ErrorGuaranteed = self.error_lt_bound_with_modifiers(modifiers, binder_span);
+            return self.parse_generic_lt_bound(lo, has_parens);
+        }
+
         let mut path = if self.token.is_keyword(kw::Fn)
             && self.look_ahead(1, |tok| tok.kind == TokenKind::OpenDelim(Delimiter::Parenthesis))
             && let Some(path) = self.recover_path_from_fn()
@@ -1045,16 +1113,19 @@ impl<'a> Parser<'a> {
     }
 
     /// Optionally parses `for<$generic_params>`.
-    pub(super) fn parse_late_bound_lifetime_defs(&mut self) -> PResult<'a, ThinVec<GenericParam>> {
+    pub(super) fn parse_late_bound_lifetime_defs(
+        &mut self,
+    ) -> PResult<'a, (ThinVec<GenericParam>, Option<Span>)> {
         if self.eat_keyword(kw::For) {
+            let lo = self.token.span;
             self.expect_lt()?;
             let params = self.parse_generic_params()?;
             self.expect_gt()?;
-            // We rely on AST validation to rule out invalid cases: There must not be type
-            // parameters, and the lifetime parameters must not have bounds.
-            Ok(params)
+            // We rely on AST validation to rule out invalid cases: There must not be
+            // type or const parameters, and parameters must not have bounds.
+            Ok((params, Some(lo.to(self.prev_token.span))))
         } else {
-            Ok(ThinVec::new())
+            Ok((ThinVec::new(), None))
         }
     }
 

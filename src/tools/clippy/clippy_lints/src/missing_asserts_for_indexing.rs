@@ -4,12 +4,12 @@ use std::ops::ControlFlow;
 use clippy_utils::comparisons::{normalize_comparison, Rel};
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet;
-use clippy_utils::visitors::for_each_expr;
+use clippy_utils::visitors::for_each_expr_without_closures;
 use clippy_utils::{eq_expr_value, hash_expr, higher};
 use rustc_ast::{LitKind, RangeLimits};
 use rustc_data_structures::packed::Pu128;
 use rustc_data_structures::unhash::UnhashMap;
-use rustc_errors::{Applicability, DiagnosticBuilder};
+use rustc_errors::{Applicability, Diag};
 use rustc_hir::{BinOp, Block, Body, Expr, ExprKind, UnOp};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
@@ -21,7 +21,7 @@ declare_clippy_lint! {
     /// Checks for repeated slice indexing without asserting beforehand that the length
     /// is greater than the largest index used to index into the slice.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// In the general case where the compiler does not have a lot of information
     /// about the length of a slice, indexing it repeatedly will generate a bounds check
     /// for every single index.
@@ -65,9 +65,9 @@ declare_clippy_lint! {
 }
 declare_lint_pass!(MissingAssertsForIndexing => [MISSING_ASSERTS_FOR_INDEXING]);
 
-fn report_lint<F>(cx: &LateContext<'_>, full_span: Span, msg: &str, indexes: &[Span], f: F)
+fn report_lint<F>(cx: &LateContext<'_>, full_span: Span, msg: &'static str, indexes: &[Span], f: F)
 where
-    F: FnOnce(&mut DiagnosticBuilder<'_, ()>),
+    F: FnOnce(&mut Diag<'_, ()>),
 {
     span_lint_and_then(cx, MISSING_ASSERTS_FOR_INDEXING, full_span, msg, |diag| {
         f(diag);
@@ -405,7 +405,7 @@ impl LateLintPass<'_> for MissingAssertsForIndexing {
     fn check_body(&mut self, cx: &LateContext<'_>, body: &Body<'_>) {
         let mut map = UnhashMap::default();
 
-        for_each_expr(body.value, |expr| {
+        for_each_expr_without_closures(body.value, |expr| {
             check_index(cx, expr, &mut map);
             check_assert(cx, expr, &mut map);
             ControlFlow::<!, ()>::Continue(())

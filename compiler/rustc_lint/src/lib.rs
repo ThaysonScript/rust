@@ -25,28 +25,23 @@
 //!
 //! This API is completely unstable and subject to change.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
 #![feature(array_windows)]
 #![feature(box_patterns)]
 #![feature(control_flow_enum)]
-#![feature(generic_nonzero)]
+#![feature(extract_if)]
 #![feature(if_let_guard)]
 #![feature(iter_order_by)]
 #![feature(let_chains)]
-#![feature(trait_upcasting)]
 #![feature(rustc_attrs)]
-#![allow(internal_features)]
+#![feature(rustdoc_internals)]
+#![feature(trait_upcasting)]
+// tidy-alphabetical-end
 
-#[macro_use]
-extern crate rustc_middle;
-#[macro_use]
-extern crate rustc_session;
-#[macro_use]
-extern crate tracing;
-
-mod array_into_iter;
+mod async_closures;
 mod async_fn_in_trait;
 pub mod builtin;
 mod context;
@@ -59,17 +54,20 @@ mod expect;
 mod for_loops_over_fallibles;
 mod foreign_modules;
 pub mod hidden_unicode_codepoints;
+mod impl_trait_overcaptures;
 mod internal;
 mod invalid_from_utf8;
 mod late;
 mod let_underscore;
 mod levels;
 mod lints;
+mod macro_expr_fragment_specifier_2024_migration;
 mod map_unit_fn;
 mod methods;
 mod multiple_supertrait_upcastable;
 mod non_ascii_idents;
 mod non_fmt_panic;
+mod non_local_def;
 mod nonstandard_style;
 mod noop_method_call;
 mod opaque_hidden_inferred_bound;
@@ -78,18 +76,19 @@ mod passes;
 mod ptr_nulls;
 mod redundant_semicolon;
 mod reference_casting;
+mod shadowed_into_iter;
 mod traits;
 mod types;
 mod unit_bindings;
 mod unused;
 
-pub use array_into_iter::ARRAY_INTO_ITER;
+pub use shadowed_into_iter::{ARRAY_INTO_ITER, BOXED_SLICE_INTO_ITER};
 
 use rustc_hir::def_id::LocalModDefId;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 
-use array_into_iter::ArrayIntoIter;
+use async_closures::AsyncClosureUsage;
 use async_fn_in_trait::AsyncFnInTrait;
 use builtin::*;
 use deref_into_dyn_supertrait::*;
@@ -97,14 +96,17 @@ use drop_forget_useless::*;
 use enum_intrinsics_non_enums::EnumIntrinsicsNonEnums;
 use for_loops_over_fallibles::*;
 use hidden_unicode_codepoints::*;
+use impl_trait_overcaptures::ImplTraitOvercaptures;
 use internal::*;
 use invalid_from_utf8::*;
 use let_underscore::*;
+use macro_expr_fragment_specifier_2024_migration::*;
 use map_unit_fn::*;
 use methods::*;
 use multiple_supertrait_upcastable::*;
 use non_ascii_idents::*;
 use non_fmt_panic::NonPanicFmt;
+use non_local_def::*;
 use nonstandard_style::*;
 use noop_method_call::*;
 use opaque_hidden_inferred_bound::*;
@@ -112,6 +114,7 @@ use pass_by_value::*;
 use ptr_nulls::*;
 use redundant_semicolon::*;
 use reference_casting::*;
+use shadowed_into_iter::ShadowedIntoIter;
 use traits::*;
 use types::*;
 use unit_bindings::*;
@@ -171,6 +174,7 @@ early_lint_methods!(
             IncompleteInternalFeatures: IncompleteInternalFeatures,
             RedundantSemicolons: RedundantSemicolons,
             UnusedDocComment: UnusedDocComment,
+            Expr2024: Expr2024,
         ]
     ]
 );
@@ -188,7 +192,6 @@ late_lint_methods!(
             ImproperCTypesDefinitions: ImproperCTypesDefinitions,
             InvalidFromUtf8: InvalidFromUtf8,
             VariantSizeDifferences: VariantSizeDifferences,
-            BoxPointers: BoxPointers,
             PathStatements: PathStatements,
             LetUnderscore: LetUnderscore,
             InvalidReferenceCasting: InvalidReferenceCasting,
@@ -215,20 +218,23 @@ late_lint_methods!(
             DerefNullPtr: DerefNullPtr,
             UnstableFeatures: UnstableFeatures,
             UngatedAsyncFnTrackCaller: UngatedAsyncFnTrackCaller,
-            ArrayIntoIter: ArrayIntoIter::default(),
+            ShadowedIntoIter: ShadowedIntoIter,
             DropTraitConstraints: DropTraitConstraints,
             TemporaryCStringAsPtr: TemporaryCStringAsPtr,
             NonPanicFmt: NonPanicFmt,
             NoopMethodCall: NoopMethodCall,
             EnumIntrinsicsNonEnums: EnumIntrinsicsNonEnums,
             InvalidAtomicOrdering: InvalidAtomicOrdering,
-            NamedAsmLabels: NamedAsmLabels,
+            AsmLabels: AsmLabels,
             OpaqueHiddenInferredBound: OpaqueHiddenInferredBound,
             MultipleSupertraitUpcastable: MultipleSupertraitUpcastable,
             MapUnitFn: MapUnitFn,
             MissingDebugImplementations: MissingDebugImplementations,
             MissingDoc: MissingDoc,
+            AsyncClosureUsage: AsyncClosureUsage,
             AsyncFnInTrait: AsyncFnInTrait,
+            NonLocalDefinitions: NonLocalDefinitions::default(),
+            ImplTraitOvercaptures: ImplTraitOvercaptures,
         ]
     ]
 );
@@ -309,13 +315,21 @@ fn register_builtins(store: &mut LintStore) {
                                        // MACRO_USE_EXTERN_CRATE
     );
 
+    add_lint_group!("keyword_idents", KEYWORD_IDENTS_2018, KEYWORD_IDENTS_2024);
+
+    add_lint_group!(
+        "refining_impl_trait",
+        REFINING_IMPL_TRAIT_REACHABLE,
+        REFINING_IMPL_TRAIT_INTERNAL
+    );
+
     // Register renamed and removed lints.
     store.register_renamed("single_use_lifetime", "single_use_lifetimes");
     store.register_renamed("elided_lifetime_in_path", "elided_lifetimes_in_paths");
     store.register_renamed("bare_trait_object", "bare_trait_objects");
     store.register_renamed("unstable_name_collision", "unstable_name_collisions");
     store.register_renamed("unused_doc_comment", "unused_doc_comments");
-    store.register_renamed("async_idents", "keyword_idents");
+    store.register_renamed("async_idents", "keyword_idents_2018");
     store.register_renamed("exceeding_bitshifts", "arithmetic_overflow");
     store.register_renamed("redundant_semicolon", "redundant_semicolons");
     store.register_renamed("overlapping_patterns", "overlapping_range_endpoints");
@@ -532,6 +546,20 @@ fn register_builtins(store: &mut LintStore) {
         "converted into hard error, see RFC #3535 \
          <https://rust-lang.github.io/rfcs/3535-constants-in-patterns.html> for more information",
     );
+    store.register_removed(
+        "indirect_structural_match",
+        "converted into hard error, see RFC #3535 \
+         <https://rust-lang.github.io/rfcs/3535-constants-in-patterns.html> for more information",
+    );
+    store.register_removed(
+        "pointer_structural_match",
+        "converted into hard error, see RFC #3535 \
+         <https://rust-lang.github.io/rfcs/3535-constants-in-patterns.html> for more information",
+    );
+    store.register_removed(
+        "box_pointers",
+        "it does not detect other kinds of allocations, and existed only for historical reasons",
+    );
 }
 
 fn register_internals(store: &mut LintStore) {
@@ -546,7 +574,6 @@ fn register_internals(store: &mut LintStore) {
     store.register_lints(&TyTyKind::get_lints());
     store.register_late_mod_pass(|_| Box::new(TyTyKind));
     store.register_lints(&Diagnostics::get_lints());
-    store.register_early_pass(|| Box::new(Diagnostics));
     store.register_late_mod_pass(|_| Box::new(Diagnostics));
     store.register_lints(&BadOptAccess::get_lints());
     store.register_late_mod_pass(|_| Box::new(BadOptAccess));

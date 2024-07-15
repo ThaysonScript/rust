@@ -12,7 +12,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, cast_expr: &Expr<'_>,
             cx,
             CAST_NAN_TO_INT,
             expr.span,
-            &format!("casting a known NaN to {to_ty}"),
+            format!("casting a known NaN to {to_ty}"),
             None,
             "this always evaluates to 0",
         );
@@ -21,6 +21,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, cast_expr: &Expr<'_>,
 
 fn is_known_nan(cx: &LateContext<'_>, e: &Expr<'_>) -> bool {
     match constant(cx, cx.typeck_results(), e) {
+        // FIXME(f16_f128): add these types when nan checks are available on all platforms
         Some(Constant::F64(n)) => n.is_nan(),
         Some(Constant::F32(n)) => n.is_nan(),
         _ => false,

@@ -1,6 +1,9 @@
+use std::borrow::{Borrow, Cow};
+use std::cmp;
 use std::fmt::{self, Write};
+use std::iter;
+use std::ops::Bound;
 use std::ops::Deref;
-use std::{borrow::Borrow, cmp, iter, ops::Bound};
 
 use rustc_index::Idx;
 use tracing::debug;
@@ -32,7 +35,7 @@ where
 pub trait LayoutCalculator {
     type TargetDataLayoutRef: Borrow<TargetDataLayout>;
 
-    fn delayed_bug(&self, txt: String);
+    fn delayed_bug(&self, txt: impl Into<Cow<'static, str>>);
     fn current_data_layout(&self) -> Self::TargetDataLayoutRef;
 
     fn scalar_pair<FieldIdx: Idx, VariantIdx: Idx>(
@@ -183,7 +186,7 @@ pub trait LayoutCalculator {
         let (present_first, present_second) = {
             let mut present_variants = variants
                 .iter_enumerated()
-                .filter_map(|(i, v)| if absent(v) { None } else { Some(i) });
+                .filter_map(|(i, v)| if !repr.c() && absent(v) { None } else { Some(i) });
             (present_variants.next(), present_variants.next())
         };
         let present_first = match present_first {
@@ -248,7 +251,7 @@ pub trait LayoutCalculator {
         // If all the non-ZST fields have the same ABI and union ABI optimizations aren't
         // disabled, we can use that common ABI for the union as a whole.
         struct AbiMismatch;
-        let mut common_non_zst_abi_and_align = if repr.inhibit_union_abi_opt() {
+        let mut common_non_zst_abi_and_align = if repr.inhibits_union_abi_opt() {
             // Can't optimize
             Err(AbiMismatch)
         } else {
@@ -618,7 +621,7 @@ where
     let discr_type = repr.discr_type();
     let bits = Integer::from_attr(dl, discr_type).size().bits();
     for (i, mut val) in discriminants {
-        if variants[i].iter().any(|f| f.abi.is_uninhabited()) {
+        if !repr.c() && variants[i].iter().any(|f| f.abi.is_uninhabited()) {
             continue;
         }
         if discr_type.is_signed() {
@@ -813,15 +816,37 @@ where
                     break;
                 }
             };
-            if let Some(pair) = common_prim {
-                // This is pretty conservative. We could go fancier
-                // by conflating things like i32 and u32, or even
-                // realising that (u8, u8) could just cohabit with
-                // u16 or even u32.
-                if pair != (prim, offset) {
+            if let Some((old_prim, common_offset)) = common_prim {
+                // All variants must be at the same offset
+                if offset != common_offset {
                     common_prim = None;
                     break;
                 }
+                // This is pretty conservative. We could go fancier
+                // by realising that (u8, u8) could just cohabit with
+                // u16 or even u32.
+                let new_prim = match (old_prim, prim) {
+                    // Allow all identical primitives.
+                    (x, y) if x == y => x,
+                    // Allow integers of the same size with differing signedness.
+                    // We arbitrarily choose the signedness of the first variant.
+                    (p @ Primitive::Int(x, _), Primitive::Int(y, _)) if x == y => p,
+                    // Allow integers mixed with pointers of the same layout.
+                    // We must represent this using a pointer, to avoid
+                    // roundtripping pointers through ptrtoint/inttoptr.
+                    (p @ Primitive::Pointer(_), i @ Primitive::Int(..))
+                    | (i @ Primitive::Int(..), p @ Primitive::Pointer(_))
+                        if p.size(dl) == i.size(dl) && p.align(dl) == i.align(dl) =>
+                    {
+                        p
+                    }
+                    _ => {
+                        common_prim = None;
+                        break;
+                    }
+                };
+                // We may be updating the primitive here, for example from int->ptr.
+                common_prim = Some((new_prim, common_offset));
             } else {
                 common_prim = Some((prim, offset));
             }
@@ -945,7 +970,7 @@ fn univariant<
     let mut align = if pack.is_some() { dl.i8_align } else { dl.aggregate_align };
     let mut max_repr_align = repr.align;
     let mut inverse_memory_index: IndexVec<u32, FieldIdx> = fields.indices().collect();
-    let optimize = !repr.inhibit_struct_field_reordering_opt();
+    let optimize = !repr.inhibit_struct_field_reordering();
     if optimize && fields.len() > 1 {
         let end = if let StructKind::MaybeUnsized = kind { fields.len() - 1 } else { fields.len() };
         let optimizing = &mut inverse_memory_index.raw[..end];
@@ -958,7 +983,7 @@ fn univariant<
             #[cfg(feature = "randomize")]
             {
                 use rand::{seq::SliceRandom, SeedableRng};
-                // `ReprOptions.layout_seed` is a deterministic seed we can use to randomize field
+                // `ReprOptions.field_shuffle_seed` is a deterministic seed we can use to randomize field
                 // ordering.
                 let mut rng =
                     rand_xoshiro::Xoshiro128StarStar::seed_from_u64(repr.field_shuffle_seed);
@@ -982,13 +1007,15 @@ fn univariant<
             // Calculates a sort key to group fields by their alignment or possibly some
             // size-derived pseudo-alignment.
             let alignment_group_key = |layout: &F| {
+                // The two branches here return values that cannot be meaningfully compared with
+                // each other. However, we know that consistently for all executions of
+                // `alignment_group_key`, one or the other branch will be taken, so this is okay.
                 if let Some(pack) = pack {
                     // Return the packed alignment in bytes.
                     layout.align.abi.min(pack).bytes()
                 } else {
-                    // Returns `log2(effective-align)`. This is ok since `pack` applies to all
-                    // fields equally. The calculation assumes that size is an integer multiple of
-                    // align, except for ZSTs.
+                    // Returns `log2(effective-align)`. The calculation assumes that size is an
+                    // integer multiple of align, except for ZSTs.
                     let align = layout.align.abi.bytes();
                     let size = layout.size.bytes();
                     let niche_size = layout.largest_niche.map(|n| n.available(dl)).unwrap_or(0);

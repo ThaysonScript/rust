@@ -3,9 +3,9 @@
 //! The core pieces of the runtime are:
 //! - An implementation of `__rust_maybe_catch_panic` that pushes the invoked stack frame with
 //!   some extra metadata derived from the panic-catching arguments of `__rust_maybe_catch_panic`.
-//! - A hack in `libpanic_unwind` that calls the `miri_start_panic` intrinsic instead of the
+//! - A hack in `libpanic_unwind` that calls the `miri_start_unwind` intrinsic instead of the
 //!   target-native panic runtime. (This lives in the rustc repo.)
-//! - An implementation of `miri_start_panic` that stores its argument (the panic payload), and then
+//! - An implementation of `miri_start_unwind` that stores its argument (the panic payload), and then
 //!   immediately returns, but on the *unwind* edge (not the normal return edge), thus initiating unwinding.
 //! - A hook executed each time a frame is popped, such that if the frame pushed by `__rust_maybe_catch_panic`
 //!   gets popped *during unwinding*, we take the panic payload and store it according to the extra
@@ -13,7 +13,6 @@
 
 use rustc_ast::Mutability;
 use rustc_middle::{mir, ty};
-use rustc_span::Symbol;
 use rustc_target::spec::abi::Abi;
 use rustc_target::spec::PanicStrategy;
 
@@ -24,13 +23,13 @@ use helpers::check_arg_count;
 #[derive(Debug)]
 pub struct CatchUnwindData<'tcx> {
     /// The `catch_fn` callback to call in case of a panic.
-    catch_fn: Pointer<Option<Provenance>>,
+    catch_fn: Pointer,
     /// The `data` argument for that callback.
-    data: Scalar<Provenance>,
+    data: Scalar,
     /// The return place from the original call to `try`.
-    dest: PlaceTy<'tcx, Provenance>,
+    dest: MPlaceTy<'tcx>,
     /// The return block from the original call to `try`.
-    ret: mir::BasicBlock,
+    ret: Option<mir::BasicBlock>,
 }
 
 impl VisitProvenance for CatchUnwindData<'_> {
@@ -42,38 +41,28 @@ impl VisitProvenance for CatchUnwindData<'_> {
     }
 }
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
-    /// Handles the special `miri_start_panic` intrinsic, which is called
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+    /// Handles the special `miri_start_unwind` intrinsic, which is called
     /// by libpanic_unwind to delegate the actual unwinding process to Miri.
-    fn handle_miri_start_panic(
-        &mut self,
-        abi: Abi,
-        link_name: Symbol,
-        args: &[OpTy<'tcx, Provenance>],
-        unwind: mir::UnwindAction,
-    ) -> InterpResult<'tcx> {
+    fn handle_miri_start_unwind(&mut self, payload: &OpTy<'tcx>) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
-        trace!("miri_start_panic: {:?}", this.frame().instance);
+        trace!("miri_start_unwind: {:?}", this.frame().instance);
 
-        // Get the raw pointer stored in arg[0] (the panic payload).
-        let [payload] = this.check_shim(abi, Abi::Rust, link_name, args)?;
         let payload = this.read_scalar(payload)?;
         let thread = this.active_thread_mut();
         thread.panic_payloads.push(payload);
 
-        // Jump to the unwind block to begin unwinding.
-        this.unwind_to_block(unwind)?;
         Ok(())
     }
 
     /// Handles the `try` intrinsic, the underlying implementation of `std::panicking::try`.
-    fn handle_try(
+    fn handle_catch_unwind(
         &mut self,
-        args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
-        ret: mir::BasicBlock,
+        args: &[OpTy<'tcx>],
+        dest: &MPlaceTy<'tcx>,
+        ret: Option<mir::BasicBlock>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
@@ -85,7 +74,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         // what that is), and returns 1.
         // The `payload` is passed (by libstd) to `__rust_panic_cleanup`, which is then expected to
         // return a `Box<dyn Any + Send + 'static>`.
-        // In Miri, `miri_start_panic` is passed exactly that type, so we make the `payload` simply
+        // In Miri, `miri_start_unwind` is passed exactly that type, so we make the `payload` simply
         // a pointer to `Box<dyn Any + Send + 'static>`.
 
         // Get all the arguments.
@@ -103,7 +92,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             &[data.into()],
             None,
             // Directly return to caller.
-            StackPopCleanup::Goto { ret: Some(ret), unwind: mir::UnwindAction::Continue },
+            StackPopCleanup::Goto { ret, unwind: mir::UnwindAction::Continue },
         )?;
 
         // We ourselves will return `0`, eventually (will be overwritten if we catch a panic).
@@ -124,7 +113,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         &mut self,
         mut extra: FrameExtra<'tcx>,
         unwinding: bool,
-    ) -> InterpResult<'tcx, StackPopJump> {
+    ) -> InterpResult<'tcx, ReturnAction> {
         let this = self.eval_context_mut();
         trace!("handle_stack_pop_unwind(extra = {:?}, unwinding = {})", extra, unwinding);
 
@@ -141,7 +130,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // We set the return value of `try` to 1, since there was a panic.
             this.write_scalar(Scalar::from_i32(1), &catch_unwind.dest)?;
 
-            // The Thread's `panic_payload` holds what was passed to `miri_start_panic`.
+            // The Thread's `panic_payload` holds what was passed to `miri_start_unwind`.
             // This is exactly the second argument we need to pass to `catch_fn`.
             let payload = this.active_thread_mut().panic_payloads.pop().unwrap();
 
@@ -155,15 +144,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 None,
                 // Directly return to caller of `try`.
                 StackPopCleanup::Goto {
-                    ret: Some(catch_unwind.ret),
+                    ret: catch_unwind.ret,
                     unwind: mir::UnwindAction::Continue,
                 },
             )?;
 
             // We pushed a new stack frame, the engine should not do any jumping now!
-            Ok(StackPopJump::NoJump)
+            Ok(ReturnAction::NoJump)
         } else {
-            Ok(StackPopJump::Normal)
+            Ok(ReturnAction::Normal)
         }
     }
 
@@ -256,8 +245,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
 
             _ => {
-                // Forward everything else to `panic` lang item.
-                this.start_panic(msg.description(), unwind)?;
+                // Call the lang item associated with this message.
+                let fn_item = this.tcx.require_lang_item(msg.panic_function(), None);
+                let instance = ty::Instance::mono(this.tcx.tcx, fn_item);
+                this.call_function(
+                    instance,
+                    Abi::Rust,
+                    &[],
+                    None,
+                    StackPopCleanup::Goto { ret: None, unwind },
+                )?;
             }
         }
         Ok(())

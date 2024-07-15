@@ -23,11 +23,10 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::{env, iter};
 
 use crate::core::config::TargetSelection;
-use crate::utils::helpers::output;
+use crate::utils::exec::{command, BootstrapCommand};
 use crate::{Build, CLang, GitRepo};
 
 // The `cc` crate doesn't provide a way to obtain a path to the detected archiver,
@@ -41,13 +40,11 @@ fn cc2ar(cc: &Path, target: TargetSelection) -> Option<PathBuf> {
         Some(PathBuf::from(ar))
     } else if target.is_msvc() {
         None
-    } else if target.contains("musl") {
-        Some(PathBuf::from("ar"))
-    } else if target.contains("openbsd") {
+    } else if target.contains("musl") || target.contains("openbsd") {
         Some(PathBuf::from("ar"))
     } else if target.contains("vxworks") {
         Some(PathBuf::from("wr-ar"))
-    } else if target.contains("android") {
+    } else if target.contains("android") || target.contains("-wasi") {
         Some(cc.parent().unwrap().join(PathBuf::from("llvm-ar")))
     } else {
         let parent = cc.parent().unwrap();
@@ -145,15 +142,15 @@ pub fn find_target(build: &Build, target: TargetSelection) {
         build.cxx.borrow_mut().insert(target, compiler);
     }
 
-    build.verbose(&format!("CC_{} = {:?}", &target.triple, build.cc(target)));
-    build.verbose(&format!("CFLAGS_{} = {:?}", &target.triple, cflags));
+    build.verbose(|| println!("CC_{} = {:?}", &target.triple, build.cc(target)));
+    build.verbose(|| println!("CFLAGS_{} = {:?}", &target.triple, cflags));
     if let Ok(cxx) = build.cxx(target) {
         let cxxflags = build.cflags(target, GitRepo::Rustc, CLang::Cxx);
-        build.verbose(&format!("CXX_{} = {:?}", &target.triple, cxx));
-        build.verbose(&format!("CXXFLAGS_{} = {:?}", &target.triple, cxxflags));
+        build.verbose(|| println!("CXX_{} = {:?}", &target.triple, cxx));
+        build.verbose(|| println!("CXXFLAGS_{} = {:?}", &target.triple, cxxflags));
     }
     if let Some(ar) = ar {
-        build.verbose(&format!("AR_{} = {:?}", &target.triple, ar));
+        build.verbose(|| println!("AR_{} = {:?}", &target.triple, ar));
         build.ar.borrow_mut().insert(target, ar);
     }
 
@@ -185,14 +182,15 @@ fn default_compiler(
                 return None;
             }
 
-            let output = output(c.to_command().arg("--version"));
+            let cmd = BootstrapCommand::from(c.to_command());
+            let output = cmd.capture_stdout().arg("--version").run(build).stdout();
             let i = output.find(" 4.")?;
             match output[i + 3..].chars().next().unwrap() {
                 '0'..='6' => {}
                 _ => return None,
             }
             let alternative = format!("e{gnu_compiler}");
-            if Command::new(&alternative).output().is_ok() {
+            if command(&alternative).capture().run(build).is_success() {
                 Some(PathBuf::from(alternative))
             } else {
                 None
@@ -221,6 +219,16 @@ fn default_compiler(
             } else {
                 None
             }
+        }
+
+        t if t.contains("-wasi") => {
+            let root = PathBuf::from(std::env::var_os("WASI_SDK_PATH")?);
+            let compiler = match compiler {
+                Language::C => format!("{t}-clang"),
+                Language::CPlusPlus => format!("{t}-clang++"),
+            };
+            let compiler = root.join("bin").join(compiler);
+            Some(compiler)
         }
 
         _ => None,

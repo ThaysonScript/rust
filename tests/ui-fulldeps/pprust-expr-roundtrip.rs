@@ -36,18 +36,19 @@ use rustc_ast::mut_visit::{visit_clobber, MutVisitor};
 use rustc_ast::ptr::P;
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
-use rustc_parse::new_parser_from_source_str;
+use rustc_parse::{new_parser_from_source_str, unwrap_or_emit_fatal};
 use rustc_session::parse::ParseSess;
-use rustc_span::source_map::{FilePathMapping, Spanned};
+use rustc_span::source_map::Spanned;
 use rustc_span::symbol::Ident;
 use rustc_span::{FileName, DUMMY_SP};
 use thin_vec::{thin_vec, ThinVec};
 
-fn parse_expr(ps: &ParseSess, src: &str) -> Option<P<Expr>> {
+fn parse_expr(psess: &ParseSess, src: &str) -> Option<P<Expr>> {
     let src_as_string = src.to_string();
 
-    let mut p =
-        new_parser_from_source_str(ps, FileName::Custom(src_as_string.clone()), src_as_string);
+    let mut p = unwrap_or_emit_fatal(
+        new_parser_from_source_str(psess, FileName::Custom(src_as_string.clone()), src_as_string)
+    );
     p.parse_expr().map_err(|e| e.cancel()).ok()
 }
 
@@ -180,7 +181,10 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
             18 => {
                 let pat =
                     P(Pat { id: DUMMY_NODE_ID, kind: PatKind::Wild, span: DUMMY_SP, tokens: None });
-                iter_exprs(depth - 1, &mut |e| g(ExprKind::Let(pat.clone(), e, DUMMY_SP, None)))
+                iter_exprs(
+                    depth - 1,
+                    &mut |e| g(ExprKind::Let(pat.clone(), e, DUMMY_SP, Recovered::No))
+                )
             }
             _ => panic!("bad counter value in iter_exprs"),
         }
@@ -225,7 +229,7 @@ fn main() {
 }
 
 fn run() {
-    let ps = ParseSess::new(vec![rustc_parse::DEFAULT_LOCALE_RESOURCE], FilePathMapping::empty());
+    let psess = ParseSess::new(vec![rustc_parse::DEFAULT_LOCALE_RESOURCE]);
 
     iter_exprs(2, &mut |mut e| {
         // If the pretty printer is correct, then `parse(print(e))` should be identical to `e`,
@@ -234,7 +238,7 @@ fn run() {
         println!("printed: {}", printed);
 
         // Ignore expressions with chained comparisons that fail to parse
-        if let Some(mut parsed) = parse_expr(&ps, &printed) {
+        if let Some(mut parsed) = parse_expr(&psess, &printed) {
             // We want to know if `parsed` is structurally identical to `e`, ignoring trivial
             // differences like placement of `Paren`s or the exact ranges of node spans.
             // Unfortunately, there is no easy way to make this comparison. Instead, we add `Paren`s

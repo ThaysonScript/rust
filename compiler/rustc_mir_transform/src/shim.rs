@@ -1,43 +1,49 @@
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::lang_items::LangItem;
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::*;
 use rustc_middle::query::Providers;
-use rustc_middle::ty::{self, CoroutineArgs, EarlyBinder, Ty, TyCtxt};
-use rustc_middle::ty::{GenericArgs, CAPTURE_STRUCT_LOCAL};
-use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
-
-use rustc_index::{Idx, IndexVec};
-
+use rustc_middle::ty::GenericArgs;
+use rustc_middle::ty::{self, CoroutineArgs, CoroutineArgsExt, EarlyBinder, Ty, TyCtxt};
+use rustc_middle::{bug, span_bug};
 use rustc_span::{source_map::Spanned, Span, DUMMY_SP};
+use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
 use rustc_target::spec::abi::Abi;
 
+use std::assert_matches::assert_matches;
 use std::fmt;
 use std::iter;
 
 use crate::{
     abort_unwinding_calls, add_call_guards, add_moves_for_packed_drops, deref_separator,
-    pass_manager as pm, remove_noop_landing_pads, simplify,
+    mentioned_items, pass_manager as pm, remove_noop_landing_pads, simplify,
 };
 use rustc_middle::mir::patch::MirPatch;
 use rustc_mir_dataflow::elaborate_drops::{self, DropElaborator, DropFlagMode, DropStyle};
+
+mod async_destructor_ctor;
 
 pub fn provide(providers: &mut Providers) {
     providers.mir_shims = make_shim;
 }
 
-fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'tcx> {
+fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceKind<'tcx>) -> Body<'tcx> {
     debug!("make_shim({:?})", instance);
 
     let mut result = match instance {
-        ty::InstanceDef::Item(..) => bug!("item {:?} passed to make_shim", instance),
-        ty::InstanceDef::VTableShim(def_id) => {
+        ty::InstanceKind::Item(..) => bug!("item {:?} passed to make_shim", instance),
+        ty::InstanceKind::VTableShim(def_id) => {
             let adjustment = Adjustment::Deref { source: DerefSource::MutPtr };
             build_call_shim(tcx, instance, Some(adjustment), CallKind::Direct(def_id))
         }
-        ty::InstanceDef::FnPtrShim(def_id, ty) => {
+        ty::InstanceKind::FnPtrShim(def_id, ty) => {
             let trait_ = tcx.trait_of_item(def_id).unwrap();
-            let adjustment = match tcx.fn_trait_kind_from_def_id(trait_) {
+            // Supports `Fn` or `async Fn` traits.
+            let adjustment = match tcx
+                .fn_trait_kind_from_def_id(trait_)
+                .or_else(|| tcx.async_fn_trait_kind_from_def_id(trait_))
+            {
                 Some(ty::ClosureKind::FnOnce) => Adjustment::Identity,
                 Some(ty::ClosureKind::Fn) => Adjustment::Deref { source: DerefSource::ImmRef },
                 Some(ty::ClosureKind::FnMut) => Adjustment::Deref { source: DerefSource::MutRef },
@@ -51,10 +57,10 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
         // a virtual call, or a direct call to a function for which
         // indirect calls must be codegen'd differently than direct ones
         // (such as `#[track_caller]`).
-        ty::InstanceDef::ReifyShim(def_id) => {
+        ty::InstanceKind::ReifyShim(def_id, _) => {
             build_call_shim(tcx, instance, None, CallKind::Direct(def_id))
         }
-        ty::InstanceDef::ClosureOnceShim { call_once: _, track_caller: _ } => {
+        ty::InstanceKind::ClosureOnceShim { call_once: _, track_caller: _ } => {
             let fn_mut = tcx.require_lang_item(LangItem::FnMut, None);
             let call_mut = tcx
                 .associated_items(fn_mut)
@@ -66,41 +72,16 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
             build_call_shim(tcx, instance, Some(Adjustment::RefMut), CallKind::Direct(call_mut))
         }
 
-        ty::InstanceDef::ConstructCoroutineInClosureShim {
+        ty::InstanceKind::ConstructCoroutineInClosureShim {
             coroutine_closure_def_id,
-            target_kind,
-        } => match target_kind {
-            ty::ClosureKind::Fn => unreachable!("shouldn't be building shim for Fn"),
-            ty::ClosureKind::FnMut => {
-                // No need to optimize the body, it has already been optimized
-                // since we steal it from the `AsyncFn::call` body and just fix
-                // the return type.
-                return build_construct_coroutine_by_mut_shim(tcx, coroutine_closure_def_id);
-            }
-            ty::ClosureKind::FnOnce => {
-                build_construct_coroutine_by_move_shim(tcx, coroutine_closure_def_id)
-            }
-        },
+            receiver_by_ref,
+        } => build_construct_coroutine_by_move_shim(tcx, coroutine_closure_def_id, receiver_by_ref),
 
-        ty::InstanceDef::CoroutineKindShim { coroutine_def_id, target_kind } => match target_kind {
-            ty::ClosureKind::Fn => unreachable!(),
-            ty::ClosureKind::FnMut => {
-                return tcx
-                    .optimized_mir(coroutine_def_id)
-                    .coroutine_by_mut_body()
-                    .unwrap()
-                    .clone();
-            }
-            ty::ClosureKind::FnOnce => {
-                return tcx
-                    .optimized_mir(coroutine_def_id)
-                    .coroutine_by_move_body()
-                    .unwrap()
-                    .clone();
-            }
-        },
+        ty::InstanceKind::CoroutineKindShim { coroutine_def_id } => {
+            return tcx.optimized_mir(coroutine_def_id).coroutine_by_move_body().unwrap().clone();
+        }
 
-        ty::InstanceDef::DropGlue(def_id, ty) => {
+        ty::InstanceKind::DropGlue(def_id, ty) => {
             // FIXME(#91576): Drop shims for coroutines aren't subject to the MIR passes at the end
             // of this function. Is this intentional?
             if let Some(ty::Coroutine(coroutine_def_id, args)) = ty.map(Ty::kind) {
@@ -119,21 +100,11 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
                 let body = if id_args.as_coroutine().kind_ty() == args.as_coroutine().kind_ty() {
                     coroutine_body.coroutine_drop().unwrap()
                 } else {
-                    match args.as_coroutine().kind_ty().to_opt_closure_kind().unwrap() {
-                        ty::ClosureKind::Fn => {
-                            unreachable!()
-                        }
-                        ty::ClosureKind::FnMut => coroutine_body
-                            .coroutine_by_mut_body()
-                            .unwrap()
-                            .coroutine_drop()
-                            .unwrap(),
-                        ty::ClosureKind::FnOnce => coroutine_body
-                            .coroutine_by_move_body()
-                            .unwrap()
-                            .coroutine_drop()
-                            .unwrap(),
-                    }
+                    assert_eq!(
+                        args.as_coroutine().kind_ty().to_opt_closure_kind().unwrap(),
+                        ty::ClosureKind::FnOnce
+                    );
+                    coroutine_body.coroutine_by_move_body().unwrap().coroutine_drop().unwrap()
                 };
 
                 let mut body = EarlyBinder::bind(body.clone()).instantiate(tcx, args);
@@ -143,6 +114,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
                     tcx,
                     &mut body,
                     &[
+                        &mentioned_items::MentionedItems,
                         &abort_unwinding_calls::AbortUnwindingCalls,
                         &add_call_guards::CriticalCallEdges,
                     ],
@@ -154,13 +126,16 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
 
             build_drop_shim(tcx, def_id, ty)
         }
-        ty::InstanceDef::ThreadLocalShim(..) => build_thread_local_shim(tcx, instance),
-        ty::InstanceDef::CloneShim(def_id, ty) => build_clone_shim(tcx, def_id, ty),
-        ty::InstanceDef::FnPtrAddrShim(def_id, ty) => build_fn_ptr_addr_shim(tcx, def_id, ty),
-        ty::InstanceDef::Virtual(..) => {
-            bug!("InstanceDef::Virtual ({:?}) is for direct calls only", instance)
+        ty::InstanceKind::ThreadLocalShim(..) => build_thread_local_shim(tcx, instance),
+        ty::InstanceKind::CloneShim(def_id, ty) => build_clone_shim(tcx, def_id, ty),
+        ty::InstanceKind::FnPtrAddrShim(def_id, ty) => build_fn_ptr_addr_shim(tcx, def_id, ty),
+        ty::InstanceKind::AsyncDropGlueCtorShim(def_id, ty) => {
+            async_destructor_ctor::build_async_destructor_ctor_shim(tcx, def_id, ty)
         }
-        ty::InstanceDef::Intrinsic(_) => {
+        ty::InstanceKind::Virtual(..) => {
+            bug!("InstanceKind::Virtual ({:?}) is for direct calls only", instance)
+        }
+        ty::InstanceKind::Intrinsic(_) => {
             bug!("creating shims from intrinsics ({:?}) is unsupported", instance)
         }
     };
@@ -174,6 +149,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
         tcx,
         &mut result,
         &[
+            &mentioned_items::MentionedItems,
             &add_moves_for_packed_drops::AddMovesForPackedDrops,
             &deref_separator::Derefer,
             &remove_noop_landing_pads::RemoveNoopLandingPads,
@@ -263,7 +239,7 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
     block(&mut blocks, TerminatorKind::Goto { target: return_block });
     block(&mut blocks, TerminatorKind::Return);
 
-    let source = MirSource::from_instance(ty::InstanceDef::DropGlue(def_id, ty));
+    let source = MirSource::from_instance(ty::InstanceKind::DropGlue(def_id, ty));
     let mut body =
         new_body(source, blocks, local_decls_for_sig(&sig, span), sig.inputs().len(), span);
 
@@ -415,7 +391,10 @@ impl<'a, 'tcx> DropElaborator<'a, 'tcx> for DropShimElaborator<'a, 'tcx> {
     }
 }
 
-fn build_thread_local_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'tcx> {
+fn build_thread_local_shim<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::InstanceKind<'tcx>,
+) -> Body<'tcx> {
     let def_id = instance.def_id();
 
     let span = tcx.def_span(def_id);
@@ -495,7 +474,7 @@ impl<'tcx> CloneShimBuilder<'tcx> {
     }
 
     fn into_mir(self) -> Body<'tcx> {
-        let source = MirSource::from_instance(ty::InstanceDef::CloneShim(
+        let source = MirSource::from_instance(ty::InstanceKind::CloneShim(
             self.def_id,
             self.sig.inputs_and_output[0],
         ));
@@ -568,14 +547,8 @@ impl<'tcx> CloneShimBuilder<'tcx> {
             const_: Const::zero_sized(func_ty),
         }));
 
-        let ref_loc = self.make_place(
-            Mutability::Not,
-            Ty::new_ref(
-                tcx,
-                tcx.lifetimes.re_erased,
-                ty::TypeAndMut { ty, mutbl: hir::Mutability::Not },
-            ),
-        );
+        let ref_loc =
+            self.make_place(Mutability::Not, Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, ty));
 
         // `let ref_loc: &ty = &src;`
         let statement = self.make_statement(StatementKind::Assign(Box::new((
@@ -588,7 +561,7 @@ impl<'tcx> CloneShimBuilder<'tcx> {
             vec![statement],
             TerminatorKind::Call {
                 func,
-                args: vec![Spanned { node: Operand::Move(ref_loc), span: DUMMY_SP }],
+                args: [Spanned { node: Operand::Move(ref_loc), span: DUMMY_SP }].into(),
                 destination: dest,
                 target: Some(next),
                 unwind: UnwindAction::Cleanup(cleanup),
@@ -663,7 +636,7 @@ impl<'tcx> CloneShimBuilder<'tcx> {
         dest: Place<'tcx>,
         src: Place<'tcx>,
         coroutine_def_id: DefId,
-        args: CoroutineArgs<'tcx>,
+        args: CoroutineArgs<TyCtxt<'tcx>>,
     ) {
         self.block(vec![], TerminatorKind::Goto { target: self.block_index_offset(3) }, false);
         let unwind = self.block(vec![], TerminatorKind::UnwindResume, true);
@@ -711,14 +684,14 @@ impl<'tcx> CloneShimBuilder<'tcx> {
 #[instrument(level = "debug", skip(tcx), ret)]
 fn build_call_shim<'tcx>(
     tcx: TyCtxt<'tcx>,
-    instance: ty::InstanceDef<'tcx>,
+    instance: ty::InstanceKind<'tcx>,
     rcvr_adjustment: Option<Adjustment>,
     call_kind: CallKind<'tcx>,
 ) -> Body<'tcx> {
     // `FnPtrShim` contains the fn pointer type that a call shim is being built for - this is used
     // to instantiate into the signature of the shim. It is not necessary for users of this
-    // MIR body to perform further instantiations (see `InstanceDef::has_polymorphic_mir_body`).
-    let (sig_args, untuple_args) = if let ty::InstanceDef::FnPtrShim(_, ty) = instance {
+    // MIR body to perform further instantiations (see `InstanceKind::has_polymorphic_mir_body`).
+    let (sig_args, untuple_args) = if let ty::InstanceKind::FnPtrShim(_, ty) = instance {
         let sig = tcx.instantiate_bound_regions_with_erased(ty.fn_sig(tcx));
 
         let untuple_args = sig.inputs();
@@ -770,8 +743,8 @@ fn build_call_shim<'tcx>(
     }
 
     // FIXME(eddyb) avoid having this snippet both here and in
-    // `Instance::fn_sig` (introduce `InstanceDef::fn_sig`?).
-    if let ty::InstanceDef::VTableShim(..) = instance {
+    // `Instance::fn_sig` (introduce `InstanceKind::fn_sig`?).
+    if let ty::InstanceKind::VTableShim(..) = instance {
         // Modify fn(self, ...) to fn(self: *mut Self, ...)
         let mut inputs_and_output = sig.inputs_and_output.to_vec();
         let self_arg = &mut inputs_and_output[0];
@@ -800,11 +773,7 @@ fn build_call_shim<'tcx>(
             // let rcvr = &mut rcvr;
             let ref_rcvr = local_decls.push(
                 LocalDecl::new(
-                    Ty::new_ref(
-                        tcx,
-                        tcx.lifetimes.re_erased,
-                        ty::TypeAndMut { ty: sig.inputs()[0], mutbl: hir::Mutability::Mut },
-                    ),
+                    Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, sig.inputs()[0]),
                     span,
                 )
                 .immutable(),
@@ -873,7 +842,7 @@ fn build_call_shim<'tcx>(
     };
 
     // BB #0
-    let args = args.into_iter().map(|a| Spanned { node: a, span: DUMMY_SP }).collect::<Vec<_>>();
+    let args = args.into_iter().map(|a| Spanned { node: a, span: DUMMY_SP }).collect();
     block(
         &mut blocks,
         statements,
@@ -1024,7 +993,7 @@ fn build_fn_ptr_addr_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, self_ty: Ty<'t
     let locals = local_decls_for_sig(&sig, span);
 
     let source_info = SourceInfo::outermost(span);
-    // FIXME: use `expose_addr` once we figure out whether function pointers have meaningful provenance.
+    // FIXME: use `expose_provenance` once we figure out whether function pointers have meaningful provenance.
     let rvalue = Rvalue::Cast(
         CastKind::FnPtrToPtr,
         Operand::Move(Place::from(Local::new(1))),
@@ -1040,18 +1009,30 @@ fn build_fn_ptr_addr_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, self_ty: Ty<'t
         terminator: Some(Terminator { source_info, kind: TerminatorKind::Return }),
         is_cleanup: false,
     };
-    let source = MirSource::from_instance(ty::InstanceDef::FnPtrAddrShim(def_id, self_ty));
+    let source = MirSource::from_instance(ty::InstanceKind::FnPtrAddrShim(def_id, self_ty));
     new_body(source, IndexVec::from_elem_n(start_block, 1), locals, sig.inputs().len(), span)
 }
 
 fn build_construct_coroutine_by_move_shim<'tcx>(
     tcx: TyCtxt<'tcx>,
     coroutine_closure_def_id: DefId,
+    receiver_by_ref: bool,
 ) -> Body<'tcx> {
-    let self_ty = tcx.type_of(coroutine_closure_def_id).instantiate_identity();
+    let mut self_ty = tcx.type_of(coroutine_closure_def_id).instantiate_identity();
+    let mut self_local: Place<'tcx> = Local::from_usize(1).into();
     let ty::CoroutineClosure(_, args) = *self_ty.kind() else {
         bug!();
     };
+
+    // We use `&Self` here because we only need to emit an ABI-compatible shim body,
+    // rather than match the signature exactly (which might take `&mut self` instead).
+    //
+    // We adjust the `self_local` to be a deref since we want to copy fields out of
+    // a reference to the closure.
+    if receiver_by_ref {
+        self_local = tcx.mk_place_deref(self_local);
+        self_ty = Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, self_ty);
+    }
 
     let poly_sig = args.as_coroutine_closure().coroutine_closure_sig().map_bound(|sig| {
         tcx.mk_fn_sig(
@@ -1066,7 +1047,7 @@ fn build_construct_coroutine_by_move_shim<'tcx>(
                 args.as_coroutine_closure().coroutine_captures_by_ref_ty(),
             ),
             sig.c_variadic,
-            sig.unsafety,
+            sig.safety,
             sig.abi,
         )
     });
@@ -1083,11 +1064,27 @@ fn build_construct_coroutine_by_move_shim<'tcx>(
         fields.push(Operand::Move(Local::from_usize(idx + 1).into()));
     }
     for (idx, ty) in args.as_coroutine_closure().upvar_tys().iter().enumerate() {
-        fields.push(Operand::Move(tcx.mk_place_field(
-            Local::from_usize(1).into(),
-            FieldIdx::from_usize(idx),
-            ty,
-        )));
+        if receiver_by_ref {
+            // The only situation where it's possible is when we capture immuatable references,
+            // since those don't need to be reborrowed with the closure's env lifetime. Since
+            // references are always `Copy`, just emit a copy.
+            assert_matches!(
+                ty.kind(),
+                ty::Ref(_, _, hir::Mutability::Not),
+                "field should be captured by immutable ref if we have an `Fn` instance"
+            );
+            fields.push(Operand::Copy(tcx.mk_place_field(
+                self_local,
+                FieldIdx::from_usize(idx),
+                ty,
+            )));
+        } else {
+            fields.push(Operand::Move(tcx.mk_place_field(
+                self_local,
+                FieldIdx::from_usize(idx),
+                ty,
+            )));
+        }
     }
 
     let source_info = SourceInfo::outermost(span);
@@ -1106,51 +1103,21 @@ fn build_construct_coroutine_by_move_shim<'tcx>(
         is_cleanup: false,
     };
 
-    let source = MirSource::from_instance(ty::InstanceDef::ConstructCoroutineInClosureShim {
+    let source = MirSource::from_instance(ty::InstanceKind::ConstructCoroutineInClosureShim {
         coroutine_closure_def_id,
-        target_kind: ty::ClosureKind::FnOnce,
+        receiver_by_ref,
     });
 
     let body =
         new_body(source, IndexVec::from_elem_n(start_block, 1), locals, sig.inputs().len(), span);
-    dump_mir(tcx, false, "coroutine_closure_by_move", &0, &body, |_, _| Ok(()));
-
-    body
-}
-
-fn build_construct_coroutine_by_mut_shim<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    coroutine_closure_def_id: DefId,
-) -> Body<'tcx> {
-    let mut body = tcx.optimized_mir(coroutine_closure_def_id).clone();
-    let coroutine_closure_ty = tcx.type_of(coroutine_closure_def_id).instantiate_identity();
-    let ty::CoroutineClosure(_, args) = *coroutine_closure_ty.kind() else {
-        bug!();
-    };
-    let args = args.as_coroutine_closure();
-
-    body.local_decls[RETURN_PLACE].ty =
-        tcx.instantiate_bound_regions_with_erased(args.coroutine_closure_sig().map_bound(|sig| {
-            sig.to_coroutine_given_kind_and_upvars(
-                tcx,
-                args.parent_args(),
-                tcx.coroutine_for_closure(coroutine_closure_def_id),
-                ty::ClosureKind::FnMut,
-                tcx.lifetimes.re_erased,
-                args.tupled_upvars_ty(),
-                args.coroutine_captures_by_ref_ty(),
-            )
-        }));
-    body.local_decls[CAPTURE_STRUCT_LOCAL].ty =
-        Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, coroutine_closure_ty);
-
-    body.source = MirSource::from_instance(ty::InstanceDef::ConstructCoroutineInClosureShim {
-        coroutine_closure_def_id,
-        target_kind: ty::ClosureKind::FnMut,
-    });
-
-    body.pass_count = 0;
-    dump_mir(tcx, false, "coroutine_closure_by_mut", &0, &body, |_, _| Ok(()));
+    dump_mir(
+        tcx,
+        false,
+        if receiver_by_ref { "coroutine_closure_by_ref" } else { "coroutine_closure_by_move" },
+        &0,
+        &body,
+        |_, _| Ok(()),
+    );
 
     body
 }

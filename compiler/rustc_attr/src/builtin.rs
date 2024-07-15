@@ -1,14 +1,15 @@
 //! Parsing and validation of builtin attributes
 
+use rustc_abi::Align;
 use rustc_ast::{self as ast, attr};
 use rustc_ast::{Attribute, LitKind, MetaItem, MetaItemKind, MetaItemLit, NestedMetaItem, NodeId};
 use rustc_ast_pretty::pprust;
 use rustc_errors::ErrorGuaranteed;
 use rustc_feature::{find_gated_cfg, is_builtin_attr_name, Features, GatedCfg};
-use rustc_macros::HashStable_Generic;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_session::config::ExpectedValues;
 use rustc_session::lint::builtin::UNEXPECTED_CFGS;
-use rustc_session::lint::BuiltinLintDiagnostics;
+use rustc_session::lint::BuiltinLintDiag;
 use rustc_session::parse::feature_err;
 use rustc_session::{RustcVersion, Session};
 use rustc_span::hygiene::Transparency;
@@ -516,6 +517,7 @@ pub struct Condition {
 }
 
 /// Tests if a cfg-pattern matches the cfg set
+#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 pub fn cfg_matches(
     cfg: &ast::MetaItem,
     sess: &Session,
@@ -524,30 +526,24 @@ pub fn cfg_matches(
 ) -> bool {
     eval_condition(cfg, sess, features, &mut |cfg| {
         try_gate_cfg(cfg.name, cfg.span, sess, features);
-        match sess.parse_sess.check_config.expecteds.get(&cfg.name) {
+        match sess.psess.check_config.expecteds.get(&cfg.name) {
             Some(ExpectedValues::Some(values)) if !values.contains(&cfg.value) => {
-                sess.parse_sess.buffer_lint_with_diagnostic(
+                sess.psess.buffer_lint(
                     UNEXPECTED_CFGS,
                     cfg.span,
                     lint_node_id,
-                    if let Some(value) = cfg.value {
-                        format!("unexpected `cfg` condition value: `{value}`")
-                    } else {
-                        format!("unexpected `cfg` condition value: (none)")
-                    },
-                    BuiltinLintDiagnostics::UnexpectedCfgValue(
+                    BuiltinLintDiag::UnexpectedCfgValue(
                         (cfg.name, cfg.name_span),
                         cfg.value.map(|v| (v, cfg.value_span.unwrap())),
                     ),
                 );
             }
-            None if sess.parse_sess.check_config.exhaustive_names => {
-                sess.parse_sess.buffer_lint_with_diagnostic(
+            None if sess.psess.check_config.exhaustive_names => {
+                sess.psess.buffer_lint(
                     UNEXPECTED_CFGS,
                     cfg.span,
                     lint_node_id,
-                    format!("unexpected `cfg` condition name: `{}`", cfg.name),
-                    BuiltinLintDiagnostics::UnexpectedCfgName(
+                    BuiltinLintDiag::UnexpectedCfgName(
                         (cfg.name, cfg.name_span),
                         cfg.value.map(|v| (v, cfg.value_span.unwrap())),
                     ),
@@ -555,7 +551,7 @@ pub fn cfg_matches(
             }
             _ => { /* not unexpected */ }
         }
-        sess.parse_sess.config.contains(&(cfg.name, cfg.value))
+        sess.psess.config.contains(&(cfg.name, cfg.value))
     })
 }
 
@@ -566,6 +562,7 @@ fn try_gate_cfg(name: Symbol, span: Span, sess: &Session, features: Option<&Feat
     }
 }
 
+#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 fn gate_cfg(gated_cfg: &GatedCfg, cfg_span: Span, sess: &Session, features: &Features) {
     let (cfg, feature, has_feature) = gated_cfg;
     if !has_feature(features) && !cfg_span.allows_unstable(*feature) {
@@ -592,13 +589,14 @@ fn parse_version(s: Symbol) -> Option<RustcVersion> {
 
 /// Evaluate a cfg-like condition (with `any` and `all`), using `eval` to
 /// evaluate individual items.
+#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 pub fn eval_condition(
     cfg: &ast::MetaItem,
     sess: &Session,
     features: Option<&Features>,
     eval: &mut impl FnMut(Condition) -> bool,
 ) -> bool {
-    let dcx = &sess.parse_sess.dcx;
+    let dcx = sess.dcx();
     match &cfg.kind {
         ast::MetaItemKind::List(mis) if cfg.name_or_empty() == sym::version => {
             try_gate_cfg(sym::version, cfg.span, sess, features);
@@ -626,7 +624,7 @@ pub fn eval_condition(
             };
 
             // See https://github.com/rust-lang/rust/issues/64796#issuecomment-640851454 for details
-            if sess.parse_sess.assume_incomplete_release {
+            if sess.psess.assume_incomplete_release {
                 RustcVersion::CURRENT > min_version
             } else {
                 RustcVersion::CURRENT >= min_version
@@ -916,10 +914,10 @@ pub enum ReprAttr {
     ReprInt(IntType),
     ReprRust,
     ReprC,
-    ReprPacked(u32),
+    ReprPacked(Align),
     ReprSimd,
     ReprTransparent,
-    ReprAlign(u32),
+    ReprAlign(Align),
 }
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
@@ -965,7 +963,7 @@ pub fn parse_repr_attr(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
                 let hint = match item.name_or_empty() {
                     sym::Rust => Some(ReprRust),
                     sym::C => Some(ReprC),
-                    sym::packed => Some(ReprPacked(1)),
+                    sym::packed => Some(ReprPacked(Align::ONE)),
                     sym::simd => Some(ReprSimd),
                     sym::transparent => Some(ReprTransparent),
                     sym::align => {
@@ -982,19 +980,26 @@ pub fn parse_repr_attr(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
                     recognised = true;
                     acc.push(h);
                 }
-            } else if let Some((name, value)) = item.name_value_literal() {
+            } else if let Some((name, value)) = item.singleton_lit_list() {
                 let mut literal_error = None;
+                let mut err_span = item.span();
                 if name == sym::align {
                     recognised = true;
                     match parse_alignment(&value.kind) {
                         Ok(literal) => acc.push(ReprAlign(literal)),
-                        Err(message) => literal_error = Some(message),
+                        Err(message) => {
+                            err_span = value.span;
+                            literal_error = Some(message)
+                        }
                     };
                 } else if name == sym::packed {
                     recognised = true;
                     match parse_alignment(&value.kind) {
                         Ok(literal) => acc.push(ReprPacked(literal)),
-                        Err(message) => literal_error = Some(message),
+                        Err(message) => {
+                            err_span = value.span;
+                            literal_error = Some(message)
+                        }
                     };
                 } else if matches!(name, sym::Rust | sym::C | sym::simd | sym::transparent)
                     || int_type_of_word(name).is_some()
@@ -1007,7 +1012,7 @@ pub fn parse_repr_attr(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
                 }
                 if let Some(literal_error) = literal_error {
                     sess.dcx().emit_err(session_diagnostics::InvalidReprGeneric {
-                        span: item.span(),
+                        span: err_span,
                         repr_arg: name.to_ident_string(),
                         error_part: literal_error,
                     });
@@ -1039,21 +1044,37 @@ pub fn parse_repr_attr(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
                             });
                         }
                     }
-                    MetaItemKind::List(_) => {
+                    MetaItemKind::List(nested_items) => {
                         if meta_item.has_name(sym::align) {
                             recognised = true;
-                            sess.dcx().emit_err(
-                                session_diagnostics::IncorrectReprFormatAlignOneArg {
-                                    span: meta_item.span,
-                                },
-                            );
+                            if nested_items.len() == 1 {
+                                sess.dcx().emit_err(
+                                    session_diagnostics::IncorrectReprFormatExpectInteger {
+                                        span: nested_items[0].span(),
+                                    },
+                                );
+                            } else {
+                                sess.dcx().emit_err(
+                                    session_diagnostics::IncorrectReprFormatAlignOneArg {
+                                        span: meta_item.span,
+                                    },
+                                );
+                            }
                         } else if meta_item.has_name(sym::packed) {
                             recognised = true;
-                            sess.dcx().emit_err(
-                                session_diagnostics::IncorrectReprFormatPackedOneOrZeroArg {
-                                    span: meta_item.span,
-                                },
-                            );
+                            if nested_items.len() == 1 {
+                                sess.dcx().emit_err(
+                                    session_diagnostics::IncorrectReprFormatPackedExpectInteger {
+                                        span: nested_items[0].span(),
+                                    },
+                                );
+                            } else {
+                                sess.dcx().emit_err(
+                                    session_diagnostics::IncorrectReprFormatPackedOneOrZeroArg {
+                                        span: meta_item.span,
+                                    },
+                                );
+                            }
                         } else if matches!(
                             meta_item.name_or_empty(),
                             sym::Rust | sym::C | sym::simd | sym::transparent
@@ -1183,11 +1204,17 @@ fn allow_unstable<'a>(
     })
 }
 
-pub fn parse_alignment(node: &ast::LitKind) -> Result<u32, &'static str> {
+pub fn parse_alignment(node: &ast::LitKind) -> Result<Align, &'static str> {
     if let ast::LitKind::Int(literal, ast::LitIntType::Unsuffixed) = node {
+        // `Align::from_bytes` accepts 0 as an input, check is_power_of_two() first
         if literal.get().is_power_of_two() {
-            // rustc_middle::ty::layout::Align restricts align to <= 2^29
-            if *literal <= 1 << 29 { Ok(literal.get() as u32) } else { Err("larger than 2^29") }
+            // Only possible error is larger than 2^29
+            literal
+                .get()
+                .try_into()
+                .ok()
+                .and_then(|v| Align::from_bytes(v).ok())
+                .ok_or("larger than 2^29")
         } else {
             Err("not a power of two")
         }

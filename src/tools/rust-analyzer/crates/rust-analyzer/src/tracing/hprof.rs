@@ -1,8 +1,8 @@
 //! Consumer of `tracing` data, which prints a hierarchical profile.
 //!
-//! Based on https://github.com/davidbarsky/tracing-tree, but does less, while
+//! Based on <https://github.com/davidbarsky/tracing-tree>, but does less, while
 //! actually printing timings for spans by default. The code here is vendored from
-//! https://github.com/matklad/tracing-span-tree.
+//! <https://github.com/matklad/tracing-span-tree>.
 //!
 //! Usage:
 //!
@@ -52,7 +52,15 @@ use tracing_subscriber::{
 
 use crate::tracing::hprof;
 
-pub fn init(spec: &str) {
+pub fn init(spec: &str) -> tracing::subscriber::DefaultGuard {
+    let subscriber = Registry::default().with(layer(spec));
+    tracing::subscriber::set_default(subscriber)
+}
+
+pub fn layer<S>(spec: &str) -> impl Layer<S>
+where
+    S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
     let (write_filter, allowed_names) = WriteFilter::from_spec(spec);
 
     // this filter the first pass for `tracing`: these are all the "profiling" spans, but things like
@@ -63,20 +71,15 @@ pub fn init(spec: &str) {
             None => true,
         };
 
-        metadata.is_span()
-            && allowed
+        allowed
+            && metadata.is_span()
             && metadata.level() >= &Level::INFO
             && !metadata.target().starts_with("salsa")
+            && metadata.name() != "compute_exhaustiveness_and_usefulness"
             && !metadata.target().starts_with("chalk")
     });
 
-    let layer = hprof::SpanTree::default()
-        .aggregate(true)
-        .spec_filter(write_filter)
-        .with_filter(profile_filter);
-
-    let subscriber = Registry::default().with(layer);
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+    hprof::SpanTree::default().aggregate(true).spec_filter(write_filter).with_filter(profile_filter)
 }
 
 #[derive(Default, Debug)]
@@ -196,7 +199,7 @@ impl Node {
                 let _ = write!(out, " ({} calls)", self.count);
             }
 
-            eprintln!("{}", out);
+            eprintln!("{out}");
 
             for child in &self.children {
                 child.go(level + 1, filter)

@@ -110,7 +110,7 @@ fn should_lint<'tcx>(
     // Is there a call to `DebugStruct::debug_struct`? Do lint if there is.
     let mut has_debug_struct = false;
 
-    for_each_expr(block, |expr| {
+    for_each_expr(cx, block, |expr| {
         if let ExprKind::MethodCall(path, recv, ..) = &expr.kind {
             let recv_ty = typeck_results.expr_ty(recv).peel_refs();
 
@@ -165,7 +165,7 @@ fn check_struct<'tcx>(
     let mut has_direct_field_access = false;
     let mut field_accesses = FxHashSet::default();
 
-    for_each_expr(block, |expr| {
+    for_each_expr(cx, block, |expr| {
         if let ExprKind::Field(target, ident) = expr.kind
             && let target_ty = typeck_results.expr_ty_adjusted(target).peel_refs()
             && target_ty == self_ty
@@ -198,7 +198,7 @@ fn check_struct<'tcx>(
 }
 
 impl<'tcx> LateLintPass<'tcx> for MissingFieldsInDebug {
-    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx rustc_hir::Item<'tcx>) {
+    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
         // is this an `impl Debug for X` block?
         if let ItemKind::Impl(Impl { of_trait: Some(trait_ref), self_ty, items, .. }) = item.kind
             && let Res::Def(DefKind::Trait, trait_def_id) = trait_ref.path.res
@@ -220,7 +220,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingFieldsInDebug {
             && let self_ty = cx.tcx.type_of(self_path_did).skip_binder().peel_refs()
             && let Some(self_adt) = self_ty.ty_adt_def()
             && let Some(self_def_id) = self_adt.did().as_local()
-            && let Some(Node::Item(self_item)) = cx.tcx.opt_hir_node_by_def_id(self_def_id)
+            && let Node::Item(self_item) = cx.tcx.hir_node_by_def_id(self_def_id)
             // NB: can't call cx.typeck_results() as we are not in a body
             && let typeck_results = cx.tcx.typeck_body(*body_id)
             && should_lint(cx, typeck_results, block)

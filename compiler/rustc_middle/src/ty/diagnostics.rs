@@ -5,13 +5,13 @@ use std::fmt::Write;
 use std::ops::ControlFlow;
 
 use crate::ty::{
-    AliasTy, Const, ConstKind, FallibleTypeFolder, InferConst, InferTy, Opaque, PolyTraitPredicate,
-    Projection, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
-    TypeVisitor,
+    self, AliasTy, Const, ConstKind, FallibleTypeFolder, InferConst, InferTy, Opaque,
+    PolyTraitPredicate, Projection, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable,
+    TypeSuperVisitable, TypeVisitable, TypeVisitor,
 };
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{Applicability, DiagnosticArgValue, DiagnosticBuilder, IntoDiagnosticArg};
+use rustc_errors::{into_diag_arg_using_display, Applicability, Diag, DiagArgValue, IntoDiagArg};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
@@ -19,10 +19,9 @@ use rustc_hir::{PredicateOrigin, WherePredicate};
 use rustc_span::{BytePos, Span};
 use rustc_type_ir::TyKind::*;
 
-impl<'tcx> IntoDiagnosticArg for Ty<'tcx> {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
-        self.to_string().into_diagnostic_arg()
-    }
+into_diag_arg_using_display! {
+    Ty<'_>,
+    ty::Region<'_>,
 }
 
 impl<'tcx> Ty<'tcx> {
@@ -91,7 +90,12 @@ pub trait IsSuggestable<'tcx>: Sized {
     /// inference variables to be suggestable.
     fn is_suggestable(self, tcx: TyCtxt<'tcx>, infer_suggestable: bool) -> bool;
 
-    fn make_suggestable(self, tcx: TyCtxt<'tcx>, infer_suggestable: bool) -> Option<Self>;
+    fn make_suggestable(
+        self,
+        tcx: TyCtxt<'tcx>,
+        infer_suggestable: bool,
+        placeholder: Option<Ty<'tcx>>,
+    ) -> Option<Self>;
 }
 
 impl<'tcx, T> IsSuggestable<'tcx> for T
@@ -103,15 +107,20 @@ where
         self.visit_with(&mut IsSuggestableVisitor { tcx, infer_suggestable }).is_continue()
     }
 
-    fn make_suggestable(self, tcx: TyCtxt<'tcx>, infer_suggestable: bool) -> Option<T> {
-        self.try_fold_with(&mut MakeSuggestableFolder { tcx, infer_suggestable }).ok()
+    fn make_suggestable(
+        self,
+        tcx: TyCtxt<'tcx>,
+        infer_suggestable: bool,
+        placeholder: Option<Ty<'tcx>>,
+    ) -> Option<T> {
+        self.try_fold_with(&mut MakeSuggestableFolder { tcx, infer_suggestable, placeholder }).ok()
     }
 }
 
 pub fn suggest_arbitrary_trait_bound<'tcx>(
     tcx: TyCtxt<'tcx>,
     generics: &hir::Generics<'_>,
-    err: &mut DiagnosticBuilder<'_>,
+    err: &mut Diag<'_>,
     trait_pred: PolyTraitPredicate<'tcx>,
     associated_ty: Option<(&'static str, Ty<'tcx>)>,
 ) -> bool {
@@ -216,7 +225,7 @@ fn suggest_changing_unsized_bound(
 pub fn suggest_constraining_type_param(
     tcx: TyCtxt<'_>,
     generics: &hir::Generics<'_>,
-    err: &mut DiagnosticBuilder<'_>,
+    err: &mut Diag<'_>,
     param_name: &str,
     constraint: &str,
     def_id: Option<DefId>,
@@ -235,7 +244,7 @@ pub fn suggest_constraining_type_param(
 pub fn suggest_constraining_type_params<'a>(
     tcx: TyCtxt<'_>,
     generics: &hir::Generics<'_>,
-    err: &mut DiagnosticBuilder<'_>,
+    err: &mut Diag<'_>,
     param_names_and_constraints: impl Iterator<Item = (&'a str, &'a str, Option<DefId>)>,
     span_to_replace: Option<Span>,
 ) -> bool {
@@ -270,24 +279,29 @@ pub fn suggest_constraining_type_params<'a>(
         constraint.sort();
         constraint.dedup();
         let constraint = constraint.join(" + ");
-        let mut suggest_restrict = |span, bound_list_non_empty| {
-            suggestions.push((
-                span,
-                if span_to_replace.is_some() {
-                    constraint.clone()
-                } else if constraint.starts_with('<') {
-                    constraint.to_string()
-                } else if bound_list_non_empty {
-                    format!(" + {constraint}")
-                } else {
-                    format!(" {constraint}")
-                },
-                SuggestChangingConstraintsMessage::RestrictBoundFurther,
-            ))
+        let mut suggest_restrict = |span, bound_list_non_empty, open_paren_sp| {
+            let suggestion = if span_to_replace.is_some() {
+                constraint.clone()
+            } else if constraint.starts_with('<') {
+                constraint.to_string()
+            } else if bound_list_non_empty {
+                format!(" + {constraint}")
+            } else {
+                format!(" {constraint}")
+            };
+
+            use SuggestChangingConstraintsMessage::RestrictBoundFurther;
+
+            if let Some(open_paren_sp) = open_paren_sp {
+                suggestions.push((open_paren_sp, "(".to_string(), RestrictBoundFurther));
+                suggestions.push((span, format!("){suggestion}"), RestrictBoundFurther));
+            } else {
+                suggestions.push((span, suggestion, RestrictBoundFurther));
+            }
         };
 
         if let Some(span) = span_to_replace {
-            suggest_restrict(span, true);
+            suggest_restrict(span, true, None);
             continue;
         }
 
@@ -318,8 +332,8 @@ pub fn suggest_constraining_type_params<'a>(
         //          --
         //          |
         //          replace with: `T: Bar +`
-        if let Some(span) = generics.bounds_span_for_suggestions(param.def_id) {
-            suggest_restrict(span, true);
+        if let Some((span, open_paren_sp)) = generics.bounds_span_for_suggestions(param.def_id) {
+            suggest_restrict(span, true, open_paren_sp);
             continue;
         }
 
@@ -482,9 +496,9 @@ pub struct IsSuggestableVisitor<'tcx> {
 }
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IsSuggestableVisitor<'tcx> {
-    type BreakTy = ();
+    type Result = ControlFlow<()>;
 
-    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
+    fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
         match *t.kind() {
             Infer(InferTy::TyVar(_)) if self.infer_suggestable => {}
 
@@ -536,7 +550,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IsSuggestableVisitor<'tcx> {
         t.super_visit_with(self)
     }
 
-    fn visit_const(&mut self, c: Const<'tcx>) -> ControlFlow<Self::BreakTy> {
+    fn visit_const(&mut self, c: Const<'tcx>) -> Self::Result {
         match c.kind() {
             ConstKind::Infer(InferConst::Var(_)) if self.infer_suggestable => {}
 
@@ -559,12 +573,13 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IsSuggestableVisitor<'tcx> {
 pub struct MakeSuggestableFolder<'tcx> {
     tcx: TyCtxt<'tcx>,
     infer_suggestable: bool,
+    placeholder: Option<Ty<'tcx>>,
 }
 
 impl<'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for MakeSuggestableFolder<'tcx> {
     type Error = ();
 
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -572,19 +587,24 @@ impl<'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for MakeSuggestableFolder<'tcx> {
         let t = match *t.kind() {
             Infer(InferTy::TyVar(_)) if self.infer_suggestable => t,
 
-            FnDef(def_id, args) => {
+            FnDef(def_id, args) if self.placeholder.is_none() => {
                 Ty::new_fn_ptr(self.tcx, self.tcx.fn_sig(def_id).instantiate(self.tcx, args))
             }
 
-            // FIXME(compiler-errors): We could replace these with infer, I guess.
             Closure(..)
+            | FnDef(..)
             | Infer(..)
             | Coroutine(..)
             | CoroutineWitness(..)
             | Bound(_, _)
             | Placeholder(_)
             | Error(_) => {
-                return Err(());
+                if let Some(placeholder) = self.placeholder {
+                    // We replace these with infer (which is passed in from an infcx).
+                    placeholder
+                } else {
+                    return Err(());
+                }
             }
 
             Alias(Opaque, AliasTy { def_id, .. }) => {

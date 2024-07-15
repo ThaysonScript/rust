@@ -13,7 +13,7 @@ use std::fmt::{self, Display, Write};
 use std::iter::{self, once};
 
 use rustc_ast as ast;
-use rustc_attr::{ConstStability, StabilityLevel};
+use rustc_attr::{ConstStability, StabilityLevel, StableSince};
 use rustc_data_structures::captures::Captures;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
@@ -29,8 +29,7 @@ use rustc_target::spec::abi::Abi;
 use itertools::Itertools;
 
 use crate::clean::{
-    self, types::ExternalLocation, utils::find_nearest_parent_module, ExternalCrate, ItemId,
-    PrimitiveType,
+    self, types::ExternalLocation, utils::find_nearest_parent_module, ExternalCrate, PrimitiveType,
 };
 use crate::formats::cache::Cache;
 use crate::formats::item_type::ItemType;
@@ -413,6 +412,20 @@ impl clean::GenericBound {
                 })?;
                 ty.print(cx).fmt(f)
             }
+            clean::GenericBound::Use(args) => {
+                if f.alternate() {
+                    f.write_str("use<")?;
+                } else {
+                    f.write_str("use&lt;")?;
+                }
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    arg.fmt(f)?;
+                }
+                if f.alternate() { f.write_str(">") } else { f.write_str("&gt;") }
+            }
         })
     }
 }
@@ -421,8 +434,8 @@ impl clean::GenericArgs {
     fn print<'a, 'tcx: 'a>(&'a self, cx: &'a Context<'tcx>) -> impl Display + 'a + Captures<'tcx> {
         display_fn(move |f| {
             match self {
-                clean::GenericArgs::AngleBracketed { args, bindings } => {
-                    if !args.is_empty() || !bindings.is_empty() {
+                clean::GenericArgs::AngleBracketed { args, constraints } => {
+                    if !args.is_empty() || !constraints.is_empty() {
                         if f.alternate() {
                             f.write_str("<")?;
                         } else {
@@ -440,15 +453,15 @@ impl clean::GenericArgs {
                                 write!(f, "{}", arg.print(cx))?;
                             }
                         }
-                        for binding in bindings.iter() {
+                        for constraint in constraints.iter() {
                             if comma {
                                 f.write_str(", ")?;
                             }
                             comma = true;
                             if f.alternate() {
-                                write!(f, "{:#}", binding.print(cx))?;
+                                write!(f, "{:#}", constraint.print(cx))?;
                             } else {
-                                write!(f, "{}", binding.print(cx))?;
+                                write!(f, "{}", constraint.print(cx))?;
                             }
                         }
                         if f.alternate() {
@@ -575,7 +588,7 @@ fn generate_macro_def_id_path(
         ExternalLocation::Local => {
             // `root_path` always end with a `/`.
             format!(
-                "{root_path}{crate_name}/{path}",
+                "{root_path}{path}",
                 root_path = root_path.unwrap_or(""),
                 path = path.iter().map(|p| p.as_str()).join("/")
             )
@@ -595,9 +608,9 @@ fn generate_item_def_id_path(
     root_path: Option<&str>,
     original_def_kind: DefKind,
 ) -> Result<(String, ItemType, Vec<Symbol>), HrefError> {
-    use crate::rustc_trait_selection::infer::TyCtxtInferExt;
-    use crate::rustc_trait_selection::traits::query::normalize::QueryNormalizeExt;
     use rustc_middle::traits::ObligationCause;
+    use rustc_trait_selection::infer::TyCtxtInferExt;
+    use rustc_trait_selection::traits::query::normalize::QueryNormalizeExt;
 
     let tcx = cx.tcx();
     let crate_name = tcx.crate_name(def_id.krate);
@@ -1014,7 +1027,7 @@ fn fmt_type<'cx>(
         }
         clean::BareFunction(ref decl) => {
             print_higher_ranked_params_with_space(&decl.generic_params, cx).fmt(f)?;
-            decl.unsafety.print_with_space().fmt(f)?;
+            decl.safety.print_with_space().fmt(f)?;
             print_abi_with_space(decl.abi).fmt(f)?;
             if f.alternate() {
                 f.write_str("fn")?;
@@ -1072,6 +1085,10 @@ fn fmt_type<'cx>(
                 write!(f, "]")
             }
         },
+        clean::Type::Pat(ref t, ref pat) => {
+            fmt::Display::fmt(&t.print(cx), f)?;
+            write!(f, " is {pat}")
+        }
         clean::Array(ref t, ref n) => match **t {
             clean::Generic(name) if !f.alternate() => primitive_link(
                 f,
@@ -1300,7 +1317,7 @@ impl clean::Impl {
                 // Link should match `# Trait implementations`
 
                 print_higher_ranked_params_with_space(&bare_fn.generic_params, cx).fmt(f)?;
-                bare_fn.unsafety.print_with_space().fmt(f)?;
+                bare_fn.safety.print_with_space().fmt(f)?;
                 print_abi_with_space(bare_fn.abi).fmt(f)?;
                 let ellipsis = if bare_fn.decl.c_variadic { ", ..." } else { "" };
                 primitive_link_fragment(
@@ -1435,13 +1452,9 @@ impl clean::FnDecl {
         {
             write!(f, "\n{}", Indent(n + 4))?;
         }
+
+        let last_input_index = self.inputs.values.len().checked_sub(1);
         for (i, input) in self.inputs.values.iter().enumerate() {
-            if i > 0 {
-                match line_wrapping_indent {
-                    None => write!(f, ", ")?,
-                    Some(n) => write!(f, ",\n{}", Indent(n + 4))?,
-                };
-            }
             if let Some(selfty) = input.to_self() {
                 match selfty {
                     clean::SelfValue => {
@@ -1474,18 +1487,25 @@ impl clean::FnDecl {
                 write!(f, "{}: ", input.name)?;
                 input.type_.print(cx).fmt(f)?;
             }
+            match (line_wrapping_indent, last_input_index) {
+                (_, None) => (),
+                (None, Some(last_i)) if i != last_i => write!(f, ", ")?,
+                (None, Some(_)) => (),
+                (Some(n), Some(last_i)) if i != last_i => write!(f, ",\n{}", Indent(n + 4))?,
+                (Some(_), Some(_)) => write!(f, ",\n")?,
+            }
         }
 
         if self.c_variadic {
             match line_wrapping_indent {
                 None => write!(f, ", ...")?,
-                Some(n) => write!(f, "\n{}...", Indent(n + 4))?,
+                Some(n) => write!(f, "{}...\n", Indent(n + 4))?,
             };
         }
 
         match line_wrapping_indent {
             None => write!(f, ")")?,
-            Some(n) => write!(f, "\n{})", Indent(n))?,
+            Some(n) => write!(f, "{})", Indent(n))?,
         };
 
         self.print_output(cx).fmt(f)
@@ -1506,20 +1526,18 @@ impl clean::FnDecl {
 }
 
 pub(crate) fn visibility_print_with_space<'a, 'tcx: 'a>(
-    visibility: Option<ty::Visibility<DefId>>,
-    item_did: ItemId,
+    item: &clean::Item,
     cx: &'a Context<'tcx>,
 ) -> impl Display + 'a + Captures<'tcx> {
     use std::fmt::Write as _;
-
-    let to_print: Cow<'static, str> = match visibility {
+    let vis: Cow<'static, str> = match item.visibility(cx.tcx()) {
         None => "".into(),
         Some(ty::Visibility::Public) => "pub ".into(),
         Some(ty::Visibility::Restricted(vis_did)) => {
             // FIXME(camelid): This may not work correctly if `item_did` is a module.
             //                 However, rustdoc currently never displays a module's
             //                 visibility, so it shouldn't matter.
-            let parent_module = find_nearest_parent_module(cx.tcx(), item_did.expect_def_id());
+            let parent_module = find_nearest_parent_module(cx.tcx(), item.item_id.expect_def_id());
 
             if vis_did.is_crate_root() {
                 "pub(crate) ".into()
@@ -1547,7 +1565,15 @@ pub(crate) fn visibility_print_with_space<'a, 'tcx: 'a>(
             }
         }
     };
-    display_fn(move |f| f.write_str(&to_print))
+
+    let is_doc_hidden = item.is_doc_hidden();
+    display_fn(move |f| {
+        if is_doc_hidden {
+            f.write_str("#[doc(hidden)] ")?;
+        }
+
+        f.write_str(&vis)
+    })
 }
 
 /// This function is the same as print_with_space, except that it renders no links.
@@ -1557,8 +1583,9 @@ pub(crate) fn visibility_to_src_with_space<'a, 'tcx: 'a>(
     visibility: Option<ty::Visibility<DefId>>,
     tcx: TyCtxt<'tcx>,
     item_did: DefId,
+    is_doc_hidden: bool,
 ) -> impl Display + 'a + Captures<'tcx> {
-    let to_print: Cow<'static, str> = match visibility {
+    let vis: Cow<'static, str> = match visibility {
         None => "".into(),
         Some(ty::Visibility::Public) => "pub ".into(),
         Some(ty::Visibility::Restricted(vis_did)) => {
@@ -1582,18 +1609,23 @@ pub(crate) fn visibility_to_src_with_space<'a, 'tcx: 'a>(
             }
         }
     };
-    display_fn(move |f| f.write_str(&to_print))
+    display_fn(move |f| {
+        if is_doc_hidden {
+            f.write_str("#[doc(hidden)] ")?;
+        }
+        f.write_str(&vis)
+    })
 }
 
 pub(crate) trait PrintWithSpace {
     fn print_with_space(&self) -> &str;
 }
 
-impl PrintWithSpace for hir::Unsafety {
+impl PrintWithSpace for hir::Safety {
     fn print_with_space(&self) -> &str {
         match self {
-            hir::Unsafety::Unsafe => "unsafe ",
-            hir::Unsafety::Normal => "",
+            hir::Safety::Unsafe => "unsafe ",
+            hir::Safety::Safe => "",
         }
     }
 }
@@ -1618,17 +1650,24 @@ impl PrintWithSpace for hir::Mutability {
 
 pub(crate) fn print_constness_with_space(
     c: &hir::Constness,
-    s: Option<ConstStability>,
+    overall_stab: Option<StableSince>,
+    const_stab: Option<ConstStability>,
 ) -> &'static str {
-    match (c, s) {
-        // const stable or when feature(staged_api) is not set
-        (
-            hir::Constness::Const,
-            Some(ConstStability { level: StabilityLevel::Stable { .. }, .. }),
-        )
-        | (hir::Constness::Const, None) => "const ",
-        // const unstable or not const
-        _ => "",
+    match c {
+        hir::Constness::Const => match (overall_stab, const_stab) {
+            // const stable...
+            (_, Some(ConstStability { level: StabilityLevel::Stable { .. }, .. }))
+            // ...or when feature(staged_api) is not set...
+            | (_, None)
+            // ...or when const unstable, but overall unstable too
+            | (None, Some(ConstStability { level: StabilityLevel::Unstable { .. }, .. })) => {
+                "const "
+            }
+            // const unstable (and overall stable)
+            (Some(_), Some(ConstStability { level: StabilityLevel::Unstable { .. }, .. })) => "",
+        },
+        // not const
+        hir::Constness::NotConst => "",
     }
 }
 
@@ -1684,7 +1723,7 @@ impl clean::ImportSource {
     }
 }
 
-impl clean::TypeBinding {
+impl clean::AssocItemConstraint {
     pub(crate) fn print<'a, 'tcx: 'a>(
         &'a self,
         cx: &'a Context<'tcx>,
@@ -1693,11 +1732,11 @@ impl clean::TypeBinding {
             f.write_str(self.assoc.name.as_str())?;
             self.assoc.args.print(cx).fmt(f)?;
             match self.kind {
-                clean::TypeBindingKind::Equality { ref term } => {
+                clean::AssocItemConstraintKind::Equality { ref term } => {
                     f.write_str(" = ")?;
                     term.print(cx).fmt(f)?;
                 }
-                clean::TypeBindingKind::Constraint { ref bounds } => {
+                clean::AssocItemConstraintKind::Bound { ref bounds } => {
                     if !bounds.is_empty() {
                         f.write_str(": ")?;
                         print_generic_bounds(bounds, cx).fmt(f)?;

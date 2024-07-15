@@ -1,9 +1,5 @@
 parse_add_paren = try adding parentheses
 
-parse_ambiguous_missing_keyword_for_item_definition = missing `fn` or `struct` for function or struct definition
-    .suggestion = if you meant to call a macro, try
-    .help = if you meant to call a macro, remove the `pub` and add a trailing `!` after the identifier
-
 parse_ambiguous_range_pattern = the range pattern here has ambiguous interpretation
     .suggestion = add parentheses to clarify the precedence
 
@@ -13,10 +9,6 @@ parse_array_brackets_instead_of_braces = this is a block expression, not an arra
 parse_array_index_offset_of = array indexing not supported in offset_of
 
 parse_assignment_else_not_allowed = <assignment> ... else {"{"} ... {"}"} is not allowed
-
-parse_assoc_lifetime = associated lifetimes are not supported
-    .label = the lifetime is given here
-    .help = if you meant to specify a trait object, write `dyn Trait + 'lifetime`
 
 parse_associated_static_item_not_allowed = associated `static` items are not allowed
 
@@ -48,10 +40,6 @@ parse_bad_assoc_type_bounds = bounds on associated types do not belong here
 
 parse_bad_item_kind = {$descr} is not supported in {$ctx}
     .help = consider moving the {$descr} out to a nearby module scope
-
-parse_bad_return_type_notation_dotdot =
-    return type notation uses `()` instead of `(..)` for elided arguments
-    .suggestion = remove the `..`
 
 parse_bad_return_type_notation_output =
     return type not allowed with return type notation
@@ -136,6 +124,8 @@ parse_dot_dot_dot_for_remaining_fields = expected field pattern, found `{$token_
 
 parse_dot_dot_dot_range_to_pattern_not_allowed = range-to patterns with `...` are not allowed
     .suggestion = use `..=` instead
+
+parse_dot_dot_range_attribute = attributes are not allowed on range expressions starting with `..`
 
 parse_dotdotdot = unexpected token: `...`
     .suggest_exclusive_range = use `..` for an exclusive range
@@ -234,6 +224,10 @@ parse_expected_struct_field = expected one of `,`, `:`, or `{"}"}`, found `{$tok
 
 parse_expected_trait_in_trait_impl_found_type = expected a trait, found type
 
+parse_expr_rarrow_call = `->` used for field access or method call
+    .suggestion = try using `.` instead
+    .help = the `.` operator will dereference the value if needed
+
 parse_extern_crate_name_with_dashes = crate name using dashes are not valid in `extern crate` statements
     .label = dash-separated idents are not valid
     .suggestion = if the original crate name uses dashes you need to use underscores in the code
@@ -283,9 +277,6 @@ parse_found_expr_would_be_stmt = expected expression, found `{$token}`
 
 parse_function_body_equals_expr = function body cannot be `= expression;`
     .suggestion = surround the expression with `{"{"}` and `{"}"}` instead of `=` and `;`
-
-parse_gen_fn = `gen` functions are not yet implemented
-    .help = for now you can use `gen {"{}"}` blocks and return `impl Iterator` instead
 
 parse_generic_args_in_pat_require_turbofish_syntax = generic args in patterns require the turbofish syntax
 
@@ -367,6 +358,10 @@ parse_inner_doc_comment_not_permitted = expected outer doc comment
     .label_does_not_annotate_this = the inner doc comment doesn't annotate this {$item}
     .sugg_change_inner_to_outer = to annotate the {$item}, change the doc comment from inner to outer style
 
+parse_invalid_attr_unsafe = `{$name}` is not an unsafe attribute
+    .suggestion = remove the `unsafe(...)`
+    .note = extraneous unsafe is not allowed in attributes
+
 parse_invalid_block_macro_segment = cannot use a `block` macro fragment here
     .label = the `block` fragment is within this context
     .suggestion = wrap this in another block
@@ -393,11 +388,6 @@ parse_invalid_dyn_keyword = invalid `dyn` keyword
 parse_invalid_expression_in_let_else = a `{$operator}` expression cannot be directly assigned in `let...else`
 parse_invalid_identifier_with_leading_number = identifiers cannot start with a number
 
-parse_invalid_interpolated_expression = invalid interpolated expression
-
-parse_invalid_literal_suffix = suffixes on {$kind} literals are invalid
-    .label = invalid suffix `{$suffix}`
-
 parse_invalid_literal_suffix_on_tuple_index = suffixes on a tuple index are invalid
     .label = invalid suffix `{$suffix}`
     .tuple_exception_line_1 = `{$suffix}` is *temporarily* accepted on tuple index fields as it was incorrectly accepted on stable for a few releases
@@ -409,10 +399,8 @@ parse_invalid_logical_operator = `{$incorrect}` is not a logical operator
     .use_amp_amp_for_conjunction = use `&&` to perform logical conjunction
     .use_pipe_pipe_for_disjunction = use `||` to perform logical disjunction
 
-parse_invalid_meta_item = expected unsuffixed literal or identifier, found `{$token}`
-
-parse_invalid_meta_item_unquoted_ident = expected unsuffixed literal, found `{$token}`
-    .suggestion = surround the identifier with quotation marks to parse it as a string
+parse_invalid_meta_item = expected unsuffixed literal, found `{$token}`
+    .quote_ident_sugg = surround the identifier with quotation marks to make it into a string literal
 
 parse_invalid_offset_of = offset_of expects dot-separated field and variant names
 
@@ -452,6 +440,12 @@ parse_lifetime_after_mut = lifetime must precede `mut`
 parse_lifetime_in_borrow_expression = borrow expressions cannot be annotated with lifetimes
     .suggestion = remove the lifetime annotation
     .label = annotated with lifetime here
+
+parse_lifetime_in_eq_constraint = lifetimes are not permitted in this context
+    .label = lifetime is not allowed here
+    .context_label = this introduces an associated item binding
+    .help = if you meant to specify a trait object, write `dyn /* Trait */ + {$lifetime}`
+    .colon_sugg = you might have meant to write a bound here
 
 parse_lone_slash = invalid trailing slash in literal
     .label = {parse_lone_slash}
@@ -530,14 +524,23 @@ parse_missing_comma_after_match_arm = expected `,` following `match` arm
 parse_missing_const_type = missing type for `{$kind}` item
     .suggestion = provide a type for the item
 
+parse_missing_enum_for_enum_definition = missing `enum` for enum definition
+    .suggestion = add `enum` here to parse `{$ident}` as an enum
+
+parse_missing_enum_or_struct_for_item_definition = missing `enum` or `struct` for enum or struct definition
+
 parse_missing_expression_in_for_loop = missing expression to iterate on in `for` loop
     .suggestion = try adding an expression to the `for` loop
 
 parse_missing_fn_for_function_definition = missing `fn` for function definition
-    .suggestion = add `fn` here to parse `{$ident}` as a public function
+    .suggestion = add `fn` here to parse `{$ident}` as a function
 
 parse_missing_fn_for_method_definition = missing `fn` for method definition
-    .suggestion = add `fn` here to parse `{$ident}` as a public method
+    .suggestion = add `fn` here to parse `{$ident}` as a method
+
+parse_missing_fn_or_struct_for_item_definition = missing `fn` or `struct` for function or struct definition
+    .suggestion = if you meant to call a macro, try
+    .help = if you meant to call a macro, remove the `pub` and add a trailing `!` after the identifier
 
 parse_missing_fn_params = missing parameters for function definition
     .suggestion = add a parameter list
@@ -557,7 +560,7 @@ parse_missing_semicolon_before_array = expected `;`, found `[`
     .suggestion = consider adding `;` here
 
 parse_missing_struct_for_struct_definition = missing `struct` for struct definition
-    .suggestion = add `struct` here to parse `{$ident}` as a public struct
+    .suggestion = add `struct` here to parse `{$ident}` as a struct
 
 parse_missing_trait_in_trait_impl = missing trait in a trait impl
     .suggestion_add_trait = add a trait here
@@ -576,7 +579,7 @@ parse_more_than_one_char = character literal may only contain one codepoint
     .remove_non = consider removing the non-printing characters
     .use_double_quotes = if you meant to write a {$is_byte ->
         [true] byte string
-        *[false] `str`
+        *[false] string
         } literal, use double quotes
 
 parse_multiple_skipped_lines = multiple lines skipped by escaped newline
@@ -612,7 +615,6 @@ parse_nonterminal_expected_item_keyword = expected an item keyword
 parse_nonterminal_expected_lifetime = expected a lifetime, found `{$token}`
 
 parse_nonterminal_expected_statement = expected a statement
-parse_not_supported = not supported
 
 parse_note_edition_guide = for more on editions, read https://doc.rust-lang.org/edition-guide
 
@@ -661,9 +663,6 @@ parse_question_mark_in_type = invalid `?` in type
 
 parse_recover_import_as_use = expected item, found {$token_name}
     .suggestion = items are imported using the `use` keyword
-
-parse_ref_mut_order_incorrect = the order of `mut` and `ref` is incorrect
-    .suggestion = try switching the order
 
 parse_remove_let = expected pattern, found `let`
     .suggestion = remove the unnecessary `let` keyword
@@ -842,6 +841,7 @@ parse_unknown_prefix = prefix `{$prefix}` is unknown
     .label = unknown prefix
     .note =  prefixed identifiers and literals are reserved since Rust 2021
     .suggestion_br = use `br` for a raw byte string
+    .suggestion_str = if you meant to write a string literal, use double quotes
     .suggestion_whitespace = consider inserting whitespace here
 
 parse_unknown_start_of_token = unknown start of token: {$escaped}
@@ -870,6 +870,11 @@ parse_unmatched_angle_brackets = {$num_extra_brackets ->
             [one] remove extra angle bracket
            *[other] remove extra angle brackets
         }
+
+parse_unsafe_attr_outside_unsafe = unsafe attribute used without unsafe
+    .label = usage of unsafe attribute
+parse_unsafe_attr_outside_unsafe_suggestion = wrap the attribute in `unsafe(...)`
+
 
 parse_unskipped_whitespace = whitespace symbol '{$ch}' is not skipped
     .label = {parse_unskipped_whitespace}

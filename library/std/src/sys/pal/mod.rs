@@ -37,6 +37,9 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "hermit")] {
         mod hermit;
         pub use self::hermit::*;
+    } else if #[cfg(all(target_os = "wasi", target_env = "p2"))] {
+        mod wasip2;
+        pub use self::wasip2::*;
     } else if #[cfg(target_os = "wasi")] {
         mod wasi;
         pub use self::wasi::*;
@@ -89,37 +92,6 @@ cfg_if::cfg_if! {
             unsafe { crate::intrinsics::log2f64(n) }
         }
     }
-}
-
-// Solaris/Illumos requires a wrapper around log, log2, and log10 functions
-// because of their non-standard behavior (e.g., log(-n) returns -Inf instead
-// of expected NaN).
-#[cfg(not(test))]
-#[cfg(any(target_os = "solaris", target_os = "illumos"))]
-#[inline]
-pub fn log_wrapper<F: Fn(f64) -> f64>(n: f64, log_fn: F) -> f64 {
-    if n.is_finite() {
-        if n > 0.0 {
-            log_fn(n)
-        } else if n == 0.0 {
-            f64::NEG_INFINITY // log(0) = -Inf
-        } else {
-            f64::NAN // log(-n) = NaN
-        }
-    } else if n.is_nan() {
-        n // log(NaN) = NaN
-    } else if n > 0.0 {
-        n // log(Inf) = Inf
-    } else {
-        f64::NAN // log(-Inf) = NaN
-    }
-}
-
-#[cfg(not(test))]
-#[cfg(not(any(target_os = "solaris", target_os = "illumos")))]
-#[inline]
-pub fn log_wrapper<F: Fn(f64) -> f64>(n: f64, log_fn: F) -> f64 {
-    log_fn(n)
 }
 
 #[cfg(not(target_os = "uefi"))]

@@ -8,6 +8,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::def_id::LOCAL_CRATE;
+use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::parse::feature_err;
@@ -79,6 +80,8 @@ pub fn from_target_feature(
                 Some(sym::loongarch_target_feature) => rust_features.loongarch_target_feature,
                 Some(sym::lahfsahf_target_feature) => rust_features.lahfsahf_target_feature,
                 Some(sym::prfchw_target_feature) => rust_features.prfchw_target_feature,
+                Some(sym::x86_amx_intrinsics) => rust_features.x86_amx_intrinsics,
+                Some(sym::xop_target_feature) => rust_features.xop_target_feature,
                 Some(name) => bug!("unknown target feature gate {}", name),
                 None => true,
             };

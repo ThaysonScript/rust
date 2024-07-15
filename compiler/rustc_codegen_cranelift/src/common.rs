@@ -1,14 +1,13 @@
 use cranelift_codegen::isa::TargetFrontendConfig;
-use gimli::write::FileId;
-use rustc_data_structures::sync::Lrc;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use rustc_index::IndexVec;
 use rustc_middle::ty::layout::{
-    FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOfHelpers,
+    self, FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOfHelpers,
 };
+use rustc_middle::ty::TypeFoldable;
 use rustc_span::source_map::Spanned;
-use rustc_span::SourceFile;
 use rustc_target::abi::call::FnAbi;
-use rustc_target::abi::{Integer, Primitive};
+use rustc_target::abi::{Float, Integer, Primitive};
 use rustc_target::spec::{HasTargetSpec, Target};
 
 use crate::constant::ConstantCx;
@@ -33,8 +32,12 @@ pub(crate) fn scalar_to_clif_type(tcx: TyCtxt<'_>, scalar: Scalar) -> Type {
             Integer::I64 => types::I64,
             Integer::I128 => types::I128,
         },
-        Primitive::F32 => types::F32,
-        Primitive::F64 => types::F64,
+        Primitive::Float(float) => match float {
+            Float::F16 => unimplemented!("f16_f128"),
+            Float::F32 => types::F32,
+            Float::F64 => types::F64,
+            Float::F128 => unimplemented!("f16_f128"),
+        },
         // FIXME(erikdesjardins): handle non-default addrspace ptr sizes
         Primitive::Pointer(_) => pointer_ty(tcx),
     }
@@ -61,11 +64,13 @@ fn clif_type_from_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<types::Typ
         },
         ty::Char => types::I32,
         ty::Float(size) => match size {
+            FloatTy::F16 => unimplemented!("f16_f128"),
             FloatTy::F32 => types::F32,
             FloatTy::F64 => types::F64,
+            FloatTy::F128 => unimplemented!("f16_f128"),
         },
         ty::FnPtr(_) => pointer_ty(tcx),
-        ty::RawPtr(TypeAndMut { ty: pointee_ty, mutbl: _ }) | ty::Ref(_, pointee_ty, _) => {
+        ty::RawPtr(pointee_ty, _) | ty::Ref(_, pointee_ty, _) => {
             if has_ptr_meta(tcx, *pointee_ty) {
                 return None;
             } else {
@@ -85,7 +90,7 @@ fn clif_pair_type_from_ty<'tcx>(
         ty::Tuple(types) if types.len() == 2 => {
             (clif_type_from_ty(tcx, types[0])?, clif_type_from_ty(tcx, types[1])?)
         }
-        ty::RawPtr(TypeAndMut { ty: pointee_ty, mutbl: _ }) | ty::Ref(_, pointee_ty, _) => {
+        ty::RawPtr(pointee_ty, _) | ty::Ref(_, pointee_ty, _) => {
             if has_ptr_meta(tcx, *pointee_ty) {
                 (pointer_ty(tcx), pointer_ty(tcx))
             } else {
@@ -242,7 +247,6 @@ pub(crate) fn type_sign(ty: Ty<'_>) -> bool {
 
 pub(crate) fn create_wrapper_function(
     module: &mut dyn Module,
-    unwind_context: &mut UnwindContext,
     sig: Signature,
     wrapper_name: &str,
     callee_name: &str,
@@ -275,7 +279,6 @@ pub(crate) fn create_wrapper_function(
         bcx.finalize();
     }
     module.define_function(wrapper_func_id, &mut ctx).unwrap();
-    unwind_context.add_function(wrapper_func_id, &ctx, module.isa());
 }
 
 pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
@@ -290,7 +293,7 @@ pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
     pub(crate) instance: Instance<'tcx>,
     pub(crate) symbol_name: String,
     pub(crate) mir: &'tcx Body<'tcx>,
-    pub(crate) fn_abi: Option<&'tcx FnAbi<'tcx, Ty<'tcx>>>,
+    pub(crate) fn_abi: &'tcx FnAbi<'tcx, Ty<'tcx>>,
 
     pub(crate) bcx: FunctionBuilder<'clif>,
     pub(crate) block_map: IndexVec<BasicBlock, Block>,
@@ -300,11 +303,6 @@ pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
     pub(crate) caller_location: Option<CValue<'tcx>>,
 
     pub(crate) clif_comments: crate::pretty_clif::CommentWriter,
-
-    /// Last accessed source file and it's debuginfo file id.
-    ///
-    /// For optimization purposes only
-    pub(crate) last_source_file: Option<(Lrc<SourceFile>, FileId)>,
 
     /// This should only be accessed by `CPlace::new_var`.
     pub(crate) next_ssa_var: u32,
@@ -388,18 +386,27 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
     }
 
     pub(crate) fn create_stack_slot(&mut self, size: u32, align: u32) -> Pointer {
-        if align <= 16 {
+        let abi_align = if self.tcx.sess.target.arch == "s390x" { 8 } else { 16 };
+        if align <= abi_align {
             let stack_slot = self.bcx.create_sized_stack_slot(StackSlotData {
                 kind: StackSlotKind::ExplicitSlot,
-                // FIXME Don't force the size to a multiple of 16 bytes once Cranelift gets a way to
-                // specify stack slot alignment.
-                size: (size + 15) / 16 * 16,
+                // FIXME Don't force the size to a multiple of <abi_align> bytes once Cranelift gets
+                // a way to specify stack slot alignment.
+                size: (size + abi_align - 1) / abi_align * abi_align,
+                align_shift: 4,
             });
             Pointer::stack_slot(stack_slot)
         } else {
             // Alignment is too big to handle using the above hack. Dynamically realign a stack slot
             // instead. This wastes some space for the realignment.
-            let base_ptr = self.create_stack_slot(size + align, 16).get_addr(self);
+            let stack_slot = self.bcx.create_sized_stack_slot(StackSlotData {
+                kind: StackSlotKind::ExplicitSlot,
+                // FIXME Don't force the size to a multiple of <abi_align> bytes once Cranelift gets
+                // a way to specify stack slot alignment.
+                size: (size + align) / abi_align * abi_align,
+                align_shift: 4,
+            });
+            let base_ptr = self.bcx.ins().stack_addr(self.pointer_type, stack_slot, 0);
             let misalign_offset = self.bcx.ins().urem_imm(base_ptr, i64::from(align));
             let realign_offset = self.bcx.ins().irsub_imm(misalign_offset, i64::from(align));
             Pointer::new(self.bcx.ins().iadd(base_ptr, realign_offset))
@@ -408,25 +415,8 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
 
     pub(crate) fn set_debug_loc(&mut self, source_info: mir::SourceInfo) {
         if let Some(debug_context) = &mut self.cx.debug_context {
-            let (file, line, column) =
-                DebugContext::get_span_loc(self.tcx, self.mir.span, source_info.span);
-
-            // add_source_file is very slow.
-            // Optimize for the common case of the current file not being changed.
-            let mut cached_file_id = None;
-            if let Some((ref last_source_file, last_file_id)) = self.last_source_file {
-                // If the allocations are not equal, the files may still be equal, but that
-                // doesn't matter, as this is just an optimization.
-                if rustc_data_structures::sync::Lrc::ptr_eq(last_source_file, &file) {
-                    cached_file_id = Some(last_file_id);
-                }
-            }
-
-            let file_id = if let Some(file_id) = cached_file_id {
-                file_id
-            } else {
-                debug_context.add_source_file(&file)
-            };
+            let (file_id, line, column) =
+                debug_context.get_span_loc(self.tcx, self.mir.span, source_info.span);
 
             let source_loc =
                 self.func_debug_cx.as_mut().unwrap().add_dbg_loc(file_id, line, column);

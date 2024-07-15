@@ -12,6 +12,7 @@
 //! Some examples of the [`format!`] extension are:
 //!
 //! ```
+//! # #![allow(unused_must_use)]
 //! format!("Hello");                 // => "Hello"
 //! format!("Hello, {}!", "world");   // => "Hello, world!"
 //! format!("The number is {}", 1);   // => "The number is 1"
@@ -50,6 +51,7 @@
 //! the iterator advances. This leads to behavior like this:
 //!
 //! ```
+//! # #![allow(unused_must_use)]
 //! format!("{1} {} {0} {}", 1, 2); // => "2 1 1 2"
 //! ```
 //!
@@ -77,6 +79,7 @@
 //! For example, the following [`format!`] expressions all use named arguments:
 //!
 //! ```
+//! # #![allow(unused_must_use)]
 //! format!("{argument}", argument = "test");   // => "test"
 //! format!("{name} {}", 1, name = 2);          // => "2 1"
 //! format!("{a} {c} {b}", a="a", b='b', c=3);  // => "a 3 b"
@@ -86,6 +89,7 @@
 //! reference a variable with that name in the current scope.
 //!
 //! ```
+//! # #![allow(unused_must_use)]
 //! let argument = 2 + 2;
 //! format!("{argument}");   // => "4"
 //!
@@ -403,7 +407,7 @@
 //! is, a formatting implementation must and may only return an error if the
 //! passed-in [`Formatter`] returns an error. This is because, contrary to what
 //! the function signature might suggest, string formatting is an infallible
-//! operation. This function only returns a result because writing to the
+//! operation. This function only returns a [`Result`] because writing to the
 //! underlying stream might fail and it must provide a way to propagate the fact
 //! that an error has occurred back up the stack.
 //!
@@ -630,7 +634,9 @@ pub fn format(args: Arguments<'_>) -> string::String {
     fn format_inner(args: Arguments<'_>) -> string::String {
         let capacity = args.estimated_capacity();
         let mut output = string::String::with_capacity(capacity);
-        output.write_fmt(args).expect("a formatting trait implementation returned an error");
+        output
+            .write_fmt(args)
+            .expect("a formatting trait implementation returned an error when the underlying stream did not");
         output
     }
 

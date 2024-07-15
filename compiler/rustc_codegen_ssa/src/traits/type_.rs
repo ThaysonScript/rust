@@ -3,15 +3,15 @@ use super::Backend;
 use super::HasCodegen;
 use crate::common::TypeKind;
 use crate::mir::place::PlaceRef;
+use rustc_middle::bug;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, Ty};
 use rustc_target::abi::call::{ArgAbi, CastTarget, FnAbi, Reg};
-use rustc_target::abi::{AddressSpace, Integer};
+use rustc_target::abi::{AddressSpace, Float, Integer};
 
 // This depends on `Backend` and not `BackendTypes`, because consumers will probably want to use
 // `LayoutOf` or `HasTyCtxt`. This way, they don't have to add a constraint on it themselves.
 pub trait BaseTypeMethods<'tcx>: Backend<'tcx> {
-    fn type_i1(&self) -> Self::Type;
     fn type_i8(&self) -> Self::Type;
     fn type_i16(&self) -> Self::Type;
     fn type_i32(&self) -> Self::Type;
@@ -19,12 +19,13 @@ pub trait BaseTypeMethods<'tcx>: Backend<'tcx> {
     fn type_i128(&self) -> Self::Type;
     fn type_isize(&self) -> Self::Type;
 
+    fn type_f16(&self) -> Self::Type;
     fn type_f32(&self) -> Self::Type;
     fn type_f64(&self) -> Self::Type;
+    fn type_f128(&self) -> Self::Type;
 
     fn type_array(&self, ty: Self::Type, len: u64) -> Self::Type;
     fn type_func(&self, args: &[Self::Type], ret: Self::Type) -> Self::Type;
-    fn type_struct(&self, els: &[Self::Type], packed: bool) -> Self::Type;
     fn type_kind(&self, ty: Self::Type) -> TypeKind;
     fn type_ptr(&self) -> Self::Type;
     fn type_ptr_ext(&self, address_space: AddressSpace) -> Self::Type;
@@ -59,6 +60,16 @@ pub trait DerivedTypeMethods<'tcx>: BaseTypeMethods<'tcx> + MiscMethods<'tcx> {
             I32 => self.type_i32(),
             I64 => self.type_i64(),
             I128 => self.type_i128(),
+        }
+    }
+
+    fn type_from_float(&self, f: Float) -> Self::Type {
+        use Float::*;
+        match f {
+            F16 => self.type_f16(),
+            F32 => self.type_f32(),
+            F64 => self.type_f64(),
+            F128 => self.type_f128(),
         }
     }
 
@@ -102,8 +113,8 @@ pub trait LayoutTypeMethods<'tcx>: Backend<'tcx> {
     /// The backend type used for a rust type when it's in an SSA register.
     ///
     /// For nearly all types this is the same as the [`Self::backend_type`], however
-    /// `bool` (and other `0`-or-`1` values) are kept as [`BaseTypeMethods::type_i1`]
-    /// in registers but as [`BaseTypeMethods::type_i8`] in memory.
+    /// `bool` (and other `0`-or-`1` values) are kept as `i1` in registers but as
+    /// [`BaseTypeMethods::type_i8`] in memory.
     ///
     /// Converting values between the two different backend types is done using
     /// [`from_immediate`](super::BuilderMethods::from_immediate) and
@@ -111,7 +122,6 @@ pub trait LayoutTypeMethods<'tcx>: Backend<'tcx> {
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type;
     fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool;
     fn is_backend_scalar_pair(&self, layout: TyAndLayout<'tcx>) -> bool;
-    fn backend_field_index(&self, layout: TyAndLayout<'tcx>, index: usize) -> u64;
     fn scalar_pair_element_backend_type(
         &self,
         layout: TyAndLayout<'tcx>,
@@ -119,26 +129,18 @@ pub trait LayoutTypeMethods<'tcx>: Backend<'tcx> {
         immediate: bool,
     ) -> Self::Type;
 
-    /// A type that can be used in a [`super::BuilderMethods::load`] +
-    /// [`super::BuilderMethods::store`] pair to implement a *typed* copy,
-    /// such as a MIR `*_0 = *_1`.
+    /// A type that produces an [`OperandValue::Ref`] when loaded.
     ///
-    /// It's always legal to return `None` here, as the provided impl does,
-    /// in which case callers should use [`super::BuilderMethods::memcpy`]
-    /// instead of the `load`+`store` pair.
+    /// AKA one that's not a ZST, not `is_backend_immediate`, and
+    /// not `is_backend_scalar_pair`. For such a type, a
+    /// [`load_operand`] doesn't actually `load` anything.
     ///
-    /// This can be helpful for things like arrays, where the LLVM backend type
-    /// `[3 x i16]` optimizes to three separate loads and stores, but it can
-    /// instead be copied via an `i48` that stays as the single `load`+`store`.
-    /// (As of 2023-05 LLVM cannot necessarily optimize away a `memcpy` in these
-    /// cases, due to `poison` handling, but in codegen we have more information
-    /// about the type invariants, so can emit something better instead.)
-    ///
-    /// This *should* return `None` for particularly-large types, where leaving
-    /// the `memcpy` may well be important to avoid code size explosion.
-    fn scalar_copy_backend_type(&self, layout: TyAndLayout<'tcx>) -> Option<Self::Type> {
-        let _ = layout;
-        None
+    /// [`OperandValue::Ref`]: crate::mir::operand::OperandValue::Ref
+    /// [`load_operand`]: super::BuilderMethods::load_operand
+    fn is_backend_ref(&self, layout: TyAndLayout<'tcx>) -> bool {
+        !(layout.is_zst()
+            || self.is_backend_immediate(layout)
+            || self.is_backend_scalar_pair(layout))
     }
 }
 

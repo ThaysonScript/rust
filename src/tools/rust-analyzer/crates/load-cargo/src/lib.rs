@@ -9,15 +9,15 @@ use hir_expand::proc_macro::{
     ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
     ProcMacros,
 };
-use ide::{AnalysisHost, SourceRoot};
 use ide_db::{
-    base_db::{CrateGraph, Env},
-    Change, FxHashMap,
+    base_db::{CrateGraph, Env, SourceRoot, SourceRootId},
+    prime_caches, ChangeWithProcMacros, FxHashMap, RootDatabase,
 };
 use itertools::Itertools;
 use proc_macro_api::{MacroDylib, ProcMacroServer};
-use project_model::{CargoConfig, PackageRoot, ProjectManifest, ProjectWorkspace};
+use project_model::{CargoConfig, ManifestPath, PackageRoot, ProjectManifest, ProjectWorkspace};
 use span::Span;
+use tracing::instrument;
 use vfs::{file_set::FileSetConfig, loader::Handle, AbsPath, AbsPathBuf, VfsPath};
 
 pub struct LoadCargoConfig {
@@ -38,8 +38,8 @@ pub fn load_workspace_at(
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
     progress: &dyn Fn(String),
-) -> anyhow::Result<(AnalysisHost, vfs::Vfs, Option<ProcMacroServer>)> {
-    let root = AbsPathBuf::assert(std::env::current_dir()?.join(root));
+) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroServer>)> {
+    let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(root));
     let root = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(root, cargo_config, progress)?;
 
@@ -51,11 +51,12 @@ pub fn load_workspace_at(
     load_workspace(workspace, &cargo_config.extra_env, load_config)
 }
 
+#[instrument(skip_all)]
 pub fn load_workspace(
     ws: ProjectWorkspace,
     extra_env: &FxHashMap<String, String>,
     load_config: &LoadCargoConfig,
-) -> anyhow::Result<(AnalysisHost, vfs::Vfs, Option<ProcMacroServer>)> {
+) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroServer>)> {
     let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {
@@ -67,9 +68,9 @@ pub fn load_workspace(
     let proc_macro_server = match &load_config.with_proc_macro_server {
         ProcMacroServerChoice::Sysroot => ws
             .find_sysroot_proc_macro_srv()
-            .and_then(|it| ProcMacroServer::spawn(it, extra_env).map_err(Into::into)),
+            .and_then(|it| ProcMacroServer::spawn(&it, extra_env).map_err(Into::into)),
         ProcMacroServerChoice::Explicit(path) => {
-            ProcMacroServer::spawn(path.clone(), extra_env).map_err(Into::into)
+            ProcMacroServer::spawn(path, extra_env).map_err(Into::into)
         }
         ProcMacroServerChoice::None => Err(anyhow::format_err!("proc macro server disabled")),
     };
@@ -113,7 +114,7 @@ pub fn load_workspace(
         version: 0,
     });
 
-    let host = load_crate_graph(
+    let db = load_crate_graph(
         &ws,
         crate_graph,
         proc_macros,
@@ -123,9 +124,9 @@ pub fn load_workspace(
     );
 
     if load_config.prefill_caches {
-        host.analysis().parallel_prime_caches(1, |_| {})?;
+        prime_caches::parallel_prime_caches(&db, 1, &|_| ());
     }
-    Ok((host, vfs, proc_macro_server.ok()))
+    Ok((db, vfs, proc_macro_server.ok()))
 }
 
 #[derive(Default)]
@@ -232,8 +233,21 @@ impl ProjectFolders {
             res.load.push(entry);
 
             if root.is_local {
-                local_filesets.push(fsc.len());
+                local_filesets.push(fsc.len() as u64);
             }
+            fsc.add_file_set(file_set_roots)
+        }
+
+        // register the workspace manifest as well, note that this currently causes duplicates for
+        // non-virtual cargo workspaces! We ought to fix that
+        for manifest in workspaces.iter().filter_map(|ws| ws.manifest().map(ManifestPath::as_ref)) {
+            let file_set_roots: Vec<VfsPath> = vec![VfsPath::from(manifest.to_owned())];
+
+            let entry = vfs::loader::Entry::Files(vec![manifest.to_owned()]);
+
+            res.watch.push(res.load.len());
+            res.load.push(entry);
+            local_filesets.push(fsc.len() as u64);
             fsc.add_file_set(file_set_roots)
         }
 
@@ -247,7 +261,7 @@ impl ProjectFolders {
 #[derive(Default, Debug)]
 pub struct SourceRootConfig {
     pub fsc: FileSetConfig,
-    pub local_filesets: Vec<usize>,
+    pub local_filesets: Vec<u64>,
 }
 
 impl SourceRootConfig {
@@ -257,7 +271,7 @@ impl SourceRootConfig {
             .into_iter()
             .enumerate()
             .map(|(idx, file_set)| {
-                let is_local = self.local_filesets.contains(&idx);
+                let is_local = self.local_filesets.contains(&(idx as u64));
                 if is_local {
                     SourceRoot::new_local(file_set)
                 } else {
@@ -265,6 +279,60 @@ impl SourceRootConfig {
                 }
             })
             .collect()
+    }
+
+    /// Maps local source roots to their parent source roots by bytewise comparing of root paths .
+    /// If a `SourceRoot` doesn't have a parent and is local then it is not contained in this mapping but it can be asserted that it is a root `SourceRoot`.
+    pub fn source_root_parent_map(&self) -> FxHashMap<SourceRootId, SourceRootId> {
+        let roots = self.fsc.roots();
+
+        let mut map = FxHashMap::default();
+
+        // See https://github.com/rust-lang/rust-analyzer/issues/17409
+        //
+        // We can view the connections between roots as a graph. The problem is
+        // that this graph may contain cycles, so when adding edges, it is necessary
+        // to check whether it will lead to a cycle.
+        //
+        // Since we ensure that each node has at most one outgoing edge (because
+        // each SourceRoot can have only one parent), we can use a disjoint-set to
+        // maintain the connectivity between nodes. If an edge’s two nodes belong
+        // to the same set, they are already connected.
+        let mut dsu = FxHashMap::default();
+        fn find_parent(dsu: &mut FxHashMap<u64, u64>, id: u64) -> u64 {
+            if let Some(&parent) = dsu.get(&id) {
+                let parent = find_parent(dsu, parent);
+                dsu.insert(id, parent);
+                parent
+            } else {
+                id
+            }
+        }
+
+        for (idx, (root, root_id)) in roots.iter().enumerate() {
+            if !self.local_filesets.contains(root_id)
+                || map.contains_key(&SourceRootId(*root_id as u32))
+            {
+                continue;
+            }
+
+            for (root2, root2_id) in roots[..idx].iter().rev() {
+                if self.local_filesets.contains(root2_id)
+                    && root_id != root2_id
+                    && root.starts_with(root2)
+                {
+                    // check if the edge will create a cycle
+                    if find_parent(&mut dsu, *root_id) != find_parent(&mut dsu, *root2_id) {
+                        map.insert(SourceRootId(*root_id as u32), SourceRootId(*root2_id as u32));
+                        dsu.insert(*root_id, *root2_id);
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        map
     }
 }
 
@@ -308,16 +376,14 @@ fn load_crate_graph(
     source_root_config: SourceRootConfig,
     vfs: &mut vfs::Vfs,
     receiver: &Receiver<vfs::loader::Message>,
-) -> AnalysisHost {
-    let (ProjectWorkspace::Cargo { toolchain, target_layout, .. }
-    | ProjectWorkspace::Json { toolchain, target_layout, .. }
-    | ProjectWorkspace::DetachedFiles { toolchain, target_layout, .. }) = ws;
+) -> RootDatabase {
+    let ProjectWorkspace { toolchain, target_layout, .. } = ws;
 
     let lru_cap = std::env::var("RA_LRU_CAP").ok().and_then(|it| it.parse::<usize>().ok());
-    let mut host = AnalysisHost::new(lru_cap);
-    let mut analysis_change = Change::new();
+    let mut db = RootDatabase::new(lru_cap);
+    let mut analysis_change = ChangeWithProcMacros::new();
 
-    host.raw_database_mut().enable_proc_attr_macros();
+    db.enable_proc_attr_macros();
 
     // wait until Vfs has loaded all roots
     for task in receiver {
@@ -328,6 +394,8 @@ fn load_crate_graph(
                 }
             }
             vfs::loader::Message::Loaded { files } | vfs::loader::Message::Changed { files } => {
+                let _p =
+                    tracing::info_span!("load_cargo::load_crate_craph/LoadedChanged").entered();
                 for (path, contents) in files {
                     vfs.set_file_contents(path.into(), contents);
                 }
@@ -335,10 +403,10 @@ fn load_crate_graph(
         }
     }
     let changes = vfs.take_changes();
-    for file in changes {
-        if let vfs::Change::Create(v) | vfs::Change::Modify(v) = file.change {
-            if let Ok(text) = std::str::from_utf8(&v) {
-                analysis_change.change_file(file.file_id, Some(text.into()))
+    for (_, file) in changes {
+        if let vfs::Change::Create(v, _) | vfs::Change::Modify(v, _) = file.change {
+            if let Ok(text) = String::from_utf8(v) {
+                analysis_change.change_file(file.file_id, Some(text))
             }
         }
     }
@@ -352,8 +420,8 @@ fn load_crate_graph(
         .set_target_data_layouts(iter::repeat(target_layout.clone()).take(num_crates).collect());
     analysis_change.set_toolchains(iter::repeat(toolchain.clone()).take(num_crates).collect());
 
-    host.apply_change(analysis_change);
-    host
+    db.apply_change(analysis_change);
+    db
 }
 
 fn expander_to_proc_macro(
@@ -363,7 +431,7 @@ fn expander_to_proc_macro(
     let name = From::from(expander.name());
     let kind = match expander.kind() {
         proc_macro_api::ProcMacroKind::CustomDerive => ProcMacroKind::CustomDerive,
-        proc_macro_api::ProcMacroKind::FuncLike => ProcMacroKind::FuncLike,
+        proc_macro_api::ProcMacroKind::Bang => ProcMacroKind::Bang,
         proc_macro_api::ProcMacroKind::Attr => ProcMacroKind::Attr,
     };
     let disabled = ignored_macros.iter().any(|replace| **replace == name);
@@ -383,8 +451,7 @@ impl ProcMacroExpander for Expander {
         call_site: Span,
         mixed_site: Span,
     ) -> Result<tt::Subtree<Span>, ProcMacroExpansionError> {
-        let env = env.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-        match self.0.expand(subtree, attrs, env, def_site, call_site, mixed_site) {
+        match self.0.expand(subtree, attrs, env.clone(), def_site, call_site, mixed_site) {
             Ok(Ok(subtree)) => Ok(subtree),
             Ok(Err(err)) => Err(ProcMacroExpansionError::Panic(err.0)),
             Err(err) => Err(ProcMacroExpansionError::System(err.to_string())),
@@ -395,6 +462,7 @@ impl ProcMacroExpander for Expander {
 #[cfg(test)]
 mod tests {
     use ide_db::base_db::SourceDatabase;
+    use vfs::file_set::FileSetConfigBuilder;
 
     use super::*;
 
@@ -407,11 +475,163 @@ mod tests {
             with_proc_macro_server: ProcMacroServerChoice::None,
             prefill_caches: false,
         };
-        let (host, _vfs, _proc_macro) =
+        let (db, _vfs, _proc_macro) =
             load_workspace_at(path, &cargo_config, &load_cargo_config, &|_| {}).unwrap();
 
-        let n_crates = host.raw_database().crate_graph().iter().count();
+        let n_crates = db.crate_graph().iter().count();
         // RA has quite a few crates, but the exact count doesn't matter
         assert!(n_crates > 20);
+    }
+
+    #[test]
+    fn unrelated_sources() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
+        let vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+
+        assert_eq!(vc, vec![])
+    }
+
+    #[test]
+    fn unrelated_source_sharing_dirname() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/abc".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
+        let vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+
+        assert_eq!(vc, vec![])
+    }
+
+    #[test]
+    fn basic_child_parent() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc/def".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
+        let vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+
+        assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0))])
+    }
+
+    #[test]
+    fn basic_child_parent_with_unrelated_parents_sib() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/abc".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 2] };
+        let vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+
+        assert_eq!(vc, vec![(SourceRootId(2), SourceRootId(1))])
+    }
+
+    #[test]
+    fn deep_sources_with_parent_missing() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/ghi".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/abc".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 2] };
+        let vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+
+        assert_eq!(vc, vec![])
+    }
+
+    #[test]
+    fn ancestor_can_be_parent() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/ghi/jkl".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 2] };
+        let vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+
+        assert_eq!(vc, vec![(SourceRootId(2), SourceRootId(1))])
+    }
+
+    #[test]
+    fn ancestor_can_be_parent_2() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/ghi/jkl".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/ghi/klm".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 2, 3] };
+        let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+
+        assert_eq!(vc, vec![(SourceRootId(2), SourceRootId(1)), (SourceRootId(3), SourceRootId(1))])
+    }
+
+    #[test]
+    fn non_locals_are_skipped() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/ghi/jkl".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/klm".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 3] };
+        let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+
+        assert_eq!(vc, vec![(SourceRootId(3), SourceRootId(1)),])
+    }
+
+    #[test]
+    fn child_binds_ancestor_if_parent_nonlocal() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/abc".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/klm".to_owned())]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/klm/jkl".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 3] };
+        let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+
+        assert_eq!(vc, vec![(SourceRootId(3), SourceRootId(1)),])
+    }
+
+    #[test]
+    fn parents_with_identical_root_id() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![
+            VfsPath::new_virtual_path("/ROOT/def".to_owned()),
+            VfsPath::new_virtual_path("/ROOT/def/abc/def".to_owned()),
+        ]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/abc/def/ghi".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
+        let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+
+        assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0)),])
+    }
+
+    #[test]
+    fn circular_reference() {
+        let mut builder = FileSetConfigBuilder::default();
+        builder.add_file_set(vec![
+            VfsPath::new_virtual_path("/ROOT/def".to_owned()),
+            VfsPath::new_virtual_path("/ROOT/def/abc/def".to_owned()),
+        ]);
+        builder.add_file_set(vec![VfsPath::new_virtual_path("/ROOT/def/abc".to_owned())]);
+        let fsc = builder.build();
+        let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
+        let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
+        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+
+        assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0)),])
     }
 }

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use rustc_macros::HashStable_Generic;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_span::symbol::sym;
 use rustc_span::{Span, Symbol};
 
@@ -48,13 +48,11 @@ pub enum Abi {
     AvrInterrupt,
     AvrNonBlockingInterrupt,
     CCmseNonSecureCall,
-    Wasm,
     System {
         unwind: bool,
     },
     RustIntrinsic,
     RustCall,
-    PlatformIntrinsic,
     Unadjusted,
     /// For things unlikely to be called, where reducing register pressure in
     /// `extern "Rust"` callers is worth paying extra cost in the callee.
@@ -124,12 +122,10 @@ const AbiDatas: &[AbiData] = &[
     AbiData { abi: Abi::AvrInterrupt, name: "avr-interrupt" },
     AbiData { abi: Abi::AvrNonBlockingInterrupt, name: "avr-non-blocking-interrupt" },
     AbiData { abi: Abi::CCmseNonSecureCall, name: "C-cmse-nonsecure-call" },
-    AbiData { abi: Abi::Wasm, name: "wasm" },
     AbiData { abi: Abi::System { unwind: false }, name: "system" },
     AbiData { abi: Abi::System { unwind: true }, name: "system-unwind" },
     AbiData { abi: Abi::RustIntrinsic, name: "rust-intrinsic" },
     AbiData { abi: Abi::RustCall, name: "rust-call" },
-    AbiData { abi: Abi::PlatformIntrinsic, name: "platform-intrinsic" },
     AbiData { abi: Abi::Unadjusted, name: "unadjusted" },
     AbiData { abi: Abi::RustCold, name: "rust-cold" },
     AbiData { abi: Abi::RiscvInterruptM, name: "riscv-interrupt-m" },
@@ -150,6 +146,9 @@ pub fn lookup(name: &str) -> Result<Abi, AbiUnsupported> {
         },
         "riscv-interrupt-u" => AbiUnsupported::Reason {
             explain: "user-mode interrupt handlers have been removed from LLVM pending standardization, see: https://reviews.llvm.org/D149314",
+        },
+        "wasm" => AbiUnsupported::Reason {
+            explain: "non-standard wasm ABI is no longer supported",
         },
 
         _ => AbiUnsupported::Unrecognized,
@@ -199,10 +198,6 @@ pub fn is_stable(name: &str) -> Result<(), AbiDisabled> {
             feature: sym::intrinsics,
             explain: "intrinsics are subject to change",
         }),
-        "platform-intrinsic" => Err(AbiDisabled::Unstable {
-            feature: sym::platform_intrinsics,
-            explain: "platform intrinsics are experimental and possibly buggy",
-        }),
         "vectorcall" => Err(AbiDisabled::Unstable {
             feature: sym::abi_vectorcall,
             explain: "vectorcall is experimental and subject to change",
@@ -247,10 +242,6 @@ pub fn is_stable(name: &str) -> Result<(), AbiDisabled> {
             feature: sym::abi_c_cmse_nonsecure_call,
             explain: "C-cmse-nonsecure-call ABI is experimental and subject to change",
         }),
-        "wasm" => Err(AbiDisabled::Unstable {
-            feature: sym::wasm_abi,
-            explain: "wasm ABI is experimental and subject to change",
-        }),
         _ => Err(AbiDisabled::Unrecognized),
     }
 }
@@ -293,17 +284,15 @@ impl Abi {
             AvrInterrupt => 23,
             AvrNonBlockingInterrupt => 24,
             CCmseNonSecureCall => 25,
-            Wasm => 26,
             // Cross-platform ABIs
-            System { unwind: false } => 27,
-            System { unwind: true } => 28,
-            RustIntrinsic => 29,
-            RustCall => 30,
-            PlatformIntrinsic => 31,
-            Unadjusted => 32,
-            RustCold => 33,
-            RiscvInterruptM => 34,
-            RiscvInterruptS => 35,
+            System { unwind: false } => 26,
+            System { unwind: true } => 27,
+            RustIntrinsic => 28,
+            RustCall => 29,
+            Unadjusted => 30,
+            RustCold => 31,
+            RiscvInterruptM => 32,
+            RiscvInterruptS => 33,
         };
         debug_assert!(
             AbiDatas

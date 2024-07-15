@@ -4,45 +4,23 @@
 #![cfg_attr(test, allow(dead_code))]
 #![unstable(issue = "none", feature = "windows_c")]
 #![allow(clippy::style)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::ffi::CStr;
 use crate::mem;
-use crate::num::NonZero;
-pub use crate::os::raw::c_int;
-use crate::os::raw::{c_char, c_long, c_longlong, c_uint, c_ulong, c_ushort, c_void};
+use crate::os::raw::{c_char, c_int, c_uint, c_ulong, c_ushort, c_void};
 use crate::os::windows::io::{AsRawHandle, BorrowedHandle};
 use crate::ptr;
+
+pub(super) mod windows_targets;
 
 mod windows_sys;
 pub use windows_sys::*;
 
-pub type DWORD = c_ulong;
-pub type NonZeroDWORD = NonZero<c_ulong>;
-pub type LARGE_INTEGER = c_longlong;
-#[cfg_attr(target_vendor = "uwp", allow(unused))]
-pub type LONG = c_long;
-pub type UINT = c_uint;
 pub type WCHAR = u16;
-pub type USHORT = c_ushort;
-pub type SIZE_T = usize;
-pub type WORD = u16;
-pub type CHAR = c_char;
-pub type ULONG = c_ulong;
-pub type ACCESS_MASK = DWORD;
-
-pub type LPCVOID = *const c_void;
-pub type LPHANDLE = *mut HANDLE;
-pub type LPOVERLAPPED = *mut OVERLAPPED;
-pub type LPSECURITY_ATTRIBUTES = *mut SECURITY_ATTRIBUTES;
-pub type LPVOID = *mut c_void;
-pub type LPWCH = *mut WCHAR;
-pub type LPWSTR = *mut WCHAR;
-
-pub type PLARGE_INTEGER = *mut c_longlong;
-pub type PSRWLOCK = *mut SRWLOCK;
 
 pub type socklen_t = c_int;
-pub type ADDRESS_FAMILY = USHORT;
+pub type ADDRESS_FAMILY = c_ushort;
 pub use FD_SET as fd_set;
 pub use LINGER as linger;
 pub use TIMEVAL as timeval;
@@ -53,8 +31,11 @@ pub const INVALID_HANDLE_VALUE: HANDLE = ::core::ptr::without_provenance_mut(-1i
 pub const EXIT_SUCCESS: u32 = 0;
 pub const EXIT_FAILURE: u32 = 1;
 
+#[cfg(target_vendor = "win7")]
 pub const CONDITION_VARIABLE_INIT: CONDITION_VARIABLE = CONDITION_VARIABLE { Ptr: ptr::null_mut() };
+#[cfg(target_vendor = "win7")]
 pub const SRWLOCK_INIT: SRWLOCK = SRWLOCK { Ptr: ptr::null_mut() };
+#[cfg(not(target_thread_local))]
 pub const INIT_ONCE_STATIC_INIT: INIT_ONCE = INIT_ONCE { Ptr: ptr::null_mut() };
 
 // Some windows_sys types have different signs than the types we use.
@@ -145,39 +126,29 @@ pub struct MOUNT_POINT_REPARSE_BUFFER {
     pub PrintNameLength: c_ushort,
     pub PathBuffer: WCHAR,
 }
-#[repr(C)]
-pub struct REPARSE_MOUNTPOINT_DATA_BUFFER {
-    pub ReparseTag: DWORD,
-    pub ReparseDataLength: DWORD,
-    pub Reserved: WORD,
-    pub ReparseTargetLength: WORD,
-    pub ReparseTargetMaximumLength: WORD,
-    pub Reserved1: WORD,
-    pub ReparseTarget: WCHAR,
-}
 
 #[repr(C)]
 pub struct SOCKADDR_STORAGE_LH {
     pub ss_family: ADDRESS_FAMILY,
-    pub __ss_pad1: [CHAR; 6],
+    pub __ss_pad1: [c_char; 6],
     pub __ss_align: i64,
-    pub __ss_pad2: [CHAR; 112],
+    pub __ss_pad2: [c_char; 112],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct sockaddr_in {
     pub sin_family: ADDRESS_FAMILY,
-    pub sin_port: USHORT,
+    pub sin_port: c_ushort,
     pub sin_addr: in_addr,
-    pub sin_zero: [CHAR; 8],
+    pub sin_zero: [c_char; 8],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct sockaddr_in6 {
     pub sin6_family: ADDRESS_FAMILY,
-    pub sin6_port: USHORT,
+    pub sin6_port: c_ushort,
     pub sin6_flowinfo: c_ulong,
     pub sin6_addr: in6_addr,
     pub sin6_scope_id: c_ulong,
@@ -279,9 +250,9 @@ pub unsafe fn NtReadFile(
     apccontext: *mut c_void,
     iostatusblock: &mut IO_STATUS_BLOCK,
     buffer: *mut crate::mem::MaybeUninit<u8>,
-    length: ULONG,
-    byteoffset: Option<&LARGE_INTEGER>,
-    key: Option<&ULONG>,
+    length: u32,
+    byteoffset: Option<&i64>,
+    key: Option<&u32>,
 ) -> NTSTATUS {
     windows_sys::NtReadFile(
         filehandle.as_raw_handle(),
@@ -302,9 +273,9 @@ pub unsafe fn NtWriteFile(
     apccontext: *mut c_void,
     iostatusblock: &mut IO_STATUS_BLOCK,
     buffer: *const u8,
-    length: ULONG,
-    byteoffset: Option<&LARGE_INTEGER>,
-    key: Option<&ULONG>,
+    length: u32,
+    byteoffset: Option<&i64>,
+    key: Option<&u32>,
 ) -> NTSTATUS {
     windows_sys::NtWriteFile(
         filehandle.as_raw_handle(),
@@ -344,11 +315,18 @@ compat_fn_with_fallback! {
     // >= Win10 1607
     // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreaddescription
     pub fn SetThreadDescription(hthread: HANDLE, lpthreaddescription: PCWSTR) -> HRESULT {
-        SetLastError(ERROR_CALL_NOT_IMPLEMENTED as DWORD); E_NOTIMPL
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED as u32); E_NOTIMPL
+    }
+
+    // >= Win10 1607
+    // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreaddescription
+    pub fn GetThreadDescription(hthread: HANDLE, lpthreaddescription: *mut PWSTR) -> HRESULT {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED as u32); E_NOTIMPL
     }
 
     // >= Win8 / Server 2012
     // https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimepreciseasfiletime
+    #[cfg(target_vendor = "win7")]
     pub fn GetSystemTimePreciseAsFileTime(lpsystemtimeasfiletime: *mut FILETIME) -> () {
         GetSystemTimeAsFileTime(lpsystemtimeasfiletime)
     }
@@ -360,6 +338,32 @@ compat_fn_with_fallback! {
     }
 }
 
+#[cfg(not(target_vendor = "win7"))]
+// Use raw-dylib to import synchronization functions to workaround issues with the older mingw import library.
+#[cfg_attr(
+    target_arch = "x86",
+    link(
+        name = "api-ms-win-core-synch-l1-2-0",
+        kind = "raw-dylib",
+        import_name_type = "undecorated"
+    )
+)]
+#[cfg_attr(
+    not(target_arch = "x86"),
+    link(name = "api-ms-win-core-synch-l1-2-0", kind = "raw-dylib")
+)]
+extern "system" {
+    pub fn WaitOnAddress(
+        address: *const c_void,
+        compareaddress: *const c_void,
+        addresssize: usize,
+        dwmilliseconds: u32,
+    ) -> BOOL;
+    pub fn WakeByAddressSingle(address: *const c_void);
+    pub fn WakeByAddressAll(address: *const c_void);
+}
+
+#[cfg(target_vendor = "win7")]
 compat_fn_optional! {
     crate::sys::compat::load_synch_functions();
     pub fn WaitOnAddress(
@@ -371,30 +375,34 @@ compat_fn_optional! {
     pub fn WakeByAddressSingle(address: *const ::core::ffi::c_void);
 }
 
+#[cfg(any(target_vendor = "win7", target_vendor = "uwp"))]
 compat_fn_with_fallback! {
     pub static NTDLL: &CStr = c"ntdll";
 
+    #[cfg(target_vendor = "win7")]
     pub fn NtCreateKeyedEvent(
-        KeyedEventHandle: LPHANDLE,
-        DesiredAccess: ACCESS_MASK,
-        ObjectAttributes: LPVOID,
-        Flags: ULONG
+        KeyedEventHandle: *mut HANDLE,
+        DesiredAccess: u32,
+        ObjectAttributes: *mut c_void,
+        Flags: u32
     ) -> NTSTATUS {
         panic!("keyed events not available")
     }
+    #[cfg(target_vendor = "win7")]
     pub fn NtReleaseKeyedEvent(
         EventHandle: HANDLE,
-        Key: LPVOID,
+        Key: *const c_void,
         Alertable: BOOLEAN,
-        Timeout: PLARGE_INTEGER
+        Timeout: *mut i64
     ) -> NTSTATUS {
         panic!("keyed events not available")
     }
+    #[cfg(target_vendor = "win7")]
     pub fn NtWaitForKeyedEvent(
         EventHandle: HANDLE,
-        Key: LPVOID,
+        Key: *const c_void,
         Alertable: BOOLEAN,
-        Timeout: PLARGE_INTEGER
+        Timeout: *mut i64
     ) -> NTSTATUS {
         panic!("keyed events not available")
     }
@@ -424,9 +432,9 @@ compat_fn_with_fallback! {
         apccontext: *mut c_void,
         iostatusblock: &mut IO_STATUS_BLOCK,
         buffer: *mut crate::mem::MaybeUninit<u8>,
-        length: ULONG,
-        byteoffset: Option<&LARGE_INTEGER>,
-        key: Option<&ULONG>
+        length: u32,
+        byteoffset: Option<&i64>,
+        key: Option<&u32>
     ) -> NTSTATUS {
         STATUS_NOT_IMPLEMENTED
     }
@@ -438,9 +446,9 @@ compat_fn_with_fallback! {
         apccontext: *mut c_void,
         iostatusblock: &mut IO_STATUS_BLOCK,
         buffer: *const u8,
-        length: ULONG,
-        byteoffset: Option<&LARGE_INTEGER>,
-        key: Option<&ULONG>
+        length: u32,
+        byteoffset: Option<&i64>,
+        key: Option<&u32>
     ) -> NTSTATUS {
         STATUS_NOT_IMPLEMENTED
     }
@@ -477,11 +485,8 @@ if #[cfg(not(target_vendor = "uwp"))] {
     #[cfg(target_arch = "arm")]
     pub enum CONTEXT {}
 }}
-
-#[link(name = "ws2_32")]
-extern "system" {
-    pub fn WSAStartup(wversionrequested: u16, lpwsadata: *mut WSADATA) -> i32;
-}
+// WSAStartup is only redefined here so that we can override WSADATA for Arm32
+windows_targets::link!("ws2_32.dll" "system" fn WSAStartup(wversionrequested: u16, lpwsadata: *mut WSADATA) -> i32);
 #[cfg(target_arch = "arm")]
 #[repr(C)]
 pub struct WSADATA {

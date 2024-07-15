@@ -1,15 +1,15 @@
 use crate::consts::constant_simple;
 use crate::macros::macro_backtrace;
-use crate::source::{get_source_text, snippet_opt, walk_span_to_context, SpanRange};
+use crate::source::{snippet_opt, walk_span_to_context, SpanRange, SpanRangeExt};
 use crate::tokenize_with_text;
 use rustc_ast::ast::InlineAsmTemplatePiece;
 use rustc_data_structures::fx::FxHasher;
 use rustc_hir::def::Res;
 use rustc_hir::MatchSource::TryDesugar;
 use rustc_hir::{
-    ArrayLen, BinOpKind, BindingAnnotation, Block, BodyId, Closure, Expr, ExprField, ExprKind, FnRetTy, GenericArg,
-    GenericArgs, HirId, HirIdMap, InlineAsmOperand, Let, Lifetime, LifetimeName, Pat, PatField, PatKind, Path,
-    PathSegment, PrimTy, QPath, Stmt, StmtKind, Ty, TyKind, TypeBinding,
+    ArrayLen, AssocItemConstraint, BinOpKind, BindingMode, Block, BodyId, Closure, Expr, ExprField, ExprKind, FnRetTy,
+    GenericArg, GenericArgs, HirId, HirIdMap, InlineAsmOperand, LetExpr, Lifetime, LifetimeName, Pat, PatField,
+    PatKind, Path, PathSegment, PrimTy, QPath, Stmt, StmtKind, Ty, TyKind,
 };
 use rustc_lexer::{tokenize, TokenKind};
 use rustc_lint::LateContext;
@@ -108,7 +108,7 @@ pub struct HirEqInterExpr<'a, 'b, 'tcx> {
 impl HirEqInterExpr<'_, '_, '_> {
     pub fn eq_stmt(&mut self, left: &Stmt<'_>, right: &Stmt<'_>) -> bool {
         match (&left.kind, &right.kind) {
-            (&StmtKind::Local(l), &StmtKind::Local(r)) => {
+            (&StmtKind::Let(l), &StmtKind::Let(r)) => {
                 // This additional check ensures that the type of the locals are equivalent even if the init
                 // expression or type have some inferred parts.
                 if let Some((typeck_lhs, typeck_rhs)) = self.inner.maybe_typeck_results {
@@ -132,7 +132,6 @@ impl HirEqInterExpr<'_, '_, '_> {
     }
 
     /// Checks whether two blocks are the same.
-    #[expect(clippy::similar_names)]
     fn eq_block(&mut self, left: &Block<'_>, right: &Block<'_>) -> bool {
         use TokenKind::{Semi, Whitespace};
         if left.stmts.len() != right.stmts.len() {
@@ -225,7 +224,7 @@ impl HirEqInterExpr<'_, '_, '_> {
         })
     }
 
-    pub fn eq_array_length(&mut self, left: ArrayLen, right: ArrayLen) -> bool {
+    pub fn eq_array_length(&mut self, left: ArrayLen<'_>, right: ArrayLen<'_>) -> bool {
         match (left, right) {
             (ArrayLen::Infer(..), ArrayLen::Infer(..)) => true,
             (ArrayLen::Body(l_ct), ArrayLen::Body(r_ct)) => self.eq_body(l_ct.body, r_ct.body),
@@ -247,7 +246,7 @@ impl HirEqInterExpr<'_, '_, '_> {
         res
     }
 
-    #[expect(clippy::similar_names, clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn eq_expr(&mut self, left: &Expr<'_>, right: &Expr<'_>) -> bool {
         if !self.check_ctxt(left.span.ctxt(), right.span.ctxt()) {
             return false;
@@ -463,7 +462,6 @@ impl HirEqInterExpr<'_, '_, '_> {
         }
     }
 
-    #[expect(clippy::similar_names)]
     fn eq_qpath(&mut self, left: &QPath<'_>, right: &QPath<'_>) -> bool {
         match (left, right) {
             (&QPath::Resolved(ref lty, lpath), &QPath::Resolved(ref rty, rpath)) => {
@@ -488,7 +486,7 @@ impl HirEqInterExpr<'_, '_, '_> {
     fn eq_path_parameters(&mut self, left: &GenericArgs<'_>, right: &GenericArgs<'_>) -> bool {
         if left.parenthesized == right.parenthesized {
             over(left.args, right.args, |l, r| self.eq_generic_arg(l, r)) // FIXME(flip1995): may not work
-                && over(left.bindings, right.bindings, |l, r| self.eq_type_binding(l, r))
+                && over(left.constraints, right.constraints, |l, r| self.eq_assoc_type_binding(l, r))
         } else {
             false
         }
@@ -520,8 +518,12 @@ impl HirEqInterExpr<'_, '_, '_> {
         }
     }
 
-    fn eq_type_binding(&mut self, left: &TypeBinding<'_>, right: &TypeBinding<'_>) -> bool {
-        left.ident.name == right.ident.name && self.eq_ty(left.ty(), right.ty())
+    fn eq_assoc_type_binding(&mut self, left: &AssocItemConstraint<'_>, right: &AssocItemConstraint<'_>) -> bool {
+        left.ident.name == right.ident.name
+            && self.eq_ty(
+                left.ty().expect("expected assoc type binding"),
+                right.ty().expect("expected assoc type binding"),
+            )
     }
 
     fn check_ctxt(&mut self, left: SyntaxContext, right: SyntaxContext) -> bool {
@@ -835,10 +837,11 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                             self.hash_body(anon_const.body);
                         },
                         InlineAsmOperand::SymStatic { path, def_id: _ } => self.hash_qpath(path),
+                        InlineAsmOperand::Label { block } => self.hash_block(block),
                     }
                 }
             },
-            ExprKind::Let(Let { pat, init, ty, .. }) => {
+            ExprKind::Let(LetExpr { pat, init, ty, .. }) => {
                 self.hash_expr(init);
                 if let Some(ty) = ty {
                     self.hash_ty(ty);
@@ -948,14 +951,14 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
     pub fn hash_pat(&mut self, pat: &Pat<'_>) {
         std::mem::discriminant(&pat.kind).hash(&mut self.s);
         match pat.kind {
-            PatKind::Binding(BindingAnnotation(by_ref, mutability), _, _, pat) => {
+            PatKind::Binding(BindingMode(by_ref, mutability), _, _, pat) => {
                 std::mem::discriminant(&by_ref).hash(&mut self.s);
                 std::mem::discriminant(&mutability).hash(&mut self.s);
                 if let Some(pat) = pat {
                     self.hash_pat(pat);
                 }
             },
-            PatKind::Box(pat) => self.hash_pat(pat),
+            PatKind::Box(pat) | PatKind::Deref(pat) => self.hash_pat(pat),
             PatKind::Lit(expr) => self.hash_expr(expr),
             PatKind::Or(pats) => {
                 for pat in pats {
@@ -1031,7 +1034,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
         std::mem::discriminant(&b.kind).hash(&mut self.s);
 
         match &b.kind {
-            StmtKind::Local(local) => {
+            StmtKind::Let(local) => {
                 self.hash_pat(local.pat);
                 if let Some(init) = local.init {
                     self.hash_expr(init);
@@ -1069,6 +1072,10 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                 self.hash_ty(ty);
                 self.hash_array_length(len);
             },
+            TyKind::Pat(ty, pat) => {
+                self.hash_ty(ty);
+                self.hash_pat(pat);
+            },
             TyKind::Ptr(ref mut_ty) => {
                 self.hash_ty(mut_ty.ty);
                 mut_ty.mutbl.hash(&mut self.s);
@@ -1079,7 +1086,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                 mut_ty.mutbl.hash(&mut self.s);
             },
             TyKind::BareFn(bfn) => {
-                bfn.unsafety.hash(&mut self.s);
+                bfn.safety.hash(&mut self.s);
                 bfn.abi.hash(&mut self.s);
                 for arg in bfn.decl.inputs {
                     self.hash_ty(arg);
@@ -1113,7 +1120,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
         }
     }
 
-    pub fn hash_array_length(&mut self, length: ArrayLen) {
+    pub fn hash_array_length(&mut self, length: ArrayLen<'_>) {
         match length {
             ArrayLen::Infer(..) => {},
             ArrayLen::Body(anon_const) => self.hash_body(anon_const.body),
@@ -1159,7 +1166,6 @@ pub fn hash_expr(cx: &LateContext<'_>, e: &Expr<'_>) -> u64 {
     h.finish()
 }
 
-#[expect(clippy::similar_names)]
 fn eq_span_tokens(
     cx: &LateContext<'_>,
     left: impl SpanRange,
@@ -1167,9 +1173,9 @@ fn eq_span_tokens(
     pred: impl Fn(TokenKind) -> bool,
 ) -> bool {
     fn f(cx: &LateContext<'_>, left: Range<BytePos>, right: Range<BytePos>, pred: impl Fn(TokenKind) -> bool) -> bool {
-        if let Some(lsrc) = get_source_text(cx, left)
+        if let Some(lsrc) = left.get_source_text(cx)
             && let Some(lsrc) = lsrc.as_str()
-            && let Some(rsrc) = get_source_text(cx, right)
+            && let Some(rsrc) = right.get_source_text(cx)
             && let Some(rsrc) = rsrc.as_str()
         {
             let pred = |t: &(_, _)| pred(t.0);

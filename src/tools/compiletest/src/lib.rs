@@ -24,13 +24,13 @@ use crate::util::logv;
 use build_helper::git::{get_git_modified_files, get_git_untracked_files};
 use core::panic;
 use getopts::Options;
-use lazycell::AtomicLazyCell;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 use std::{env, vec};
 use test::ColorConfig;
@@ -39,7 +39,6 @@ use walkdir::WalkDir;
 
 use self::header::{make_test_description, EarlyProps};
 use crate::header::HeadersCache;
-use std::sync::Arc;
 
 pub fn parse_config(args: Vec<String>) -> Config {
     let mut opts = Options::new();
@@ -47,7 +46,6 @@ pub fn parse_config(args: Vec<String>) -> Config {
         .reqopt("", "run-lib-path", "path to target shared libraries", "PATH")
         .reqopt("", "rustc-path", "path to rustc to use for compiling", "PATH")
         .optopt("", "rustdoc-path", "path to rustdoc to use for compiling", "PATH")
-        .optopt("", "rust-demangler-path", "path to rust-demangler to use in tests", "PATH")
         .optopt("", "coverage-dump-path", "path to coverage-dump to use in tests", "PATH")
         .reqopt("", "python", "path to python to use for doc tests", "PATH")
         .optopt("", "jsondocck-path", "path to jsondocck to use for doc tests", "PATH")
@@ -65,7 +63,8 @@ pub fn parse_config(args: Vec<String>) -> Config {
             "mode",
             "which sort of compile tests to run",
             "run-pass-valgrind | pretty | debug-info | codegen | rustdoc \
-            | rustdoc-json | codegen-units | incremental | run-make | ui | js-doc-test | mir-opt | assembly",
+            | rustdoc-json | codegen-units | incremental | run-make | ui \
+            | js-doc-test | mir-opt | assembly | crashes",
         )
         .reqopt(
             "",
@@ -82,11 +81,16 @@ pub fn parse_config(args: Vec<String>) -> Config {
         .optopt("", "run", "whether to execute run-* tests", "auto | always | never")
         .optflag("", "ignored", "run tests marked as ignored")
         .optflag("", "with-debug-assertions", "whether to run tests with `ignore-debug` header")
-        .optmulti("", "skip", "skip tests matching SUBSTRING. Can be passed multiple times", "SUBSTRING")
+        .optmulti(
+            "",
+            "skip",
+            "skip tests matching SUBSTRING. Can be passed multiple times",
+            "SUBSTRING",
+        )
         .optflag("", "exact", "filters match exactly")
         .optopt(
             "",
-            "runtool",
+            "runner",
             "supervisor program to run tests under \
              (eg. emulator, valgrind)",
             "PROGRAM",
@@ -145,7 +149,11 @@ pub fn parse_config(args: Vec<String>) -> Config {
         .optflag("", "profiler-support", "is the profiler runtime enabled for this target")
         .optflag("h", "help", "show this message")
         .reqopt("", "channel", "current Rust channel", "CHANNEL")
-        .optflag("", "git-hash", "run tests which rely on commit version being compiled into the binaries")
+        .optflag(
+            "",
+            "git-hash",
+            "run tests which rely on commit version being compiled into the binaries",
+        )
         .optopt("", "edition", "default Rust edition", "EDITION")
         .reqopt("", "git-repository", "name of the git repository", "ORG/REPO")
         .reqopt("", "nightly-branch", "name of the git branch for nightly", "BRANCH");
@@ -223,7 +231,6 @@ pub fn parse_config(args: Vec<String>) -> Config {
         run_lib_path: make_absolute(opt_path(matches, "run-lib-path")),
         rustc_path: opt_path(matches, "rustc-path"),
         rustdoc_path: matches.opt_str("rustdoc-path").map(PathBuf::from),
-        rust_demangler_path: matches.opt_str("rust-demangler-path").map(PathBuf::from),
         coverage_dump_path: matches.opt_str("coverage-dump-path").map(PathBuf::from),
         python: matches.opt_str("python").unwrap(),
         jsondocck_path: matches.opt_str("jsondocck-path"),
@@ -256,7 +263,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
             _ => panic!("unknown `--run` option `{}` given", mode),
         }),
         logfile: matches.opt_str("logfile").map(|s| PathBuf::from(&s)),
-        runtool: matches.opt_str("runtool"),
+        runner: matches.opt_str("runner"),
         host_rustcflags: matches.opt_strs("host-rustcflags"),
         target_rustcflags: matches.opt_strs("target-rustcflags"),
         optimize_tests: matches.opt_present("optimize-tests"),
@@ -310,7 +317,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
 
         force_rerun: matches.opt_present("force-rerun"),
 
-        target_cfgs: AtomicLazyCell::new(),
+        target_cfgs: OnceLock::new(),
 
         nocapture: matches.opt_present("nocapture"),
 
@@ -328,7 +335,6 @@ pub fn log_config(config: &Config) {
     logv(c, format!("run_lib_path: {:?}", config.run_lib_path));
     logv(c, format!("rustc_path: {:?}", config.rustc_path.display()));
     logv(c, format!("rustdoc_path: {:?}", config.rustdoc_path));
-    logv(c, format!("rust_demangler_path: {:?}", config.rust_demangler_path));
     logv(c, format!("src_base: {:?}", config.src_base.display()));
     logv(c, format!("build_base: {:?}", config.build_base.display()));
     logv(c, format!("stage_id: {}", config.stage_id));
@@ -341,7 +347,7 @@ pub fn log_config(config: &Config) {
         c,
         format!("force_pass_mode: {}", opt_str(&config.force_pass_mode.map(|m| format!("{}", m))),),
     );
-    logv(c, format!("runtool: {}", opt_str(&config.runtool)));
+    logv(c, format!("runner: {}", opt_str(&config.runner)));
     logv(c, format!("host-rustcflags: {:?}", config.host_rustcflags));
     logv(c, format!("target-rustcflags: {:?}", config.target_rustcflags));
     logv(c, format!("target: {}", config.target));
@@ -571,7 +577,9 @@ pub fn make_tests(
         &modified_tests,
         &mut poisoned,
     )
-    .unwrap_or_else(|_| panic!("Could not read tests from {}", config.src_base.display()));
+    .unwrap_or_else(|reason| {
+        panic!("Could not read tests from {}: {reason}", config.src_base.display())
+    });
 
     if poisoned {
         eprintln!();
@@ -608,6 +616,8 @@ fn common_inputs_stamp(config: &Config) -> Stamp {
         stamp.add_path(&rustdoc_path);
         stamp.add_path(&rust_src_dir.join("src/etc/htmldocck.py"));
     }
+
+    stamp.add_dir(&rust_src_dir.join("src/tools/run-make-support"));
 
     // Compiletest itself.
     stamp.add_dir(&rust_src_dir.join("src/tools/compiletest/"));
@@ -655,13 +665,21 @@ fn collect_tests_from_dir(
         return Ok(());
     }
 
-    if config.mode == Mode::RunMake && dir.join("Makefile").exists() {
-        let paths = TestPaths {
-            file: dir.to_path_buf(),
-            relative_dir: relative_dir_path.parent().unwrap().to_path_buf(),
-        };
-        tests.extend(make_test(config, cache, &paths, inputs, poisoned));
-        return Ok(());
+    if config.mode == Mode::RunMake {
+        if dir.join("Makefile").exists() && dir.join("rmake.rs").exists() {
+            return Err(io::Error::other(
+                "run-make tests cannot have both `Makefile` and `rmake.rs`",
+            ));
+        }
+
+        if dir.join("Makefile").exists() || dir.join("rmake.rs").exists() {
+            let paths = TestPaths {
+                file: dir.to_path_buf(),
+                relative_dir: relative_dir_path.parent().unwrap().to_path_buf(),
+            };
+            tests.extend(make_test(config, cache, &paths, inputs, poisoned));
+            return Ok(());
+        }
     }
 
     // If we find a test foo/bar.rs, we have to build the
@@ -733,8 +751,17 @@ fn make_test(
     poisoned: &mut bool,
 ) -> Vec<test::TestDescAndFn> {
     let test_path = if config.mode == Mode::RunMake {
-        // Parse directives in the Makefile
-        testpaths.file.join("Makefile")
+        if testpaths.file.join("rmake.rs").exists() && testpaths.file.join("Makefile").exists() {
+            panic!("run-make tests cannot have both `rmake.rs` and `Makefile`");
+        }
+
+        if testpaths.file.join("rmake.rs").exists() {
+            // Parse directives in rmake.rs.
+            testpaths.file.join("rmake.rs")
+        } else {
+            // Parse directives in the Makefile.
+            testpaths.file.join("Makefile")
+        }
     } else {
         PathBuf::from(&testpaths.file)
     };
@@ -920,7 +947,7 @@ fn is_android_gdb_target(target: &str) -> bool {
     )
 }
 
-/// Returns `true` if the given target is a MSVC target for the purpouses of CDB testing.
+/// Returns `true` if the given target is a MSVC target for the purposes of CDB testing.
 fn is_pc_windows_msvc_target(target: &str) -> bool {
     target.ends_with("-pc-windows-msvc")
 }
@@ -1120,7 +1147,7 @@ fn extract_lldb_version(full_version_line: &str) -> Option<(u32, bool)> {
 }
 
 fn not_a_digit(c: char) -> bool {
-    !c.is_digit(10)
+    !c.is_ascii_digit()
 }
 
 fn check_overlapping_tests(found_paths: &HashSet<PathBuf>) {

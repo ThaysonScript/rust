@@ -1,4 +1,6 @@
 //@compile-flags: -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
+// Avoid accidental synchronization via address reuse inside `thread::spawn`.
+//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
 #![feature(new_uninit)]
 
 use std::mem::MaybeUninit;
@@ -39,7 +41,7 @@ pub fn main() {
             let pointer = &*ptr.0;
 
             // Note: could also error due to reading uninitialized memory, but the data-race detector triggers first.
-            *pointer.load(Ordering::Relaxed) //~ ERROR: Data race detected between (1) creating a new allocation on thread `<unnamed>` and (2) non-atomic read on thread `<unnamed>`
+            *pointer.load(Ordering::Relaxed) //~ ERROR: Data race detected between (1) creating a new allocation on thread `unnamed-1` and (2) non-atomic read on thread `unnamed-2`
         });
 
         j1.join().unwrap();

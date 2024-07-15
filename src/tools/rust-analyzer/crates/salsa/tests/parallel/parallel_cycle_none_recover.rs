@@ -5,7 +5,6 @@
 use crate::setup::{Knobs, ParDatabaseImpl};
 use expect_test::expect;
 use salsa::ParallelDatabase;
-use test_log::test;
 
 #[test]
 fn parallel_cycle_none_recover() {
@@ -28,13 +27,13 @@ fn parallel_cycle_none_recover() {
     if let Some(c) = err_b.downcast_ref::<salsa::Cycle>() {
         expect![[r#"
             [
-                "a(-1)",
-                "b(-1)",
+                "parallel::parallel_cycle_none_recover::AQuery::a(-1)",
+                "parallel::parallel_cycle_none_recover::BQuery::b(-1)",
             ]
         "#]]
         .assert_debug_eq(&c.unexpected_participants(&db));
     } else {
-        panic!("b failed in an unexpected way: {:?}", err_b);
+        panic!("b failed in an unexpected way: {err_b:?}");
     }
 
     // We expect A to propagate a panic, which causes us to use the sentinel

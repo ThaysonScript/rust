@@ -266,7 +266,7 @@
 //! its file descriptors with no operations being performed by any other part of the program.
 //!
 //! Note that exclusive ownership of a file descriptor does *not* imply exclusive ownership of the
-//! underlying kernel object that the file descriptor references (also called "file description" on
+//! underlying kernel object that the file descriptor references (also called "open file description" on
 //! some operating systems). File descriptors basically work like [`Arc`]: when you receive an owned
 //! file descriptor, you cannot know whether there are any other file descriptors that reference the
 //! same kernel object. However, when you create a new kernel object, you know that you are holding
@@ -304,21 +304,21 @@ use crate::ops::{Deref, DerefMut};
 use crate::slice;
 use crate::str;
 use crate::sys;
-use crate::sys_common::memchr;
+use core::slice::memchr;
 
 #[stable(feature = "bufwriter_into_parts", since = "1.56.0")]
 pub use self::buffered::WriterPanicked;
 #[unstable(feature = "raw_os_error_ty", issue = "107792")]
 pub use self::error::RawOsError;
 pub(crate) use self::stdio::attempt_print_to_stderr;
-#[unstable(feature = "internal_output_capture", issue = "none")]
-#[doc(no_inline, hidden)]
-pub use self::stdio::set_output_capture;
 #[stable(feature = "is_terminal", since = "1.70.0")]
 pub use self::stdio::IsTerminal;
 #[unstable(feature = "print_internals", issue = "none")]
 #[doc(hidden)]
 pub use self::stdio::{_eprint, _print};
+#[unstable(feature = "internal_output_capture", issue = "none")]
+#[doc(no_inline, hidden)]
+pub use self::stdio::{set_output_capture, try_set_output_capture};
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::{
     buffered::{BufReader, BufWriter, IntoInnerError, LineWriter},
@@ -382,15 +382,13 @@ pub(crate) unsafe fn append_to_string<F>(buf: &mut String, f: F) -> Result<usize
 where
     F: FnOnce(&mut Vec<u8>) -> Result<usize>,
 {
-    let mut g = Guard { len: buf.len(), buf: buf.as_mut_vec() };
+    let mut g = Guard { len: buf.len(), buf: unsafe { buf.as_mut_vec() } };
     let ret = f(g.buf);
-    if str::from_utf8(&g.buf[g.len..]).is_err() {
-        ret.and_then(|_| {
-            Err(error::const_io_error!(
-                ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8"
-            ))
-        })
+
+    // SAFETY: the caller promises to only append data to `buf`
+    let appended = unsafe { g.buf.get_unchecked(g.len..) };
+    if str::from_utf8(appended).is_err() {
+        ret.and_then(|_| Err(Error::INVALID_UTF8))
     } else {
         g.len = g.buf.len();
         ret
@@ -465,7 +463,7 @@ pub(crate) fn default_read_to_end<R: Read + ?Sized>(
 
         if buf.len() == buf.capacity() {
             // buf is full, need more space
-            buf.try_reserve(PROBE_SIZE).map_err(|_| ErrorKind::OutOfMemory)?;
+            buf.try_reserve(PROBE_SIZE)?;
         }
 
         let mut spare = buf.spare_capacity_mut();
@@ -566,11 +564,7 @@ pub(crate) fn default_read_exact<R: Read + ?Sized>(this: &mut R, mut buf: &mut [
             Err(e) => return Err(e),
         }
     }
-    if !buf.is_empty() {
-        Err(error::const_io_error!(ErrorKind::UnexpectedEof, "failed to fill whole buffer"))
-    } else {
-        Ok(())
-    }
+    if !buf.is_empty() { Err(Error::READ_EXACT_EOF) } else { Ok(()) }
 }
 
 pub(crate) fn default_read_buf<F>(read: F, mut cursor: BorrowedCursor<'_>) -> Result<()>
@@ -579,6 +573,26 @@ where
 {
     let n = read(cursor.ensure_init().init_mut())?;
     cursor.advance(n);
+    Ok(())
+}
+
+pub(crate) fn default_read_buf_exact<R: Read + ?Sized>(
+    this: &mut R,
+    mut cursor: BorrowedCursor<'_>,
+) -> Result<()> {
+    while cursor.capacity() > 0 {
+        let prev_written = cursor.written();
+        match this.read_buf(cursor.reborrow()) {
+            Ok(()) => {}
+            Err(e) if e.is_interrupted() => continue,
+            Err(e) => return Err(e),
+        }
+
+        if cursor.written() == prev_written {
+            return Err(Error::READ_EXACT_EOF);
+        }
+    }
+
     Ok(())
 }
 
@@ -692,10 +706,9 @@ pub trait Read {
     /// Callers have to ensure that no unchecked out-of-bounds accesses are possible even if
     /// `n > buf.len()`.
     ///
-    /// No guarantees are provided about the contents of `buf` when this
-    /// function is called, so implementations cannot rely on any property of the
-    /// contents of `buf` being true. It is recommended that *implementations*
-    /// only write data to `buf` instead of reading its contents.
+    /// *Implementations* of this method can make no assumptions about the contents of `buf` when
+    /// this function is called. It is recommended that implementations only write data to `buf`
+    /// instead of reading its contents.
     ///
     /// Correspondingly, however, *callers* of this method in unsafe code must not assume
     /// any guarantees about how the implementation uses `buf`. The trait is safe to implement,
@@ -834,7 +847,7 @@ pub trait Read {
     ///         if src_buf.is_empty() {
     ///             break;
     ///         }
-    ///         dest_vec.try_reserve(src_buf.len()).map_err(|_| io::ErrorKind::OutOfMemory)?;
+    ///         dest_vec.try_reserve(src_buf.len())?;
     ///         dest_vec.extend_from_slice(src_buf);
     ///
     ///         // Any irreversible side effects should happen after `try_reserve` succeeds,
@@ -901,12 +914,10 @@ pub trait Read {
     /// This function reads as many bytes as necessary to completely fill the
     /// specified buffer `buf`.
     ///
-    /// No guarantees are provided about the contents of `buf` when this
-    /// function is called, so implementations cannot rely on any property of the
-    /// contents of `buf` being true. It is recommended that implementations
-    /// only write data to `buf` instead of reading its contents. The
-    /// documentation on [`read`] has a more detailed explanation on this
-    /// subject.
+    /// *Implementations* of this method can make no assumptions about the contents of `buf` when
+    /// this function is called. It is recommended that implementations only write data to `buf`
+    /// instead of reading its contents. The documentation on [`read`] has a more detailed
+    /// explanation of this subject.
     ///
     /// # Errors
     ///
@@ -981,24 +992,8 @@ pub trait Read {
     ///
     /// If this function returns an error, all bytes read will be appended to `cursor`.
     #[unstable(feature = "read_buf", issue = "78485")]
-    fn read_buf_exact(&mut self, mut cursor: BorrowedCursor<'_>) -> Result<()> {
-        while cursor.capacity() > 0 {
-            let prev_written = cursor.written();
-            match self.read_buf(cursor.reborrow()) {
-                Ok(()) => {}
-                Err(e) if e.is_interrupted() => continue,
-                Err(e) => return Err(e),
-            }
-
-            if cursor.written() == prev_written {
-                return Err(error::const_io_error!(
-                    ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer"
-                ));
-            }
-        }
-
-        Ok(())
+    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_>) -> Result<()> {
+        default_read_buf_exact(self, cursor)
     }
 
     /// Creates a "by reference" adaptor for this instance of `Read`.
@@ -1261,8 +1256,6 @@ impl<'a> IoSliceMut<'a> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(io_slice_advance)]
-    ///
     /// use std::io::IoSliceMut;
     /// use std::ops::Deref;
     ///
@@ -1273,7 +1266,7 @@ impl<'a> IoSliceMut<'a> {
     /// buf.advance(3);
     /// assert_eq!(buf.deref(), [1; 5].as_ref());
     /// ```
-    #[unstable(feature = "io_slice_advance", issue = "62726")]
+    #[stable(feature = "io_slice_advance", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     pub fn advance(&mut self, n: usize) {
         self.0.advance(n)
@@ -1295,8 +1288,6 @@ impl<'a> IoSliceMut<'a> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(io_slice_advance)]
-    ///
     /// use std::io::IoSliceMut;
     /// use std::ops::Deref;
     ///
@@ -1314,7 +1305,7 @@ impl<'a> IoSliceMut<'a> {
     /// assert_eq!(bufs[0].deref(), [2; 14].as_ref());
     /// assert_eq!(bufs[1].deref(), [3; 8].as_ref());
     /// ```
-    #[unstable(feature = "io_slice_advance", issue = "62726")]
+    #[stable(feature = "io_slice_advance", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     pub fn advance_slices(bufs: &mut &mut [IoSliceMut<'a>], n: usize) {
         // Number of buffers to remove.
@@ -1405,8 +1396,6 @@ impl<'a> IoSlice<'a> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(io_slice_advance)]
-    ///
     /// use std::io::IoSlice;
     /// use std::ops::Deref;
     ///
@@ -1417,7 +1406,7 @@ impl<'a> IoSlice<'a> {
     /// buf.advance(3);
     /// assert_eq!(buf.deref(), [1; 5].as_ref());
     /// ```
-    #[unstable(feature = "io_slice_advance", issue = "62726")]
+    #[stable(feature = "io_slice_advance", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     pub fn advance(&mut self, n: usize) {
         self.0.advance(n)
@@ -1439,8 +1428,6 @@ impl<'a> IoSlice<'a> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(io_slice_advance)]
-    ///
     /// use std::io::IoSlice;
     /// use std::ops::Deref;
     ///
@@ -1457,7 +1444,7 @@ impl<'a> IoSlice<'a> {
     /// IoSlice::advance_slices(&mut bufs, 10);
     /// assert_eq!(bufs[0].deref(), [2; 14].as_ref());
     /// assert_eq!(bufs[1].deref(), [3; 8].as_ref());
-    #[unstable(feature = "io_slice_advance", issue = "62726")]
+    #[stable(feature = "io_slice_advance", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     pub fn advance_slices(bufs: &mut &mut [IoSlice<'a>], n: usize) {
         // Number of buffers to remove.
@@ -1705,10 +1692,7 @@ pub trait Write {
         while !buf.is_empty() {
             match self.write(buf) {
                 Ok(0) => {
-                    return Err(error::const_io_error!(
-                        ErrorKind::WriteZero,
-                        "failed to write whole buffer",
-                    ));
+                    return Err(Error::WRITE_ALL_EOF);
                 }
                 Ok(n) => buf = &buf[n..],
                 Err(ref e) if e.is_interrupted() => {}
@@ -1773,10 +1757,7 @@ pub trait Write {
         while !bufs.is_empty() {
             match self.write_vectored(bufs) {
                 Ok(0) => {
-                    return Err(error::const_io_error!(
-                        ErrorKind::WriteZero,
-                        "failed to write whole buffer",
-                    ));
+                    return Err(Error::WRITE_ALL_EOF);
                 }
                 Ok(n) => IoSlice::advance_slices(&mut bufs, n),
                 Err(ref e) if e.is_interrupted() => {}
@@ -1850,7 +1831,11 @@ pub trait Write {
                 if output.error.is_err() {
                     output.error
                 } else {
-                    Err(error::const_io_error!(ErrorKind::Uncategorized, "formatter error"))
+                    // This shouldn't happen: the underlying stream did not error, but somehow
+                    // the formatter still errored?
+                    panic!(
+                        "a formatting trait implementation returned an error when the underlying stream did not"
+                    );
                 }
             }
         }
@@ -2051,7 +2036,6 @@ pub trait Seek {
     /// # Example
     ///
     /// ```no_run
-    /// #![feature(seek_seek_relative)]
     /// use std::{
     ///     io::{self, Seek},
     ///     fs::File,
@@ -2066,7 +2050,7 @@ pub trait Seek {
     /// ```
     ///
     /// [`BufReader`]: crate::io::BufReader
-    #[unstable(feature = "seek_seek_relative", issue = "117374")]
+    #[stable(feature = "seek_seek_relative", since = "1.80.0")]
     fn seek_relative(&mut self, offset: i64) -> Result<()> {
         self.seek(SeekFrom::Current(offset))?;
         Ok(())

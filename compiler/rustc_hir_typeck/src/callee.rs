@@ -3,31 +3,29 @@ use super::method::MethodCallee;
 use super::{Expectation, FnCtxt, TupleArgumentsFlag};
 
 use crate::errors;
-use rustc_ast::util::parser::PREC_POSTFIX;
-use rustc_errors::{Applicability, DiagnosticBuilder, ErrorGuaranteed, StashKey};
-use rustc_hir as hir;
+use rustc_ast::util::parser::PREC_UNAMBIGUOUS;
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed, StashKey};
 use rustc_hir::def::{self, CtorKind, Namespace, Res};
 use rustc_hir::def_id::DefId;
+use rustc_hir::{self as hir, LangItem};
 use rustc_hir_analysis::autoderef::Autoderef;
+use rustc_infer::traits::ObligationCauseCode;
 use rustc_infer::{
     infer,
-    traits::{self, Obligation},
-};
-use rustc_infer::{
-    infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind},
-    traits::ObligationCause,
+    traits::{self, Obligation, ObligationCause},
 };
 use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability,
 };
 use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::{sym, Ident};
 use rustc_span::Span;
 use rustc_target::spec::abi;
+use rustc_trait_selection::error_reporting::traits::DefIdOrName;
 use rustc_trait_selection::infer::InferCtxtExt as _;
-use rustc_trait_selection::traits::error_reporting::DefIdOrName;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
 
 use std::{iter, slice};
@@ -41,8 +39,11 @@ pub fn check_legal_trait_for_method_call(
     receiver: Option<Span>,
     expr_span: Span,
     trait_id: DefId,
+    body_id: DefId,
 ) -> Result<(), ErrorGuaranteed> {
-    if tcx.lang_items().drop_trait() == Some(trait_id) {
+    if tcx.is_lang_item(trait_id, LangItem::Drop)
+        && tcx.lang_items().fallback_surface_drop_fn() != Some(body_id)
+    {
         let sugg = if let Some(receiver) = receiver.filter(|s| !s.is_empty()) {
             errors::ExplicitDestructorCallSugg::Snippet {
                 lo: expr_span.shrink_to_lo(),
@@ -118,7 +119,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
 
         // we must check that return type of called functions is WF:
-        self.register_wf_obligation(output.into(), call_expr.span, traits::WellFormed(None));
+        self.register_wf_obligation(
+            output.into(),
+            call_expr.span,
+            ObligationCauseCode::WellFormed(None),
+        );
 
         output
     }
@@ -180,25 +185,23 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     infer::FnCall,
                     closure_args.coroutine_closure_sig(),
                 );
-                let tupled_upvars_ty = self.next_ty_var(TypeVariableOrigin {
-                    kind: TypeVariableOriginKind::TypeInference,
-                    span: callee_expr.span,
-                });
+                let tupled_upvars_ty = self.next_ty_var(callee_expr.span);
+                // We may actually receive a coroutine back whose kind is different
+                // from the closure that this dispatched from. This is because when
+                // we have no captures, we automatically implement `FnOnce`. This
+                // impl forces the closure kind to `FnOnce` i.e. `u8`.
+                let kind_ty = self.next_ty_var(callee_expr.span);
                 let call_sig = self.tcx.mk_fn_sig(
                     [coroutine_closure_sig.tupled_inputs_ty],
                     coroutine_closure_sig.to_coroutine(
                         self.tcx,
                         closure_args.parent_args(),
-                        // Inherit the kind ty of the closure, since we're calling this
-                        // coroutine with the most relaxed `AsyncFn*` trait that we can.
-                        // We don't necessarily need to do this here, but it saves us
-                        // computing one more infer var that will get constrained later.
-                        closure_args.kind_ty(),
+                        kind_ty,
                         self.tcx.coroutine_for_closure(def_id),
                         tupled_upvars_ty,
                     ),
                     coroutine_closure_sig.c_variadic,
-                    coroutine_closure_sig.unsafety,
+                    coroutine_closure_sig.safety,
                     coroutine_closure_sig.abi,
                 );
                 let adjustments = self.adjust_steps(autoderef);
@@ -298,15 +301,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let Some(trait_def_id) = opt_trait_def_id else { continue };
 
             let opt_input_type = opt_arg_exprs.map(|arg_exprs| {
-                Ty::new_tup_from_iter(
-                    self.tcx,
-                    arg_exprs.iter().map(|e| {
-                        self.next_ty_var(TypeVariableOrigin {
-                            kind: TypeVariableOriginKind::TypeInference,
-                            span: e.span,
-                        })
-                    }),
-                )
+                Ty::new_tup_from_iter(self.tcx, arg_exprs.iter().map(|e| self.next_ty_var(e.span)))
             });
 
             if let Some(ok) = self.lookup_method_in_trait(
@@ -347,7 +342,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// likely intention is to call the closure, suggest `(||{})()`. (#55851)
     fn identify_bad_closure_def_and_call(
         &self,
-        err: &mut DiagnosticBuilder<'_>,
+        err: &mut Diag<'_>,
         hir_id: hir::HirId,
         callee_node: &hir::ExprKind<'_>,
         callee_span: Span,
@@ -410,7 +405,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// likely intention is to create an array containing tuples.
     fn maybe_suggest_bad_array_definition(
         &self,
-        err: &mut DiagnosticBuilder<'_>,
+        err: &mut Diag<'_>,
         call_expr: &'tcx hir::Expr<'tcx>,
         callee_expr: &'tcx hir::Expr<'tcx>,
     ) -> bool {
@@ -484,12 +479,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
                 if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &callee_expr.kind
                     && let [segment] = path.segments
-                    && let Some(mut diag) =
-                        self.dcx().steal_diagnostic(segment.ident.span, StashKey::CallIntoMethod)
                 {
-                    // Try suggesting `foo(a)` -> `a.foo()` if possible.
-                    self.suggest_call_as_method(&mut diag, segment, arg_exprs, call_expr, expected);
-                    diag.emit();
+                    self.dcx().try_steal_modify_and_emit_err(
+                        segment.ident.span,
+                        StashKey::CallIntoMethod,
+                        |err| {
+                            // Try suggesting `foo(a)` -> `a.foo()` if possible.
+                            self.suggest_call_as_method(
+                                err, segment, arg_exprs, call_expr, expected,
+                            );
+                        },
+                    );
                 }
 
                 let err = self.report_invalid_callee(call_expr, callee_expr, callee_ty, arg_exprs);
@@ -530,9 +530,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 self.register_bound(
                     ty,
                     self.tcx.require_lang_item(hir::LangItem::Tuple, Some(sp)),
-                    traits::ObligationCause::new(sp, self.body_id, traits::RustCall),
+                    traits::ObligationCause::new(sp, self.body_id, ObligationCauseCode::RustCall),
                 );
-                self.require_type_is_sized(ty, sp, traits::RustCall);
+                self.require_type_is_sized(ty, sp, ObligationCauseCode::RustCall);
             } else {
                 self.dcx().emit_err(errors::RustCallIncorrectArgs { span: sp });
             }
@@ -540,7 +540,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         if let Some(def_id) = def_id
             && self.tcx.def_kind(def_id) == hir::def::DefKind::Fn
-            && matches!(self.tcx.intrinsic(def_id), Some(sym::const_eval_select))
+            && self.tcx.is_intrinsic(def_id, sym::const_eval_select)
         {
             let fn_sig = self.resolve_vars_if_possible(fn_sig);
             for idx in 0..=1 {
@@ -575,7 +575,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             self.misc(span),
                             self.param_env,
                             ty::ProjectionPredicate {
-                                projection_ty: ty::AliasTy::new(
+                                projection_term: ty::AliasTerm::new(
                                     self.tcx,
                                     fn_once_output_def_id,
                                     [arg_ty.into(), fn_sig.inputs()[0].into(), const_param],
@@ -601,7 +601,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// and suggesting the fix if the method probe is successful.
     fn suggest_call_as_method(
         &self,
-        diag: &mut DiagnosticBuilder<'_, ()>,
+        diag: &mut Diag<'_>,
         segment: &'tcx hir::PathSegment<'tcx>,
         arg_exprs: &'tcx [hir::Expr<'tcx>],
         call_expr: &'tcx hir::Expr<'tcx>,
@@ -628,7 +628,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 return;
             };
 
-            let pick = self.confirm_method(
+            let pick = self.confirm_method_for_diagnostic(
                 call_expr.span,
                 callee_expr,
                 call_expr,
@@ -656,7 +656,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             };
 
             if let Ok(rest_snippet) = rest_snippet {
-                let sugg = if callee_expr.precedence().order() >= PREC_POSTFIX {
+                let sugg = if callee_expr.precedence().order() >= PREC_UNAMBIGUOUS {
                     vec![
                         (up_to_rcvr_span, "".to_string()),
                         (rest_span, format!(".{}({rest_snippet}", segment.ident)),
@@ -715,7 +715,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 def::CtorOf::Variant => "enum variant",
             };
             let removal_span = callee_expr.span.shrink_to_hi().to(call_expr.span.shrink_to_hi());
-            unit_variant = Some((removal_span, descr, rustc_hir_pretty::qpath_to_string(qpath)));
+            unit_variant =
+                Some((removal_span, descr, rustc_hir_pretty::qpath_to_string(&self.tcx, qpath)));
         }
 
         let callee_ty = self.resolve_vars_if_possible(callee_ty);
@@ -750,7 +751,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         if let hir::ExprKind::Path(hir::QPath::Resolved(None, path)) = callee_expr.kind
             && let Res::Local(_) = path.res
-            && let [segment] = &path.segments[..]
+            && let [segment] = &path.segments
         {
             for id in self.tcx.hir().items() {
                 if let Some(node) = self.tcx.hir().get_if_local(id.owner_id.into())
@@ -909,7 +910,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let param = callee_args.const_at(host_effect_index);
         let cause = self.misc(span);
-        match self.at(&cause, self.param_env).eq(infer::DefineOpaqueTypes::No, effect, param) {
+        // We know the type of `effect` to be `bool`, there will be no opaque type inference.
+        match self.at(&cause, self.param_env).eq(infer::DefineOpaqueTypes::Yes, effect, param) {
             Ok(infer::InferOk { obligations, value: () }) => {
                 self.register_predicates(obligations);
             }

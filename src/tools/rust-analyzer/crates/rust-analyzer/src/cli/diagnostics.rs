@@ -5,7 +5,7 @@ use project_model::{CargoConfig, RustLibSource};
 use rustc_hash::FxHashSet;
 
 use hir::{db::HirDatabase, Crate, HirFileIdExt, Module};
-use ide::{AssistResolveStrategy, DiagnosticsConfig, Severity};
+use ide::{AnalysisHost, AssistResolveStrategy, DiagnosticsConfig, Severity};
 use ide_db::base_db::SourceDatabaseExt;
 use load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
 
@@ -13,10 +13,21 @@ use crate::cli::flags;
 
 impl flags::Diagnostics {
     pub fn run(self) -> anyhow::Result<()> {
+        const STACK_SIZE: usize = 1024 * 1024 * 8;
+
+        let handle = stdx::thread::Builder::new(stdx::thread::ThreadIntent::LatencySensitive)
+            .name("BIG_STACK_THREAD".into())
+            .stack_size(STACK_SIZE)
+            .spawn(|| self.run_())
+            .unwrap();
+
+        handle.join()
+    }
+    fn run_(self) -> anyhow::Result<()> {
         let cargo_config =
             CargoConfig { sysroot: Some(RustLibSource::Discover), ..Default::default() };
         let with_proc_macro_server = if let Some(p) = &self.proc_macro_srv {
-            let path = vfs::AbsPathBuf::assert(std::env::current_dir()?.join(p));
+            let path = vfs::AbsPathBuf::assert_utf8(std::env::current_dir()?.join(p));
             ProcMacroServerChoice::Explicit(path)
         } else {
             ProcMacroServerChoice::Sysroot
@@ -26,8 +37,9 @@ impl flags::Diagnostics {
             with_proc_macro_server,
             prefill_caches: false,
         };
-        let (host, _vfs, _proc_macro) =
+        let (db, _vfs, _proc_macro) =
             load_workspace_at(&self.path, &cargo_config, &load_cargo_config, &|_| {})?;
+        let host = AnalysisHost::with_database(db);
         let db = host.raw_database();
         let analysis = host.analysis();
 

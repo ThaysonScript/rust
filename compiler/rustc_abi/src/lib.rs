@@ -1,7 +1,9 @@
-#![cfg_attr(feature = "nightly", feature(step_trait))]
+// tidy-alphabetical-start
 #![cfg_attr(feature = "nightly", allow(internal_features))]
 #![cfg_attr(feature = "nightly", doc(rust_logo))]
 #![cfg_attr(feature = "nightly", feature(rustdoc_internals))]
+#![cfg_attr(feature = "nightly", feature(step_trait))]
+// tidy-alphabetical-end
 
 use std::fmt;
 use std::num::{NonZeroUsize, ParseIntError};
@@ -21,6 +23,8 @@ use rustc_macros::{Decodable_Generic, Encodable_Generic};
 use std::iter::Step;
 
 mod layout;
+#[cfg(test)]
+mod tests;
 
 pub use layout::LayoutCalculator;
 
@@ -41,7 +45,7 @@ bitflags! {
         // Internal only for now. If true, don't reorder fields.
         const IS_LINEAR          = 1 << 3;
         // If true, the type's layout can be randomized using
-        // the seed stored in `ReprOptions.layout_seed`
+        // the seed stored in `ReprOptions.field_shuffle_seed`
         const RANDOMIZE_LAYOUT   = 1 << 4;
         // Any of these flags being set prevent field reordering optimisation.
         const IS_UNOPTIMISABLE   = ReprFlags::IS_C.bits()
@@ -135,27 +139,20 @@ impl ReprOptions {
         self.c() || self.int.is_some()
     }
 
-    /// Returns `true` if this `#[repr()]` should inhibit struct field reordering
-    /// optimizations, such as with `repr(C)`, `repr(packed(1))`, or `repr(<int>)`.
-    pub fn inhibit_struct_field_reordering_opt(&self) -> bool {
-        if let Some(pack) = self.pack {
-            if pack.bytes() == 1 {
-                return true;
-            }
-        }
-
+    /// Returns `true` if this `#[repr()]` guarantees a fixed field order,
+    /// e.g. `repr(C)` or `repr(<int>)`.
+    pub fn inhibit_struct_field_reordering(&self) -> bool {
         self.flags.intersects(ReprFlags::IS_UNOPTIMISABLE) || self.int.is_some()
     }
 
     /// Returns `true` if this type is valid for reordering and `-Z randomize-layout`
     /// was enabled for its declaration crate.
     pub fn can_randomize_type_layout(&self) -> bool {
-        !self.inhibit_struct_field_reordering_opt()
-            && self.flags.contains(ReprFlags::RANDOMIZE_LAYOUT)
+        !self.inhibit_struct_field_reordering() && self.flags.contains(ReprFlags::RANDOMIZE_LAYOUT)
     }
 
     /// Returns `true` if this `#[repr()]` should inhibit union ABI optimisations.
-    pub fn inhibit_union_abi_opt(&self) -> bool {
+    pub fn inhibits_union_abi_opt(&self) -> bool {
         self.c()
     }
 }
@@ -171,8 +168,10 @@ pub struct TargetDataLayout {
     pub i32_align: AbiAndPrefAlign,
     pub i64_align: AbiAndPrefAlign,
     pub i128_align: AbiAndPrefAlign,
+    pub f16_align: AbiAndPrefAlign,
     pub f32_align: AbiAndPrefAlign,
     pub f64_align: AbiAndPrefAlign,
+    pub f128_align: AbiAndPrefAlign,
     pub pointer_size: Size,
     pub pointer_align: AbiAndPrefAlign,
     pub aggregate_align: AbiAndPrefAlign,
@@ -200,8 +199,10 @@ impl Default for TargetDataLayout {
             i32_align: AbiAndPrefAlign::new(align(32)),
             i64_align: AbiAndPrefAlign { abi: align(32), pref: align(64) },
             i128_align: AbiAndPrefAlign { abi: align(32), pref: align(64) },
+            f16_align: AbiAndPrefAlign::new(align(16)),
             f32_align: AbiAndPrefAlign::new(align(32)),
             f64_align: AbiAndPrefAlign::new(align(64)),
+            f128_align: AbiAndPrefAlign::new(align(128)),
             pointer_size: Size::from_bits(64),
             pointer_align: AbiAndPrefAlign::new(align(64)),
             aggregate_align: AbiAndPrefAlign { abi: align(0), pref: align(64) },
@@ -281,8 +282,10 @@ impl TargetDataLayout {
                     dl.instruction_address_space = parse_address_space(&p[1..], "P")?
                 }
                 ["a", ref a @ ..] => dl.aggregate_align = parse_align(a, "a")?,
+                ["f16", ref a @ ..] => dl.f16_align = parse_align(a, "f16")?,
                 ["f32", ref a @ ..] => dl.f32_align = parse_align(a, "f32")?,
                 ["f64", ref a @ ..] => dl.f64_align = parse_align(a, "f64")?,
+                ["f128", ref a @ ..] => dl.f128_align = parse_align(a, "f128")?,
                 // FIXME(erikdesjardins): we should be parsing nonzero address spaces
                 // this will require replacing TargetDataLayout::{pointer_size,pointer_align}
                 // with e.g. `fn pointer_size_in(AddressSpace)`
@@ -424,11 +427,13 @@ pub struct Size {
     raw: u64,
 }
 
-// Safety: Ord is implement as just comparing numerical values and numerical values
-// are not changed by (de-)serialization.
 #[cfg(feature = "nightly")]
-unsafe impl StableOrd for Size {
+impl StableOrd for Size {
     const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    // `Ord` is implemented as just comparing numerical values and numerical values
+    // are not changed by (de-)serialization.
+    const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
 }
 
 // This is debug-printed a lot in larger structs, don't waste too much space there
@@ -692,6 +697,7 @@ impl fmt::Display for AlignFromBytesError {
 
 impl Align {
     pub const ONE: Align = Align { pow2: 0 };
+    pub const EIGHT: Align = Align { pow2: 3 };
     // LLVM has a maximal supported alignment of 2^29, we inherit that.
     pub const MAX: Align = Align { pow2: 29 };
 
@@ -701,19 +707,19 @@ impl Align {
     }
 
     #[inline]
-    pub fn from_bytes(align: u64) -> Result<Align, AlignFromBytesError> {
+    pub const fn from_bytes(align: u64) -> Result<Align, AlignFromBytesError> {
         // Treat an alignment of 0 bytes like 1-byte alignment.
         if align == 0 {
             return Ok(Align::ONE);
         }
 
         #[cold]
-        fn not_power_of_2(align: u64) -> AlignFromBytesError {
+        const fn not_power_of_2(align: u64) -> AlignFromBytesError {
             AlignFromBytesError::NotPowerOfTwo(align)
         }
 
         #[cold]
-        fn too_large(align: u64) -> AlignFromBytesError {
+        const fn too_large(align: u64) -> AlignFromBytesError {
             AlignFromBytesError::TooLarge(align)
         }
 
@@ -736,8 +742,18 @@ impl Align {
     }
 
     #[inline]
+    pub fn bytes_usize(self) -> usize {
+        self.bytes().try_into().unwrap()
+    }
+
+    #[inline]
     pub fn bits(self) -> u64 {
         self.bytes() * 8
+    }
+
+    #[inline]
+    pub fn bits_usize(self) -> usize {
+        self.bits().try_into().unwrap()
     }
 
     /// Computes the best alignment possible for the given offset
@@ -907,6 +923,41 @@ impl Integer {
     }
 }
 
+/// Floating-point types.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+pub enum Float {
+    F16,
+    F32,
+    F64,
+    F128,
+}
+
+impl Float {
+    pub fn size(self) -> Size {
+        use Float::*;
+
+        match self {
+            F16 => Size::from_bits(16),
+            F32 => Size::from_bits(32),
+            F64 => Size::from_bits(64),
+            F128 => Size::from_bits(128),
+        }
+    }
+
+    pub fn align<C: HasDataLayout>(self, cx: &C) -> AbiAndPrefAlign {
+        use Float::*;
+        let dl = cx.data_layout();
+
+        match self {
+            F16 => dl.f16_align,
+            F32 => dl.f32_align,
+            F64 => dl.f64_align,
+            F128 => dl.f128_align,
+        }
+    }
+}
+
 /// Fundamental unit of memory access and layout.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
@@ -919,8 +970,7 @@ pub enum Primitive {
     /// a negative integer passed by zero-extension will appear positive in
     /// the callee, and most operations on it will produce the wrong values.
     Int(Integer, bool),
-    F32,
-    F64,
+    Float(Float),
     Pointer(AddressSpace),
 }
 
@@ -931,8 +981,7 @@ impl Primitive {
 
         match self {
             Int(i, _) => i.size(),
-            F32 => Size::from_bits(32),
-            F64 => Size::from_bits(64),
+            Float(f) => f.size(),
             // FIXME(erikdesjardins): ignoring address space is technically wrong, pointers in
             // different address spaces can have different sizes
             // (but TargetDataLayout doesn't currently parse that part of the DL string)
@@ -946,8 +995,7 @@ impl Primitive {
 
         match self {
             Int(i, _) => i.align(dl),
-            F32 => dl.f32_align,
-            F64 => dl.f64_align,
+            Float(f) => f.align(dl),
             // FIXME(erikdesjardins): ignoring address space is technically wrong, pointers in
             // different address spaces can have different alignments
             // (but TargetDataLayout doesn't currently parse that part of the DL string)
@@ -1204,7 +1252,7 @@ impl<FieldIdx: Idx> FieldsShape<FieldIdx> {
 
     /// Gets source indices of the fields by increasing offsets.
     #[inline]
-    pub fn index_by_increasing_offset(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn index_by_increasing_offset(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
         let mut inverse_small = [0u8; 64];
         let mut inverse_big = IndexVec::new();
         let use_small = self.count() <= inverse_small.len();
@@ -1220,7 +1268,12 @@ impl<FieldIdx: Idx> FieldsShape<FieldIdx> {
             }
         }
 
-        (0..self.count()).map(move |i| match *self {
+        // Primitives don't really have fields in the way that structs do,
+        // but having this return an empty iterator for them is unhelpful
+        // since that makes them look kinda like ZSTs, which they're not.
+        let pseudofield_count = if let FieldsShape::Primitive = self { 1 } else { self.count() };
+
+        (0..pseudofield_count).map(move |i| match *self {
             FieldsShape::Primitive | FieldsShape::Union(_) | FieldsShape::Array { .. } => i,
             FieldsShape::Arbitrary { .. } => {
                 if use_small {
@@ -1376,7 +1429,7 @@ pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
     /// Single enum variants, structs/tuples, unions, and all non-ADTs.
     Single { index: VariantIdx },
 
-    /// Enum-likes with more than one inhabited variant: each variant comes with
+    /// Enum-likes with more than one variant: each variant comes with
     /// a *discriminant* (usually the same as the variant index but the user can
     /// assign explicit discriminant values). That discriminant is encoded
     /// as a *tag* on the machine. The layout of each variant is
@@ -1600,8 +1653,9 @@ pub enum PointerKind {
     SharedRef { frozen: bool },
     /// Mutable reference. `unpin` indicates the absence of any pinned data.
     MutableRef { unpin: bool },
-    /// Box. `unpin` indicates the absence of any pinned data.
-    Box { unpin: bool },
+    /// Box. `unpin` indicates the absence of any pinned data. `global` indicates whether this box
+    /// uses the global allocator or a custom one.
+    Box { unpin: bool, global: bool },
 }
 
 /// Note that this information is advisory only, and backends are free to ignore it.
@@ -1610,6 +1664,8 @@ pub enum PointerKind {
 pub struct PointeeInfo {
     pub size: Size,
     pub align: Align,
+    /// If this is `None`, then this is a raw pointer, so size and alignment are not guaranteed to
+    /// be reliable.
     pub safe: Option<PointerKind>,
 }
 

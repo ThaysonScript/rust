@@ -20,13 +20,14 @@ use hir_expand::name::name;
 use crate::{
     db::{HirDatabase, InternedCoroutine},
     display::HirDisplay,
-    from_assoc_type_id, from_chalk_trait_id, from_foreign_def_id, make_binders,
-    make_single_type_binders,
+    from_assoc_type_id, from_chalk_trait_id, from_foreign_def_id,
+    generics::generics,
+    make_binders, make_single_type_binders,
     mapping::{from_chalk, ToChalk, TypeAliasAsValue},
     method_resolution::{TraitImpls, TyFingerprint, ALL_FLOAT_FPS, ALL_INT_FPS},
     to_assoc_type_id, to_chalk_trait_id,
     traits::ChalkContext,
-    utils::{generics, ClosureSubst},
+    utils::ClosureSubst,
     wrap_empty_binders, AliasEq, AliasTy, BoundVar, CallableDefId, DebruijnIndex, FnDefId,
     Interner, ProjectionTy, ProjectionTyExt, QuantifiedWhereClause, Substitution, TraitRef,
     TraitRefExt, Ty, TyBuilder, TyExt, TyKind, WhereClause,
@@ -263,6 +264,19 @@ impl chalk_solve::RustIrDatabase<Interner> for ChalkContext<'_> {
                 let datas = self
                     .db
                     .return_type_impl_traits(func)
+                    .expect("impl trait id without impl traits");
+                let (datas, binders) = (*datas).as_ref().into_value_and_skipped_binders();
+                let data = &datas.impl_traits[idx];
+                let bound = OpaqueTyDatumBound {
+                    bounds: make_single_type_binders(data.bounds.skip_binders().to_vec()),
+                    where_clauses: chalk_ir::Binders::empty(Interner, vec![]),
+                };
+                chalk_ir::Binders::new(binders, bound)
+            }
+            crate::ImplTraitId::AssociatedTypeImplTrait(alias, idx) => {
+                let datas = self
+                    .db
+                    .type_alias_impl_traits(alias)
                     .expect("impl trait id without impl traits");
                 let (datas, binders) = (*datas).as_ref().into_value_and_skipped_binders();
                 let data = &datas.impl_traits[idx];
@@ -590,7 +604,6 @@ pub(crate) fn associated_ty_data_query(
     // Lower bounds -- we could/should maybe move this to a separate query in `lower`
     let type_alias_data = db.type_alias_data(type_alias);
     let generic_params = generics(db.upcast(), type_alias.into());
-    // let bound_vars = generic_params.bound_vars_subst(DebruijnIndex::INNERMOST);
     let resolver = hir_def::resolver::HasResolver::resolver(type_alias, db.upcast());
     let ctx = crate::TyLoweringContext::new(db, &resolver, type_alias.into())
         .with_type_param_mode(crate::lower::ParamLoweringMode::Variable);
@@ -793,7 +806,7 @@ pub(crate) fn impl_datum_query(
     krate: CrateId,
     impl_id: ImplId,
 ) -> Arc<ImplDatum> {
-    let _p = tracing::span!(tracing::Level::INFO, "impl_datum").entered();
+    let _p = tracing::info_span!("impl_datum_query").entered();
     debug!("impl_datum {:?}", impl_id);
     let impl_: hir_def::ImplId = from_chalk(db, impl_id);
     impl_def_datum(db, krate, impl_id, impl_)

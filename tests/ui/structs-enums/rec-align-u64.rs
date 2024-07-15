@@ -1,7 +1,6 @@
 //@ run-pass
 #![allow(dead_code)]
 #![allow(unused_unsafe)]
-//@ ignore-wasm32-bare seems unimportant to test
 
 // Issue #2303
 
@@ -31,21 +30,21 @@ struct Outer {
     t: Inner
 }
 
-
-#[cfg(any(target_os = "android",
-          target_os = "dragonfly",
-          target_os = "emscripten",
-          target_os = "freebsd",
-          target_os = "fuchsia",
-          target_os = "hurd",
-          target_os = "illumos",
-          target_os = "linux",
-          target_os = "macos",
-          target_os = "netbsd",
-          target_os = "openbsd",
-          target_os = "solaris",
-          target_os = "vxworks",
-          target_os = "nto",
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "hurd",
+    target_os = "illumos",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+    target_os = "vxworks",
+    target_os = "nto",
+    target_vendor = "apple",
 ))]
 mod m {
     #[cfg(target_arch = "x86")]
@@ -71,6 +70,14 @@ mod m {
 }
 
 #[cfg(target_os = "windows")]
+mod m {
+    pub mod m {
+        pub fn align() -> usize { 8 }
+        pub fn size() -> usize { 16 }
+    }
+}
+
+#[cfg(target_family = "wasm")]
 mod m {
     pub mod m {
         pub fn align() -> usize { 8 }

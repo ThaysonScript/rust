@@ -6,8 +6,8 @@ use std::{
 use crate::fluent_generated as fluent;
 use rustc_ast::Label;
 use rustc_errors::{
-    codes::*, AddToDiagnostic, Applicability, DiagCtxt, DiagnosticBuilder, DiagnosticSymbolList,
-    EmissionGuarantee, IntoDiagnostic, Level, MultiSpan, SubdiagnosticMessageOp,
+    codes::*, Applicability, Diag, DiagCtxtHandle, DiagSymbolList, Diagnostic, EmissionGuarantee,
+    Level, MultiSpan, SubdiagMessageOp, Subdiagnostic,
 };
 use rustc_hir::{self as hir, ExprKind, Target};
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
@@ -17,12 +17,9 @@ use rustc_span::{Span, Symbol, DUMMY_SP};
 use crate::check_attr::ProcMacroKind;
 use crate::lang_items::Duplicate;
 
-#[derive(Diagnostic)]
+#[derive(LintDiagnostic)]
 #[diag(passes_incorrect_do_not_recommend_location)]
-pub struct IncorrectDoNotRecommendLocation {
-    #[primary_span]
-    pub span: Span,
-}
+pub struct IncorrectDoNotRecommendLocation;
 
 #[derive(LintDiagnostic)]
 #[diag(passes_outer_crate_level_attr)]
@@ -63,21 +60,9 @@ pub struct InlineNotFnOrClosure {
     pub defn_span: Span,
 }
 
-#[derive(LintDiagnostic)]
-#[diag(passes_coverage_ignored_function_prototype)]
-pub struct IgnoredCoverageFnProto;
-
-#[derive(LintDiagnostic)]
-#[diag(passes_coverage_propagate)]
-pub struct IgnoredCoveragePropagate;
-
-#[derive(LintDiagnostic)]
-#[diag(passes_coverage_fn_defn)]
-pub struct IgnoredCoverageFnDefn;
-
 #[derive(Diagnostic)]
-#[diag(passes_coverage_not_coverable, code = E0788)]
-pub struct IgnoredCoverageNotCoverable {
+#[diag(passes_coverage_not_fn_or_closure, code = E0788)]
+pub struct CoverageNotFnOrClosure {
     #[primary_span]
     pub attr_span: Span,
     #[label]
@@ -566,7 +551,10 @@ pub struct ReprConflictingLint;
 #[diag(passes_used_static)]
 pub struct UsedStatic {
     #[primary_span]
+    pub attr_span: Span,
+    #[label]
     pub span: Span,
+    pub target: &'static str,
 }
 
 #[derive(Diagnostic)]
@@ -820,6 +808,16 @@ pub struct MissingLangItem {
 }
 
 #[derive(Diagnostic)]
+#[diag(passes_lang_item_fn_with_track_caller)]
+pub struct LangItemWithTrackCaller {
+    #[primary_span]
+    pub attr_span: Span,
+    pub name: Symbol,
+    #[label]
+    pub sig_span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag(passes_lang_item_fn_with_target_feature)]
 pub struct LangItemWithTargetFeature {
     #[primary_span]
@@ -862,11 +860,10 @@ pub struct ItemFollowingInnerAttr {
     pub kind: &'static str,
 }
 
-impl<G: EmissionGuarantee> IntoDiagnostic<'_, G> for InvalidAttrAtCrateLevel {
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for InvalidAttrAtCrateLevel {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &'_ DiagCtxt, level: Level) -> DiagnosticBuilder<'_, G> {
-        let mut diag =
-            DiagnosticBuilder::new(dcx, level, fluent::passes_invalid_attr_at_crate_level);
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+        let mut diag = Diag::new(dcx, level, fluent::passes_invalid_attr_at_crate_level);
         diag.span(self.span);
         diag.arg("name", self.name);
         // Only emit an error with a suggestion if we can create a string out
@@ -1013,10 +1010,10 @@ pub struct BreakNonLoop<'a> {
     pub break_expr_span: Span,
 }
 
-impl<'a, G: EmissionGuarantee> IntoDiagnostic<'_, G> for BreakNonLoop<'a> {
+impl<'a, G: EmissionGuarantee> Diagnostic<'_, G> for BreakNonLoop<'a> {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &DiagCtxt, level: Level) -> DiagnosticBuilder<'_, G> {
-        let mut diag = DiagnosticBuilder::new(dcx, level, fluent::passes_break_non_loop);
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+        let mut diag = Diag::new(dcx, level, fluent::passes_break_non_loop);
         diag.span(self.span);
         diag.code(E0571);
         diag.arg("kind", self.kind);
@@ -1077,14 +1074,16 @@ pub struct BreakInsideClosure<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(passes_break_inside_async_block, code = E0267)]
-pub struct BreakInsideAsyncBlock<'a> {
+#[diag(passes_break_inside_coroutine, code = E0267)]
+pub struct BreakInsideCoroutine<'a> {
     #[primary_span]
     #[label]
     pub span: Span,
-    #[label(passes_async_block_label)]
-    pub closure_span: Span,
+    #[label(passes_coroutine_label)]
+    pub coroutine_span: Span,
     pub name: &'a str,
+    pub kind: &'a str,
+    pub source: &'a str,
 }
 
 #[derive(Diagnostic)]
@@ -1092,7 +1091,7 @@ pub struct BreakInsideAsyncBlock<'a> {
 pub struct OutsideLoop<'a> {
     #[primary_span]
     #[label]
-    pub span: Span,
+    pub spans: Vec<Span>,
     pub name: &'a str,
     pub is_break: bool,
     #[subdiagnostic]
@@ -1104,7 +1103,7 @@ pub struct OutsideLoopSuggestion {
     #[suggestion_part(code = "'block: ")]
     pub block_span: Span,
     #[suggestion_part(code = " 'block")]
-    pub break_span: Span,
+    pub break_spans: Vec<Span>,
 }
 
 #[derive(Diagnostic)]
@@ -1157,10 +1156,10 @@ pub struct NakedFunctionsAsmBlock {
     pub non_asms: Vec<Span>,
 }
 
-impl<G: EmissionGuarantee> IntoDiagnostic<'_, G> for NakedFunctionsAsmBlock {
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for NakedFunctionsAsmBlock {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &DiagCtxt, level: Level) -> DiagnosticBuilder<'_, G> {
-        let mut diag = DiagnosticBuilder::new(dcx, level, fluent::passes_naked_functions_asm_block);
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+        let mut diag = Diag::new(dcx, level, fluent::passes_naked_functions_asm_block);
         diag.span(self.span);
         diag.code(E0787);
         for span in self.multiple_asms.iter() {
@@ -1195,22 +1194,6 @@ pub struct NakedFunctionsMustUseNoreturn {
     pub span: Span,
     #[suggestion(code = ", options(noreturn)", applicability = "machine-applicable")]
     pub last_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(passes_attr_only_on_main)]
-pub struct AttrOnlyOnMain {
-    #[primary_span]
-    pub span: Span,
-    pub attr: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag(passes_attr_only_on_root_main)]
-pub struct AttrOnlyOnRootMain {
-    #[primary_span]
-    pub span: Span,
-    pub attr: Symbol,
 }
 
 #[derive(Diagnostic)]
@@ -1250,13 +1233,6 @@ pub struct ExternMain {
     pub span: Span,
 }
 
-#[derive(Diagnostic)]
-#[diag(passes_unix_sigpipe_values)]
-pub struct UnixSigpipeValues {
-    #[primary_span]
-    pub span: Span,
-}
-
 pub struct NoMainErr {
     pub sp: Span,
     pub crate_name: Symbol,
@@ -1268,10 +1244,10 @@ pub struct NoMainErr {
     pub add_teach_note: bool,
 }
 
-impl<'a, G: EmissionGuarantee> IntoDiagnostic<'a, G> for NoMainErr {
+impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for NoMainErr {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &'a DiagCtxt, level: Level) -> DiagnosticBuilder<'a, G> {
-        let mut diag = DiagnosticBuilder::new(dcx, level, fluent::passes_no_main_function);
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, G> {
+        let mut diag = Diag::new(dcx, level, fluent::passes_no_main_function);
         diag.span(DUMMY_SP);
         diag.code(E0601);
         diag.arg("crate_name", self.crate_name);
@@ -1326,10 +1302,10 @@ pub struct DuplicateLangItem {
     pub(crate) duplicate: Duplicate,
 }
 
-impl<G: EmissionGuarantee> IntoDiagnostic<'_, G> for DuplicateLangItem {
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for DuplicateLangItem {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &DiagCtxt, level: Level) -> DiagnosticBuilder<'_, G> {
-        let mut diag = DiagnosticBuilder::new(
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+        let mut diag = Diag::new(
             dcx,
             level,
             match self.duplicate {
@@ -1517,14 +1493,6 @@ pub struct TraitImplConstStable {
 }
 
 #[derive(Diagnostic)]
-#[diag(passes_feature_only_on_nightly, code = E0554)]
-pub struct FeatureOnlyOnNightly {
-    #[primary_span]
-    pub span: Span,
-    pub release_channel: &'static str,
-}
-
-#[derive(Diagnostic)]
 #[diag(passes_unknown_feature, code = E0635)]
 pub struct UnknownFeature {
     #[primary_span]
@@ -1566,7 +1534,7 @@ pub enum MultipleDeadCodes<'tcx> {
         num: usize,
         descr: &'tcx str,
         participle: &'tcx str,
-        name_list: DiagnosticSymbolList,
+        name_list: DiagSymbolList,
         #[subdiagnostic]
         parent_info: Option<ParentInfo<'tcx>>,
         #[subdiagnostic]
@@ -1578,9 +1546,9 @@ pub enum MultipleDeadCodes<'tcx> {
         num: usize,
         descr: &'tcx str,
         participle: &'tcx str,
-        name_list: DiagnosticSymbolList,
+        name_list: DiagSymbolList,
         #[subdiagnostic]
-        change_fields_suggestion: ChangeFieldsToBeOfUnitType,
+        change_fields_suggestion: ChangeFields,
         #[subdiagnostic]
         parent_info: Option<ParentInfo<'tcx>>,
         #[subdiagnostic]
@@ -1602,16 +1570,23 @@ pub struct ParentInfo<'tcx> {
 #[note(passes_ignored_derived_impls)]
 pub struct IgnoredDerivedImpls {
     pub name: Symbol,
-    pub trait_list: DiagnosticSymbolList,
+    pub trait_list: DiagSymbolList,
     pub trait_list_len: usize,
 }
 
 #[derive(Subdiagnostic)]
-#[multipart_suggestion(passes_change_fields_to_be_of_unit_type, applicability = "has-placeholders")]
-pub struct ChangeFieldsToBeOfUnitType {
-    pub num: usize,
-    #[suggestion_part(code = "()")]
-    pub spans: Vec<Span>,
+pub enum ChangeFields {
+    #[multipart_suggestion(
+        passes_change_fields_to_be_of_unit_type,
+        applicability = "has-placeholders"
+    )]
+    ChangeToUnitTypeOrRemove {
+        num: usize,
+        #[suggestion_part(code = "()")]
+        spans: Vec<Span>,
+    },
+    #[help(passes_remove_fields)]
+    Remove { num: usize },
 }
 
 #[derive(Diagnostic)]
@@ -1752,11 +1727,11 @@ pub struct UnusedVariableStringInterp {
     pub hi: Span,
 }
 
-impl AddToDiagnostic for UnusedVariableStringInterp {
-    fn add_to_diagnostic_with<G: EmissionGuarantee, F: SubdiagnosticMessageOp<G>>(
+impl Subdiagnostic for UnusedVariableStringInterp {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
         self,
-        diag: &mut DiagnosticBuilder<'_, G>,
-        _f: F,
+        diag: &mut Diag<'_, G>,
+        _f: &F,
     ) {
         diag.span_label(self.lit, crate::fluent_generated::passes_maybe_string_interpolation);
         diag.multipart_suggestion(

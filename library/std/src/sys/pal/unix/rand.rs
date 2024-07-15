@@ -12,10 +12,6 @@ pub fn hashmap_random_keys() -> (u64, u64) {
 
 #[cfg(all(
     unix,
-    not(target_os = "macos"),
-    not(target_os = "ios"),
-    not(target_os = "tvos"),
-    not(target_os = "watchos"),
     not(target_os = "openbsd"),
     not(target_os = "netbsd"),
     not(target_os = "fuchsia"),
@@ -23,6 +19,7 @@ pub fn hashmap_random_keys() -> (u64, u64) {
     not(target_os = "vxworks"),
     not(target_os = "emscripten"),
     not(target_os = "vita"),
+    not(target_vendor = "apple"),
 ))]
 mod imp {
     use crate::fs::File;
@@ -62,9 +59,28 @@ mod imp {
         unsafe { getrandom(buf.as_mut_ptr().cast(), buf.len(), libc::GRND_NONBLOCK) }
     }
 
-    #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "freebsd", netbsd10))]
+    #[cfg(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "freebsd",
+        netbsd10,
+        target_os = "illumos",
+        target_os = "solaris"
+    ))]
     fn getrandom(buf: &mut [u8]) -> libc::ssize_t {
         unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) }
+    }
+
+    #[cfg(target_os = "dragonfly")]
+    fn getrandom(buf: &mut [u8]) -> libc::ssize_t {
+        extern "C" {
+            fn getrandom(
+                buf: *mut libc::c_void,
+                buflen: libc::size_t,
+                flags: libc::c_uint,
+            ) -> libc::ssize_t;
+        }
+        unsafe { getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) }
     }
 
     #[cfg(not(any(
@@ -73,6 +89,9 @@ mod imp {
         target_os = "espidf",
         target_os = "horizon",
         target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "solaris",
+        target_os = "illumos",
         netbsd10
     )))]
     fn getrandom_fill_bytes(_buf: &mut [u8]) -> bool {
@@ -85,6 +104,9 @@ mod imp {
         target_os = "espidf",
         target_os = "horizon",
         target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "solaris",
+        target_os = "illumos",
         netbsd10
     ))]
     fn getrandom_fill_bytes(v: &mut [u8]) -> bool {

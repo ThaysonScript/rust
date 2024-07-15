@@ -9,6 +9,12 @@ pub fn target() -> Target {
 
     Target {
         llvm_target: "powerpc-unknown-linux-gnu".into(),
+        metadata: crate::spec::TargetMetadata {
+            description: Some("PowerPC Linux (kernel 3.2, glibc 2.17)".into()),
+            tier: Some(2),
+            host_tools: Some(true),
+            std: Some(true),
+        },
         pointer_width: 32,
         data_layout: "E-m:e-p:32:32-Fn32-i64:64-n32".into(),
         arch: "powerpc".into(),

@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::borrow_tracker::tree_borrows::diagnostics::TransitionError;
 use crate::borrow_tracker::tree_borrows::tree::AccessRelatedness;
-use crate::borrow_tracker::AccessKind;
+use crate::AccessKind;
 
 /// The activation states of a pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -17,6 +17,7 @@ enum PermissionPriv {
     /// is relevant
     /// - `conflicted` is set on foreign reads,
     /// - `conflicted` must not be set on child writes (there is UB otherwise).
+    ///
     /// This is so that the behavior of `Reserved` adheres to the rules of `noalias`:
     /// - foreign-read then child-write is UB due to `conflicted`,
     /// - child-write then foreign-read is UB since child-write will activate and then
@@ -181,8 +182,16 @@ impl Permission {
     pub fn is_initial(&self) -> bool {
         self.inner.is_initial()
     }
+    /// Check if `self` is the terminal state of a pointer (is `Disabled`).
+    pub fn is_disabled(&self) -> bool {
+        self.inner == Disabled
+    }
+    /// Check if `self` is the post-child-write state of a pointer (is `Active`).
+    pub fn is_active(&self) -> bool {
+        self.inner == Active
+    }
 
-    /// Default initial permission of the root of a new tree.
+    /// Default initial permission of the root of a new tree at inbounds positions.
     /// Must *only* be used for the root, this is not in general an "initial" permission!
     pub fn new_active() -> Self {
         Self { inner: Active }
@@ -193,9 +202,15 @@ impl Permission {
         Self { inner: Reserved { ty_is_freeze, conflicted: false } }
     }
 
-    /// Default initial permission of a reborrowed shared reference
+    /// Default initial permission of a reborrowed shared reference.
     pub fn new_frozen() -> Self {
         Self { inner: Frozen }
+    }
+
+    /// Default initial permission of  the root of a new tree at out-of-bounds positions.
+    /// Must *only* be used for the root, this is not in general an "initial" permission!
+    pub fn new_disabled() -> Self {
+        Self { inner: Disabled }
     }
 
     /// Apply the transition to the inner PermissionPriv.
@@ -329,15 +344,15 @@ pub mod diagnostics {
         /// This function assumes that its arguments apply to the same location
         /// and that they were obtained during a normal execution. It will panic otherwise.
         /// - all transitions involved in `self` and `err` should be increasing
-        /// (Reserved < Active < Frozen < Disabled);
+        ///   (Reserved < Active < Frozen < Disabled);
         /// - between `self` and `err` the permission should also be increasing,
-        /// so all permissions inside `err` should be greater than `self.1`;
+        ///   so all permissions inside `err` should be greater than `self.1`;
         /// - `Active` and `Reserved(conflicted=false)` cannot cause an error
-        /// due to insufficient permissions, so `err` cannot be a `ChildAccessForbidden(_)`
-        /// of either of them;
+        ///   due to insufficient permissions, so `err` cannot be a `ChildAccessForbidden(_)`
+        ///   of either of them;
         /// - `err` should not be `ProtectedDisabled(Disabled)`, because the protected
-        /// tag should not have been `Disabled` in the first place (if this occurs it means
-        /// we have unprotected tags that become protected)
+        ///   tag should not have been `Disabled` in the first place (if this occurs it means
+        ///   we have unprotected tags that become protected)
         pub(in super::super) fn is_relevant(&self, err: TransitionError) -> bool {
             // NOTE: `super::super` is the visibility of `TransitionError`
             assert!(self.is_possible());

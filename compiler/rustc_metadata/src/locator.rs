@@ -220,9 +220,8 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::owned_slice::slice_owned;
 use rustc_data_structures::svh::Svh;
-use rustc_errors::{DiagnosticArgValue, IntoDiagnosticArg};
+use rustc_errors::{DiagArgValue, IntoDiagArg};
 use rustc_fs_util::try_canonicalize;
-use rustc_session::config;
 use rustc_session::cstore::CrateSource;
 use rustc_session::filesearch::FileSearch;
 use rustc_session::search_paths::PathKind;
@@ -231,6 +230,7 @@ use rustc_session::Session;
 use rustc_span::symbol::Symbol;
 use rustc_span::Span;
 use rustc_target::spec::{Target, TargetTriple};
+use tracing::{debug, info};
 
 use snap::read::FrameDecoder;
 use std::borrow::Cow;
@@ -290,12 +290,12 @@ impl fmt::Display for CrateFlavor {
     }
 }
 
-impl IntoDiagnosticArg for CrateFlavor {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
+impl IntoDiagArg for CrateFlavor {
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
         match self {
-            CrateFlavor::Rlib => DiagnosticArgValue::Str(Cow::Borrowed("rlib")),
-            CrateFlavor::Rmeta => DiagnosticArgValue::Str(Cow::Borrowed("rmeta")),
-            CrateFlavor::Dylib => DiagnosticArgValue::Str(Cow::Borrowed("dylib")),
+            CrateFlavor::Rlib => DiagArgValue::Str(Cow::Borrowed("rlib")),
+            CrateFlavor::Rmeta => DiagArgValue::Str(Cow::Borrowed("rmeta")),
+            CrateFlavor::Dylib => DiagArgValue::Str(Cow::Borrowed("dylib")),
         }
     }
 }
@@ -308,7 +308,6 @@ impl<'a> CrateLocator<'a> {
         is_rlib: bool,
         hash: Option<Svh>,
         extra_filename: Option<&'a str>,
-        is_host: bool,
         path_kind: PathKind,
     ) -> CrateLocator<'a> {
         let needs_object_code = sess.opts.output_types.should_codegen();
@@ -339,17 +338,9 @@ impl<'a> CrateLocator<'a> {
             },
             hash,
             extra_filename,
-            target: if is_host { &sess.host } else { &sess.target },
-            triple: if is_host {
-                TargetTriple::from_triple(config::host_triple())
-            } else {
-                sess.opts.target_triple.clone()
-            },
-            filesearch: if is_host {
-                sess.host_filesearch(path_kind)
-            } else {
-                sess.target_filesearch(path_kind)
-            },
+            target: &sess.target,
+            triple: sess.opts.target_triple.clone(),
+            filesearch: sess.target_filesearch(path_kind),
             is_proc_macro: false,
             crate_rejections: CrateRejections::default(),
         }
@@ -423,12 +414,18 @@ impl<'a> CrateLocator<'a> {
                 debug!("testing {}", spf.path.display());
 
                 let f = &spf.file_name_str;
-                let (hash, kind) = if f.starts_with(rlib_prefix) && f.ends_with(rlib_suffix) {
-                    (&f[rlib_prefix.len()..(f.len() - rlib_suffix.len())], CrateFlavor::Rlib)
-                } else if f.starts_with(rmeta_prefix) && f.ends_with(rmeta_suffix) {
-                    (&f[rmeta_prefix.len()..(f.len() - rmeta_suffix.len())], CrateFlavor::Rmeta)
-                } else if f.starts_with(dylib_prefix) && f.ends_with(dylib_suffix.as_ref()) {
-                    (&f[dylib_prefix.len()..(f.len() - dylib_suffix.len())], CrateFlavor::Dylib)
+                let (hash, kind) = if let Some(f) = f.strip_prefix(rlib_prefix)
+                    && let Some(f) = f.strip_suffix(rlib_suffix)
+                {
+                    (f, CrateFlavor::Rlib)
+                } else if let Some(f) = f.strip_prefix(rmeta_prefix)
+                    && let Some(f) = f.strip_suffix(rmeta_suffix)
+                {
+                    (f, CrateFlavor::Rmeta)
+                } else if let Some(f) = f.strip_prefix(dylib_prefix)
+                    && let Some(f) = f.strip_suffix(dylib_suffix.as_ref())
+                {
+                    (f, CrateFlavor::Dylib)
                 } else {
                     if f.starts_with(staticlib_prefix) && f.ends_with(staticlib_suffix.as_ref()) {
                         self.crate_rejections.via_kind.push(CrateMismatch {
@@ -569,31 +566,47 @@ impl<'a> CrateLocator<'a> {
                 debug!("skipping empty file");
                 continue;
             }
-            let (hash, metadata) =
-                match get_metadata_section(self.target, flavor, &lib, self.metadata_loader) {
-                    Ok(blob) => {
-                        if let Some(h) = self.crate_matches(&blob, &lib) {
-                            (h, blob)
-                        } else {
-                            info!("metadata mismatch");
-                            continue;
-                        }
-                    }
-                    Err(MetadataError::LoadFailure(err)) => {
-                        info!("no metadata found: {}", err);
-                        // The file was present and created by the same compiler version, but we
-                        // couldn't load it for some reason. Give a hard error instead of silently
-                        // ignoring it, but only if we would have given an error anyway.
-                        self.crate_rejections
-                            .via_invalid
-                            .push(CrateMismatch { path: lib, got: err });
+            let (hash, metadata) = match get_metadata_section(
+                self.target,
+                flavor,
+                &lib,
+                self.metadata_loader,
+                self.cfg_version,
+            ) {
+                Ok(blob) => {
+                    if let Some(h) = self.crate_matches(&blob, &lib) {
+                        (h, blob)
+                    } else {
+                        info!("metadata mismatch");
                         continue;
                     }
-                    Err(err @ MetadataError::NotPresent(_)) => {
-                        info!("no metadata found: {}", err);
-                        continue;
-                    }
-                };
+                }
+                Err(MetadataError::VersionMismatch { expected_version, found_version }) => {
+                    // The file was present and created by the same compiler version, but we
+                    // couldn't load it for some reason. Give a hard error instead of silently
+                    // ignoring it, but only if we would have given an error anyway.
+                    info!(
+                        "Rejecting via version: expected {} got {}",
+                        expected_version, found_version
+                    );
+                    self.crate_rejections
+                        .via_version
+                        .push(CrateMismatch { path: lib, got: found_version });
+                    continue;
+                }
+                Err(MetadataError::LoadFailure(err)) => {
+                    info!("no metadata found: {}", err);
+                    // The file was present and created by the same compiler version, but we
+                    // couldn't load it for some reason. Give a hard error instead of silently
+                    // ignoring it, but only if we would have given an error anyway.
+                    self.crate_rejections.via_invalid.push(CrateMismatch { path: lib, got: err });
+                    continue;
+                }
+                Err(err @ MetadataError::NotPresent(_)) => {
+                    info!("no metadata found: {}", err);
+                    continue;
+                }
+            };
             // If we see multiple hashes, emit an error about duplicate candidates.
             if slot.as_ref().is_some_and(|s| s.0 != hash) {
                 if let Some(candidates) = err_data {
@@ -648,16 +661,6 @@ impl<'a> CrateLocator<'a> {
     }
 
     fn crate_matches(&mut self, metadata: &MetadataBlob, libpath: &Path) -> Option<Svh> {
-        let rustc_version = rustc_version(self.cfg_version);
-        let found_version = metadata.get_rustc_version();
-        if found_version != rustc_version {
-            info!("Rejecting via version: expected {} got {}", rustc_version, found_version);
-            self.crate_rejections
-                .via_version
-                .push(CrateMismatch { path: libpath.to_path_buf(), got: found_version });
-            return None;
-        }
-
         let header = metadata.get_header();
         if header.is_proc_macro_crate != self.is_proc_macro {
             info!(
@@ -770,6 +773,7 @@ fn get_metadata_section<'p>(
     flavor: CrateFlavor,
     filename: &'p Path,
     loader: &dyn MetadataLoader,
+    cfg_version: &'static str,
 ) -> Result<MetadataBlob, MetadataError<'p>> {
     if !filename.exists() {
         return Err(MetadataError::NotPresent(filename));
@@ -846,14 +850,24 @@ fn get_metadata_section<'p>(
             slice_owned(mmap, Deref::deref)
         }
     };
-    let blob = MetadataBlob(raw_bytes);
-    if blob.is_compatible() {
-        Ok(blob)
-    } else {
-        Err(MetadataError::LoadFailure(format!(
+    let Ok(blob) = MetadataBlob::new(raw_bytes) else {
+        return Err(MetadataError::LoadFailure(format!(
+            "corrupt metadata encountered in {}",
+            filename.display()
+        )));
+    };
+    match blob.check_compatibility(cfg_version) {
+        Ok(()) => Ok(blob),
+        Err(None) => Err(MetadataError::LoadFailure(format!(
             "invalid metadata version found: {}",
             filename.display()
-        )))
+        ))),
+        Err(Some(found_version)) => {
+            return Err(MetadataError::VersionMismatch {
+                expected_version: rustc_version(cfg_version),
+                found_version,
+            });
+        }
     }
 }
 
@@ -864,9 +878,10 @@ pub fn list_file_metadata(
     metadata_loader: &dyn MetadataLoader,
     out: &mut dyn Write,
     ls_kinds: &[String],
+    cfg_version: &'static str,
 ) -> IoResult<()> {
     let flavor = get_flavor_from_path(path);
-    match get_metadata_section(target, flavor, path, metadata_loader) {
+    match get_metadata_section(target, flavor, path, metadata_loader, cfg_version) {
         Ok(metadata) => metadata.list_crate_metadata(out, ls_kinds),
         Err(msg) => write!(out, "{msg}\n"),
     }
@@ -932,6 +947,8 @@ enum MetadataError<'a> {
     NotPresent(&'a Path),
     /// The file was present and invalid.
     LoadFailure(String),
+    /// The file was present, but compiled with a different rustc version.
+    VersionMismatch { expected_version: String, found_version: String },
 }
 
 impl fmt::Display for MetadataError<'_> {
@@ -941,6 +958,12 @@ impl fmt::Display for MetadataError<'_> {
                 f.write_str(&format!("no such file: '{}'", filename.display()))
             }
             MetadataError::LoadFailure(msg) => f.write_str(msg),
+            MetadataError::VersionMismatch { expected_version, found_version } => {
+                f.write_str(&format!(
+                    "rustc version mismatch. expected {}, found {}",
+                    expected_version, found_version,
+                ))
+            }
         }
     }
 }
@@ -1077,7 +1100,7 @@ impl CrateError {
                         crate_rejections,
                     });
                 } else {
-                    dcx.emit_err(errors::CannotFindCrate {
+                    let error = errors::CannotFindCrate {
                         span,
                         crate_name,
                         add_info,
@@ -1091,11 +1114,18 @@ impl CrateError {
                         profiler_runtime: Symbol::intern(&sess.opts.unstable_opts.profiler_runtime),
                         locator_triple: locator.triple,
                         is_ui_testing: sess.opts.unstable_opts.ui_testing,
-                    });
+                    };
+                    // The diagnostic for missing core is very good, but it is followed by a lot of
+                    // other diagnostics that do not add information.
+                    if missing_core {
+                        dcx.emit_fatal(error);
+                    } else {
+                        dcx.emit_err(error);
+                    }
                 }
             }
             CrateError::NotFound(crate_name) => {
-                dcx.emit_err(errors::CannotFindCrate {
+                let error = errors::CannotFindCrate {
                     span,
                     crate_name,
                     add_info: String::new(),
@@ -1105,7 +1135,14 @@ impl CrateError {
                     profiler_runtime: Symbol::intern(&sess.opts.unstable_opts.profiler_runtime),
                     locator_triple: sess.opts.target_triple.clone(),
                     is_ui_testing: sess.opts.unstable_opts.ui_testing,
-                });
+                };
+                // The diagnostic for missing core is very good, but it is followed by a lot of
+                // other diagnostics that do not add information.
+                if missing_core {
+                    dcx.emit_fatal(error);
+                } else {
+                    dcx.emit_err(error);
+                }
             }
         }
     }

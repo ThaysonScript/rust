@@ -231,7 +231,7 @@ mod tests {
 
     const DUMMY: tt::Span = tt::Span {
         range: TextRange::empty(TextSize::new(0)),
-        anchor: SpanAnchor { file_id: FileId::BOGUS, ast_id: ROOT_ERASED_FILE_AST_ID },
+        anchor: SpanAnchor { file_id: FileId::from_raw(0xe4e4e), ast_id: ROOT_ERASED_FILE_AST_ID },
         ctx: SyntaxContextId::ROOT,
     };
 
@@ -266,10 +266,11 @@ mod tests {
 
         let quoted = quote!(DUMMY =>#a);
         assert_eq!(quoted.to_string(), "hello");
-        let t = format!("{quoted:?}");
+        let t = format!("{quoted:#?}");
         expect![[r#"
-            SUBTREE $$ SpanData { range: 0..0, anchor: SpanAnchor(FileId(937550), 0), ctx: SyntaxContextId(0) } SpanData { range: 0..0, anchor: SpanAnchor(FileId(937550), 0), ctx: SyntaxContextId(0) }
-              IDENT   hello SpanData { range: 0..0, anchor: SpanAnchor(FileId(937550), 0), ctx: SyntaxContextId(0) }"#]].assert_eq(&t);
+            SUBTREE $$ 937550:0@0..0#0 937550:0@0..0#0
+              IDENT   hello 937550:0@0..0#0"#]]
+        .assert_eq(&t);
     }
 
     #[test]

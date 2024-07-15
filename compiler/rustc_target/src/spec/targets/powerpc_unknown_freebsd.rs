@@ -13,6 +13,12 @@ pub fn target() -> Target {
 
     Target {
         llvm_target: "powerpc-unknown-freebsd13.0".into(),
+        metadata: crate::spec::TargetMetadata {
+            description: Some("PowerPC FreeBSD".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(false),
+        },
         pointer_width: 32,
         data_layout: "E-m:e-p:32:32-Fn32-i64:64-n32".into(),
         arch: "powerpc".into(),

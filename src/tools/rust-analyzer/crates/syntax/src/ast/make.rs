@@ -11,7 +11,7 @@
 //! term, it will be replaced with direct tree manipulation.
 
 use itertools::Itertools;
-use parser::T;
+use parser::{Edition, T};
 use rowan::NodeOrToken;
 use stdx::{format_to, format_to_acc, never};
 
@@ -172,7 +172,7 @@ pub fn ty_alias(
     assignment: Option<(ast::Type, Option<ast::WhereClause>)>,
 ) -> ast::TypeAlias {
     let mut s = String::new();
-    s.push_str(&format!("type {}", ident));
+    s.push_str(&format!("type {ident}"));
 
     if let Some(list) = generic_param_list {
         s.push_str(&list.to_string());
@@ -297,7 +297,7 @@ pub fn impl_trait(
         };
 
     let where_clause = merge_where_clause(ty_where_clause, trait_where_clause)
-        .map_or_else(|| " ".to_owned(), |wc| format!("\n{}\n", wc));
+        .map_or_else(|| " ".to_owned(), |wc| format!("\n{wc}\n"));
 
     let body = match body {
         Some(bd) => bd.iter().map(|elem| elem.to_string()).join(""),
@@ -656,6 +656,10 @@ pub fn wildcard_pat() -> ast::WildcardPat {
     }
 }
 
+pub fn rest_pat() -> ast::RestPat {
+    ast_from_text("fn f(..)")
+}
+
 pub fn literal_pat(lit: &str) -> ast::LiteralPat {
     return from_text(lit);
 
@@ -716,8 +720,15 @@ pub fn record_pat_with_fields(path: ast::Path, fields: ast::RecordPatFieldList) 
 
 pub fn record_pat_field_list(
     fields: impl IntoIterator<Item = ast::RecordPatField>,
+    rest_pat: Option<ast::RestPat>,
 ) -> ast::RecordPatFieldList {
-    let fields = fields.into_iter().join(", ");
+    let mut fields = fields.into_iter().join(", ");
+    if let Some(rest_pat) = rest_pat {
+        if !fields.is_empty() {
+            fields.push_str(", ");
+        }
+        format_to!(fields, "{rest_pat}");
+    }
     ast_from_text(&format!("fn f(S {{ {fields} }}: ()))"))
 }
 
@@ -1116,7 +1127,7 @@ pub fn token_tree(
 
 #[track_caller]
 fn ast_from_text<N: AstNode>(text: &str) -> N {
-    let parse = SourceFile::parse(text);
+    let parse = SourceFile::parse(text, Edition::CURRENT);
     let node = match parse.tree().syntax().descendants().find_map(N::cast) {
         Some(it) => it,
         None => {
@@ -1142,12 +1153,13 @@ pub fn token(kind: SyntaxKind) -> SyntaxToken {
 
 pub mod tokens {
     use once_cell::sync::Lazy;
+    use parser::Edition;
 
     use crate::{ast, AstNode, Parse, SourceFile, SyntaxKind::*, SyntaxToken};
 
     pub(super) static SOURCE_FILE: Lazy<Parse<SourceFile>> = Lazy::new(|| {
         SourceFile::parse(
-            "const C: <()>::Item = ( true && true , true || true , 1 != 1, 2 == 2, 3 < 3, 4 <= 4, 5 > 5, 6 >= 6, !true, *p, &p , &mut p, { let a @ [] })\n;\n\nimpl A for B where: {}",
+            "const C: <()>::Item = ( true && true , true || true , 1 != 1, 2 == 2, 3 < 3, 4 <= 4, 5 > 5, 6 >= 6, !true, *p, &p , &mut p, { let _ @ [] })\n;\n\nimpl A for B where: {}", Edition::CURRENT,
         )
     });
 
@@ -1175,13 +1187,13 @@ pub mod tokens {
 
     pub fn whitespace(text: &str) -> SyntaxToken {
         assert!(text.trim().is_empty());
-        let sf = SourceFile::parse(text).ok().unwrap();
+        let sf = SourceFile::parse(text, Edition::CURRENT).ok().unwrap();
         sf.syntax().clone_for_update().first_child_or_token().unwrap().into_token().unwrap()
     }
 
     pub fn doc_comment(text: &str) -> SyntaxToken {
         assert!(!text.trim().is_empty());
-        let sf = SourceFile::parse(text).ok().unwrap();
+        let sf = SourceFile::parse(text, Edition::CURRENT).ok().unwrap();
         sf.syntax().first_child_or_token().unwrap().into_token().unwrap()
     }
 
@@ -1229,7 +1241,7 @@ pub mod tokens {
 
     impl WsBuilder {
         pub fn new(text: &str) -> WsBuilder {
-            WsBuilder(SourceFile::parse(text).ok().unwrap())
+            WsBuilder(SourceFile::parse(text, Edition::CURRENT).ok().unwrap())
         }
         pub fn ws(&self) -> SyntaxToken {
             self.0.syntax().first_child_or_token().unwrap().into_token().unwrap()

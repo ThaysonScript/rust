@@ -40,10 +40,7 @@ fn test_named_thread() {
 #[cfg(any(
     // Note: musl didn't add pthread_getname_np until 1.2.3
     all(target_os = "linux", target_env = "gnu"),
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "watchos"
+    target_vendor = "apple",
 ))]
 #[test]
 fn test_named_thread_truncation() {
@@ -403,4 +400,17 @@ fn scope_join_race() {
             }
         });
     }
+}
+
+// Test that the smallest value for stack_size works on Windows.
+#[cfg(windows)]
+#[test]
+fn test_minimal_thread_stack() {
+    use crate::sync::atomic::AtomicU8;
+    static COUNT: AtomicU8 = AtomicU8::new(0);
+
+    let builder = thread::Builder::new().stack_size(1);
+    let before = builder.spawn(|| COUNT.fetch_add(1, Ordering::Relaxed)).unwrap().join().unwrap();
+    assert_eq!(before, 0);
+    assert_eq!(COUNT.load(Ordering::Relaxed), 1);
 }

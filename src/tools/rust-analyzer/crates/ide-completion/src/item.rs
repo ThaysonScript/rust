@@ -342,7 +342,6 @@ pub enum CompletionItemKind {
     BuiltinType,
     InferredType,
     Keyword,
-    Method,
     Snippet,
     UnresolvedReference,
     Expression,
@@ -369,6 +368,8 @@ impl CompletionItemKind {
                 SymbolKind::LifetimeParam => "lt",
                 SymbolKind::Local => "lc",
                 SymbolKind::Macro => "ma",
+                SymbolKind::Method => "me",
+                SymbolKind::ProcMacro => "pm",
                 SymbolKind::Module => "md",
                 SymbolKind::SelfParam => "sp",
                 SymbolKind::SelfType => "sy",
@@ -387,7 +388,6 @@ impl CompletionItemKind {
             CompletionItemKind::BuiltinType => "bt",
             CompletionItemKind::InferredType => "it",
             CompletionItemKind::Keyword => "kw",
-            CompletionItemKind::Method => "me",
             CompletionItemKind::Snippet => "sn",
             CompletionItemKind::UnresolvedReference => "??",
             CompletionItemKind::Expression => "ex",
@@ -483,7 +483,7 @@ impl Builder {
     }
 
     pub(crate) fn build(self, db: &RootDatabase) -> CompletionItem {
-        let _p = tracing::span!(tracing::Level::INFO, "item::Builder::build").entered();
+        let _p = tracing::info_span!("item::Builder::build").entered();
 
         let label = self.label;
         let mut label_detail = None;

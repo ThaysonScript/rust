@@ -1,6 +1,11 @@
 //@no-rustfix
+//@aux-build:proc_macros.rs
+
 #![allow(clippy::never_loop)]
 #![warn(clippy::infinite_loop)]
+
+extern crate proc_macros;
+use proc_macros::{external, with_span};
 
 fn do_something() {}
 
@@ -132,7 +137,7 @@ fn can_break_both_inner_and_outer(cond: bool) {
 }
 
 fn break_wrong_loop(cond: bool) {
-    // 'inner has statement to break 'outer loop, but it was breaked early by a labeled child loop
+    // 'inner has statement to break 'outer loop, but it was broken out of early by a labeled child loop
     'outer: loop {
         loop {
             //~^ ERROR: infinite loop detected
@@ -361,6 +366,28 @@ fn inf_loop_in_res() -> Result<(), i32> {
     Ok(loop {
         do_something()
     })
+}
+
+with_span! { span
+    fn no_loop() {}
+}
+
+with_span! { span
+    fn with_loop() {
+        loop {
+            do_nothing();
+        }
+    }
+}
+
+fn do_nothing() {}
+
+fn span_inside_fn() {
+    with_span! { span
+        loop {
+            do_nothing();
+        }
+    }
 }
 
 fn main() {}

@@ -136,6 +136,7 @@ fn can_merge(class1: Option<Class>, class2: Option<Class>, text: &str) -> bool {
     match (class1, class2) {
         (Some(c1), Some(c2)) => c1.is_equal_to(c2),
         (Some(Class::Ident(_)), None) | (None, Some(Class::Ident(_))) => true,
+        (Some(Class::Macro(_)), _) => false,
         (Some(_), None) | (None, Some(_)) => text.trim().is_empty(),
         (None, None) => true,
     }
@@ -875,9 +876,10 @@ impl<'src> Classifier<'src> {
                 },
                 Some(c) => c,
             },
-            TokenKind::RawIdent | TokenKind::UnknownPrefix | TokenKind::InvalidIdent => {
-                Class::Ident(self.new_span(before, text))
-            }
+            TokenKind::RawIdent
+            | TokenKind::UnknownPrefix
+            | TokenKind::InvalidPrefix
+            | TokenKind::InvalidIdent => Class::Ident(self.new_span(before, text)),
             TokenKind::Lifetime { .. } => Class::Lifetime,
             TokenKind::Eof => panic!("Eof in advance"),
         };

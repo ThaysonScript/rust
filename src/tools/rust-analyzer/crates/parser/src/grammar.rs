@@ -13,7 +13,7 @@
 //! Code in this module also contains inline tests, which start with
 //! `// test name-of-the-test` comment and look like this:
 //!
-//! ```
+//! ```text
 //! // test function_with_zero_parameters
 //! // fn foo() {}
 //! ```
@@ -244,7 +244,7 @@ impl BlockLike {
     }
 }
 
-const VISIBILITY_FIRST: TokenSet = TokenSet::new(&[T![pub], T![crate]]);
+const VISIBILITY_FIRST: TokenSet = TokenSet::new(&[T![pub]]);
 
 fn opt_visibility(p: &mut Parser<'_>, in_tuple_field: bool) -> bool {
     if !p.at(T![pub]) {
@@ -416,14 +416,12 @@ fn delimited(
         if !parser(p) {
             break;
         }
-        if !p.at(delim) {
+        if !p.eat(delim) {
             if p.at_ts(first_set) {
-                p.error(format!("expected {:?}", delim));
+                p.error(format!("expected {delim:?}"));
             } else {
                 break;
             }
-        } else {
-            p.bump(delim);
         }
     }
     p.expect(ket);

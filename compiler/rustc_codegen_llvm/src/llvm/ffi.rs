@@ -56,6 +56,7 @@ pub enum LLVMMachineType {
     AMD64 = 0x8664,
     I386 = 0x14c,
     ARM64 = 0xaa64,
+    ARM64EC = 0xa641,
     ARM = 0x01c0,
 }
 
@@ -199,6 +200,8 @@ pub enum AttributeKind {
     AllocAlign = 39,
     SanitizeSafeStack = 40,
     FnRetThunkExtern = 41,
+    Writable = 42,
+    DeadOnUnwind = 43,
 }
 
 /// LLVMIntPredicate
@@ -480,6 +483,9 @@ pub struct SanitizerOptions {
     pub sanitize_address: bool,
     pub sanitize_address_recover: bool,
     pub sanitize_cfi: bool,
+    pub sanitize_dataflow: bool,
+    pub sanitize_dataflow_abilist: *const *const c_char,
+    pub sanitize_dataflow_abilist_len: size_t,
     pub sanitize_kcfi: bool,
     pub sanitize_memory: bool,
     pub sanitize_memory_recover: bool,
@@ -858,8 +864,10 @@ extern "C" {
     pub fn LLVMGetIntTypeWidth(IntegerTy: &Type) -> c_uint;
 
     // Operations on real types
+    pub fn LLVMHalfTypeInContext(C: &Context) -> &Type;
     pub fn LLVMFloatTypeInContext(C: &Context) -> &Type;
     pub fn LLVMDoubleTypeInContext(C: &Context) -> &Type;
+    pub fn LLVMFP128TypeInContext(C: &Context) -> &Type;
 
     // Operations on function types
     pub fn LLVMFunctionType<'a>(
@@ -930,10 +938,16 @@ extern "C" {
     pub fn LLVMConstReal(RealTy: &Type, N: f64) -> &Value;
 
     // Operations on composite constants
-    pub fn LLVMConstStringInContext(
+    pub fn LLVMConstArray2<'a>(
+        ElementTy: &'a Type,
+        ConstantVals: *const &'a Value,
+        Length: u64,
+    ) -> &'a Value;
+    pub fn LLVMArrayType2(ElementType: &Type, ElementCount: u64) -> &Type;
+    pub fn LLVMConstStringInContext2(
         C: &Context,
         Str: *const c_char,
-        Length: c_uint,
+        Length: size_t,
         DontNullTerminate: Bool,
     ) -> &Value;
     pub fn LLVMConstStructInContext<'a>(
@@ -941,14 +955,6 @@ extern "C" {
         ConstantVals: *const &'a Value,
         Count: c_uint,
         Packed: Bool,
-    ) -> &'a Value;
-
-    // FIXME: replace with LLVMConstArray2 when bumped minimal version to llvm-17
-    // https://github.com/llvm/llvm-project/commit/35276f16e5a2cae0dfb49c0fbf874d4d2f177acc
-    pub fn LLVMConstArray<'a>(
-        ElementTy: &'a Type,
-        ConstantVals: *const &'a Value,
-        Length: c_uint,
     ) -> &'a Value;
     pub fn LLVMConstVector(ScalarConstantVals: *const &Value, Size: c_uint) -> &Value;
 
@@ -1301,13 +1307,6 @@ extern "C" {
         NumIndices: c_uint,
         Name: *const c_char,
     ) -> &'a Value;
-    pub fn LLVMBuildStructGEP2<'a>(
-        B: &Builder<'a>,
-        Ty: &'a Type,
-        Pointer: &'a Value,
-        Idx: c_uint,
-        Name: *const c_char,
-    ) -> &'a Value;
 
     // Casts
     pub fn LLVMBuildTrunc<'a>(
@@ -1522,7 +1521,7 @@ extern "C" {
 
 #[link(name = "llvm-wrapper", kind = "static")]
 extern "C" {
-    pub fn LLVMRustInstallFatalErrorHandler();
+    pub fn LLVMRustInstallErrorHandlers();
     pub fn LLVMRustDisableSystemDialogsOnCrash();
 
     // Create and destroy contexts.
@@ -1530,9 +1529,6 @@ extern "C" {
 
     /// See llvm::LLVMTypeKind::getTypeID.
     pub fn LLVMRustGetTypeKind(Ty: &Type) -> TypeKind;
-
-    // Operations on array, pointer, and vector types (sequence types)
-    pub fn LLVMRustArrayType(ElementType: &Type, ElementCount: u64) -> &Type;
 
     // Operations on all values
     pub fn LLVMRustGlobalAddMetadata<'a>(Val: &'a Value, KindID: c_uint, Metadata: &'a Metadata);
@@ -1617,12 +1613,30 @@ extern "C" {
         Name: *const c_char,
     ) -> &'a Value;
 
+    pub fn LLVMRustBuildCallBr<'a>(
+        B: &Builder<'a>,
+        Ty: &'a Type,
+        Fn: &'a Value,
+        DefaultDest: &'a BasicBlock,
+        IndirectDests: *const &'a BasicBlock,
+        NumIndirectDests: c_uint,
+        Args: *const &'a Value,
+        NumArgs: c_uint,
+        OpBundles: *const &OperandBundleDef<'a>,
+        NumOpBundles: c_uint,
+        Name: *const c_char,
+    ) -> &'a Value;
+
     pub fn LLVMRustSetFastMath(Instr: &Value);
     pub fn LLVMRustSetAlgebraicMath(Instr: &Value);
     pub fn LLVMRustSetAllowReassoc(Instr: &Value);
 
     // Miscellaneous instructions
     pub fn LLVMRustGetInstrProfIncrementIntrinsic(M: &Module) -> &Value;
+    pub fn LLVMRustGetInstrProfMCDCParametersIntrinsic(M: &Module) -> &Value;
+    pub fn LLVMRustGetInstrProfMCDCTVBitmapUpdateIntrinsic(M: &Module) -> &Value;
+    pub fn LLVMRustGetInstrProfMCDCCondBitmapIntrinsic(M: &Module) -> &Value;
+
     pub fn LLVMRustBuildCall<'a>(
         B: &Builder<'a>,
         Ty: &'a Type,
@@ -1793,12 +1807,21 @@ extern "C" {
     ///
     /// In order for Rust-C LTO to work, module flags must be compatible with Clang. What
     /// "compatible" means depends on the merge behaviors involved.
-    pub fn LLVMRustAddModuleFlag(
+    pub fn LLVMRustAddModuleFlagU32(
         M: &Module,
         merge_behavior: LLVMModFlagBehavior,
         name: *const c_char,
         value: u32,
     );
+
+    pub fn LLVMRustAddModuleFlagString(
+        M: &Module,
+        merge_behavior: LLVMModFlagBehavior,
+        name: *const c_char,
+        value: *const c_char,
+        value_len: size_t,
+    );
+
     pub fn LLVMRustHasModuleFlag(M: &Module, name: *const c_char, len: size_t) -> bool;
 
     pub fn LLVMRustDIBuilderCreate(M: &Module) -> &mut DIBuilder<'_>;
@@ -2034,7 +2057,7 @@ extern "C" {
         AddrOpsCount: c_uint,
         DL: &'a DILocation,
         InsertAtEnd: &'a BasicBlock,
-    ) -> &'a Value;
+    );
 
     pub fn LLVMRustDIBuilderCreateEnumerator<'a>(
         Builder: &DIBuilder<'a>,
@@ -2162,7 +2185,7 @@ extern "C" {
         UniqueSectionNames: bool,
         TrapUnreachable: bool,
         Singlethread: bool,
-        AsmComments: bool,
+        VerboseAsm: bool,
         EmitStackSizeSection: bool,
         RelaxELFRelocations: bool,
         UseInitArray: bool,
@@ -2256,7 +2279,7 @@ extern "C" {
     pub fn LLVMRustUnpackInlineAsmDiagnostic<'a>(
         DI: &'a DiagnosticInfo,
         level_out: &mut DiagnosticLevel,
-        cookie_out: &mut c_uint,
+        cookie_out: &mut u64,
         message_out: &mut Option<&'a Twine>,
     );
 
@@ -2286,6 +2309,7 @@ extern "C" {
         Members: *const &RustArchiveMember<'_>,
         WriteSymbtab: bool,
         Kind: ArchiveKind,
+        isEC: bool,
     ) -> LLVMRustResult;
     pub fn LLVMRustArchiveMemberNew<'a>(
         Filename: *const c_char,
@@ -2326,10 +2350,16 @@ extern "C" {
     #[allow(improper_ctypes)]
     pub fn LLVMRustModuleInstructionStats(M: &Module, Str: &RustString);
 
-    pub fn LLVMRustThinLTOBufferCreate(M: &Module, is_thin: bool) -> &'static mut ThinLTOBuffer;
+    pub fn LLVMRustThinLTOBufferCreate(
+        M: &Module,
+        is_thin: bool,
+        emit_summary: bool,
+    ) -> &'static mut ThinLTOBuffer;
     pub fn LLVMRustThinLTOBufferFree(M: &'static mut ThinLTOBuffer);
     pub fn LLVMRustThinLTOBufferPtr(M: &ThinLTOBuffer) -> *const c_char;
     pub fn LLVMRustThinLTOBufferLen(M: &ThinLTOBuffer) -> size_t;
+    pub fn LLVMRustThinLTOBufferThinLinkDataPtr(M: &ThinLTOBuffer) -> *const c_char;
+    pub fn LLVMRustThinLTOBufferThinLinkDataLen(M: &ThinLTOBuffer) -> size_t;
     pub fn LLVMRustCreateThinLTOData(
         Modules: *const ThinLTOModule,
         NumModules: c_uint,

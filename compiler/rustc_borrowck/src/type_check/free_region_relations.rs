@@ -11,8 +11,8 @@ use rustc_middle::traits::query::OutlivesBound;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::{self, RegionVid, Ty, TypeVisitableExt};
 use rustc_span::{ErrorGuaranteed, Span};
+use rustc_trait_selection::error_reporting::traits::TypeErrCtxtExt;
 use rustc_trait_selection::solve::deeply_normalize;
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
 use rustc_trait_selection::traits::query::type_op::{self, TypeOp};
 use std::rc::Rc;
 use type_op::TypeOpOutput;
@@ -164,6 +164,13 @@ impl UniversalRegionRelations<'_> {
         self.outlives.contains(fr1, fr2)
     }
 
+    /// Returns `true` if fr1 is known to equal fr2.
+    ///
+    /// This will only ever be true for universally quantified regions.
+    pub(crate) fn equal(&self, fr1: RegionVid, fr2: RegionVid) -> bool {
+        self.outlives.contains(fr1, fr2) && self.outlives.contains(fr2, fr1)
+    }
+
     /// Returns a vector of free regions `x` such that `fr1: x` is
     /// known to hold.
     pub(crate) fn regions_outlived_by(&self, fr1: RegionVid) -> Vec<RegionVid> {
@@ -311,17 +318,14 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
         // Add implied bounds from impl header.
         if matches!(tcx.def_kind(defining_ty_def_id), DefKind::AssocFn | DefKind::AssocConst) {
             for &(ty, _) in tcx.assumed_wf_types(tcx.local_parent(defining_ty_def_id)) {
-                let Ok(TypeOpOutput { output: norm_ty, constraints: c, .. }) = self
+                let result: Result<_, ErrorGuaranteed> = self
                     .param_env
                     .and(type_op::normalize::Normalize::new(ty))
-                    .fully_perform(self.infcx, span)
-                else {
-                    // Note: this path is currently not reached in any test, so
-                    // any example that triggers this would be worth minimizing
-                    // and converting into a test.
-                    tcx.dcx().span_delayed_bug(span, format!("failed to normalize {ty:?}"));
+                    .fully_perform(self.infcx, span);
+                let Ok(TypeOpOutput { output: norm_ty, constraints: c, .. }) = result else {
                     continue;
                 };
+
                 constraints.extend(c);
 
                 // We currently add implied bounds from the normalized ty only.

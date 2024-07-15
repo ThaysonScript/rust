@@ -1,12 +1,11 @@
 //! Name resolution façade.
-use std::{fmt, hash::BuildHasherDefault};
+use std::{fmt, iter, mem};
 
 use base_db::CrateId;
 use hir_expand::{
     name::{name, Name},
     MacroDefId,
 };
-use indexmap::IndexMap;
 use intern::Interned;
 use rustc_hash::FxHashSet;
 use smallvec::{smallvec, SmallVec};
@@ -24,12 +23,13 @@ use crate::{
     nameres::{DefMap, MacroSubNs},
     path::{ModPath, Path, PathKind},
     per_ns::PerNs,
+    type_ref::LifetimeRef,
     visibility::{RawVisibility, Visibility},
     AdtId, ConstId, ConstParamId, CrateRootModuleId, DefWithBodyId, EnumId, EnumVariantId,
-    ExternBlockId, ExternCrateId, FunctionId, GenericDefId, GenericParamId, HasModule, ImplId,
-    ItemContainerId, ItemTreeLoc, LifetimeParamId, LocalModuleId, Lookup, Macro2Id, MacroId,
-    MacroRulesId, ModuleDefId, ModuleId, ProcMacroId, StaticId, StructId, TraitAliasId, TraitId,
-    TypeAliasId, TypeOrConstParamId, TypeOwnerId, TypeParamId, UseId, VariantId,
+    ExternBlockId, ExternCrateId, FunctionId, FxIndexMap, GenericDefId, GenericParamId, HasModule,
+    ImplId, ItemContainerId, ItemTreeLoc, LifetimeParamId, LocalModuleId, Lookup, Macro2Id,
+    MacroId, MacroRulesId, ModuleDefId, ModuleId, ProcMacroId, StaticId, StructId, TraitAliasId,
+    TraitId, TypeAliasId, TypeOrConstParamId, TypeOwnerId, TypeParamId, UseId, VariantId,
 };
 
 #[derive(Debug, Clone)]
@@ -118,6 +118,12 @@ pub enum ValueNs {
     StructId(StructId),
     EnumVariantId(EnumVariantId),
     GenericParam(ConstParamId),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum LifetimeNs {
+    Static,
+    LifetimeParam(LifetimeParamId),
 }
 
 impl Resolver {
@@ -418,6 +424,19 @@ impl Resolver {
         self.resolve_path_as_macro(db, path, expected_macro_kind).map(|(it, _)| db.macro_def(it))
     }
 
+    pub fn resolve_lifetime(&self, lifetime: &LifetimeRef) -> Option<LifetimeNs> {
+        if lifetime.name == name::known::STATIC_LIFETIME {
+            return Some(LifetimeNs::Static);
+        }
+
+        self.scopes().find_map(|scope| match scope {
+            Scope::GenericParams { def, params } => {
+                params.find_lifetime_by_name(&lifetime.name, *def).map(LifetimeNs::LifetimeParam)
+            }
+            _ => None,
+        })
+    }
+
     /// Returns a set of names available in the current scope.
     ///
     /// Note that this is a somewhat fuzzy concept -- internally, the compiler
@@ -571,13 +590,13 @@ impl Resolver {
 
     pub fn where_predicates_in_scope(
         &self,
-    ) -> impl Iterator<Item = &crate::generics::WherePredicate> {
+    ) -> impl Iterator<Item = (&crate::generics::WherePredicate, &GenericDefId)> {
         self.scopes()
             .filter_map(|scope| match scope {
-                Scope::GenericParams { params, .. } => Some(params),
+                Scope::GenericParams { params, def } => Some((params, def)),
                 _ => None,
             })
-            .flat_map(|params| params.where_predicates.iter())
+            .flat_map(|(params, def)| params.where_predicates.iter().zip(iter::repeat(def)))
     }
 
     pub fn generic_def(&self) -> Option<GenericDefId> {
@@ -809,7 +828,7 @@ fn resolver_for_scope_(
     for scope in scope_chain.into_iter().rev() {
         if let Some(block) = scopes.block(scope) {
             let def_map = db.block_def_map(block);
-            r = r.push_block_scope(def_map, DefMap::ROOT);
+            r = r.push_block_scope(def_map);
             // FIXME: This adds as many module scopes as there are blocks, but resolving in each
             // already traverses all parents, so this is O(n²). I think we could only store the
             // innermost module scope instead?
@@ -835,8 +854,9 @@ impl Resolver {
         self.push_scope(Scope::ImplDefScope(impl_def))
     }
 
-    fn push_block_scope(self, def_map: Arc<DefMap>, module_id: LocalModuleId) -> Resolver {
-        self.push_scope(Scope::BlockScope(ModuleItemMap { def_map, module_id }))
+    fn push_block_scope(self, def_map: Arc<DefMap>) -> Resolver {
+        debug_assert!(def_map.block_id().is_some());
+        self.push_scope(Scope::BlockScope(ModuleItemMap { def_map, module_id: DefMap::ROOT }))
     }
 
     fn push_expr_scope(
@@ -936,7 +956,6 @@ fn to_type_ns(per_ns: PerNs) -> Option<(TypeNs, Option<ImportOrExternCrate>)> {
     Some((res, import))
 }
 
-type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<rustc_hash::FxHasher>>;
 #[derive(Default)]
 struct ScopeNames {
     map: FxIndexMap<Name, SmallVec<[ScopeDef; 1]>>,
@@ -986,19 +1005,27 @@ pub trait HasResolver: Copy {
 impl HasResolver for ModuleId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
         let mut def_map = self.def_map(db);
-        let mut modules: SmallVec<[_; 1]> = smallvec![];
         let mut module_id = self.local_id;
+        let mut modules: SmallVec<[_; 1]> = smallvec![];
+
+        if !self.is_block_module() {
+            return Resolver { scopes: vec![], module_scope: ModuleItemMap { def_map, module_id } };
+        }
+
         while let Some(parent) = def_map.parent() {
-            modules.push((def_map, module_id));
-            def_map = parent.def_map(db);
-            module_id = parent.local_id;
+            let block_def_map = mem::replace(&mut def_map, parent.def_map(db));
+            modules.push(block_def_map);
+            if !parent.is_block_module() {
+                module_id = parent.local_id;
+                break;
+            }
         }
         let mut resolver = Resolver {
             scopes: Vec::with_capacity(modules.len()),
             module_scope: ModuleItemMap { def_map, module_id },
         };
-        for (def_map, module) in modules.into_iter().rev() {
-            resolver = resolver.push_block_scope(def_map, module);
+        for def_map in modules.into_iter().rev() {
+            resolver = resolver.push_block_scope(def_map);
         }
         resolver
     }

@@ -8,11 +8,11 @@ use super::super::ByRefSized;
 use super::super::TrustedRandomAccessNoCoerce;
 use super::super::{ArrayChunks, Chain, Cloned, Copied, Cycle, Enumerate, Filter, FilterMap, Fuse};
 use super::super::{FlatMap, Flatten};
-use super::super::{FromIterator, Intersperse, IntersperseWith, Product, Sum, Zip};
 use super::super::{
     Inspect, Map, MapWhile, MapWindows, Peekable, Rev, Scan, Skip, SkipWhile, StepBy, Take,
     TakeWhile,
 };
+use super::super::{Intersperse, IntersperseWith, Product, Sum, Zip};
 
 fn _assert_is_object_safe(_: &dyn Iterator<Item = ()>) {}
 
@@ -28,42 +28,11 @@ fn _assert_is_object_safe(_: &dyn Iterator<Item = ()>) {}
 #[rustc_on_unimplemented(
     on(
         _Self = "core::ops::range::RangeTo<Idx>",
-        label = "if you meant to iterate until a value, add a starting value",
-        note = "`..end` is a `RangeTo`, which cannot be iterated on; you might have meant to have a \
-              bounded `Range`: `0..end`"
+        note = "you might have meant to use a bounded `Range`"
     ),
     on(
         _Self = "core::ops::range::RangeToInclusive<Idx>",
-        label = "if you meant to iterate until a value (including it), add a starting value",
-        note = "`..=end` is a `RangeToInclusive`, which cannot be iterated on; you might have meant \
-              to have a bounded `RangeInclusive`: `0..=end`"
-    ),
-    on(
-        _Self = "[]",
-        label = "`{Self}` is not an iterator; try calling `.into_iter()` or `.iter()`"
-    ),
-    on(_Self = "&[]", label = "`{Self}` is not an iterator; try calling `.iter()`"),
-    on(
-        _Self = "alloc::vec::Vec<T, A>",
-        label = "`{Self}` is not an iterator; try calling `.into_iter()` or `.iter()`"
-    ),
-    on(
-        _Self = "&str",
-        label = "`{Self}` is not an iterator; try calling `.chars()` or `.bytes()`"
-    ),
-    on(
-        _Self = "alloc::string::String",
-        label = "`{Self}` is not an iterator; try calling `.chars()` or `.bytes()`"
-    ),
-    on(
-        _Self = "{integral}",
-        note = "if you want to iterate between `start` until a value `end`, use the exclusive range \
-              syntax `start..end` or the inclusive range syntax `start..=end`"
-    ),
-    on(
-        _Self = "{float}",
-        note = "if you want to iterate between `start` until a value `end`, use the exclusive range \
-              syntax `start..end` or the inclusive range syntax `start..=end`"
+        note = "you might have meant to use a bounded `RangeInclusive`"
     ),
     label = "`{Self}` is not an iterator",
     message = "`{Self}` is not an iterator"
@@ -319,7 +288,8 @@ pub trait Iterator {
     /// # Examples
     ///
     /// ```
-    /// #![feature(generic_nonzero, iter_advance_by)]
+    /// #![feature(iter_advance_by)]
+    ///
     /// use std::num::NonZero;
     ///
     /// let a = [1, 2, 3, 4];
@@ -1004,6 +974,7 @@ pub trait Iterator {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_do_not_const_check]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "enumerate_method")]
     fn enumerate(self) -> Enumerate<Self>
     where
         Self: Sized,
@@ -1603,7 +1574,7 @@ pub trait Iterator {
     ///
     /// The returned iterator implements [`FusedIterator`], because once `self`
     /// returns `None`, even if it returns a `Some(T)` again in the next iterations,
-    /// we cannot put it into a contigious array buffer, and thus the returned iterator
+    /// we cannot put it into a contiguous array buffer, and thus the returned iterator
     /// should be fused.
     ///
     /// [`slice::windows()`]: slice::windows
@@ -2109,8 +2080,7 @@ pub trait Iterator {
     fn try_collect<B>(&mut self) -> ChangeOutputType<Self::Item, B>
     where
         Self: Sized,
-        <Self as Iterator>::Item: Try,
-        <<Self as Iterator>::Item as Try>::Residual: Residual<B>,
+        Self::Item: Try<Residual: Residual<B>>,
         B: FromIterator<<Self::Item as Try>::Output>,
     {
         try_process(ByRefSized(self), |i| i.collect())
@@ -2718,12 +2688,13 @@ pub trait Iterator {
     #[inline]
     #[unstable(feature = "iterator_try_reduce", reason = "new API", issue = "87053")]
     #[rustc_do_not_const_check]
-    fn try_reduce<F, R>(&mut self, f: F) -> ChangeOutputType<R, Option<R::Output>>
+    fn try_reduce<R>(
+        &mut self,
+        f: impl FnMut(Self::Item, Self::Item) -> R,
+    ) -> ChangeOutputType<R, Option<R::Output>>
     where
         Self: Sized,
-        F: FnMut(Self::Item, Self::Item) -> R,
-        R: Try<Output = Self::Item>,
-        R::Residual: Residual<Option<Self::Item>>,
+        R: Try<Output = Self::Item, Residual: Residual<Option<Self::Item>>>,
     {
         let first = match self.next() {
             Some(i) => i,
@@ -2970,7 +2941,8 @@ pub trait Iterator {
     /// This also supports other types which implement [`Try`], not just [`Result`].
     ///
     /// ```
-    /// #![feature(generic_nonzero, try_find)]
+    /// #![feature(try_find)]
+    ///
     /// use std::num::NonZero;
     ///
     /// let a = [3, 5, 7, 4, 9, 0, 11u32];
@@ -2984,12 +2956,13 @@ pub trait Iterator {
     #[inline]
     #[unstable(feature = "try_find", reason = "new API", issue = "63178")]
     #[rustc_do_not_const_check]
-    fn try_find<F, R>(&mut self, f: F) -> ChangeOutputType<R, Option<Self::Item>>
+    fn try_find<R>(
+        &mut self,
+        f: impl FnMut(&Self::Item) -> R,
+    ) -> ChangeOutputType<R, Option<Self::Item>>
     where
         Self: Sized,
-        F: FnMut(&Self::Item) -> R,
-        R: Try<Output = bool>,
-        R::Residual: Residual<Option<Self::Item>>,
+        R: Try<Output = bool, Residual: Residual<Option<Self::Item>>>,
     {
         #[inline]
         fn check<I, V, R>(

@@ -2,7 +2,6 @@ use crate::cmp::Ordering;
 use crate::fmt;
 use crate::hash;
 use crate::intrinsics;
-use crate::intrinsics::assert_unsafe_precondition;
 use crate::marker::Unsize;
 use crate::mem::{MaybeUninit, SizedTypeProperties};
 use crate::num::NonZero;
@@ -10,6 +9,7 @@ use crate::ops::{CoerceUnsized, DispatchFromDyn};
 use crate::ptr;
 use crate::ptr::Unique;
 use crate::slice::{self, SliceIndex};
+use crate::ub_checks::assert_unsafe_precondition;
 
 /// `*mut T` but non-zero and [covariant].
 ///
@@ -218,6 +218,7 @@ impl<T: ?Sized> NonNull<T> {
         // SAFETY: the caller must guarantee that `ptr` is non-null.
         unsafe {
             assert_unsafe_precondition!(
+                check_language_ub,
                 "NonNull::new_unchecked requires that the pointer is non-null",
                 (ptr: *mut () = ptr as *mut ()) => !ptr.is_null()
             );
@@ -475,43 +476,32 @@ impl<T: ?Sized> NonNull<T> {
         unsafe { NonNull { pointer: self.as_ptr() as *mut U } }
     }
 
-    /// Calculates the offset from a pointer.
+    /// Adds an offset to a pointer.
     ///
     /// `count` is in units of T; e.g., a `count` of 3 represents a pointer
     /// offset of `3 * size_of::<T>()` bytes.
     ///
     /// # Safety
     ///
-    /// If any of the following conditions are violated, the result is Undefined
-    /// Behavior:
+    /// If any of the following conditions are violated, the result is Undefined Behavior:
     ///
-    /// * Both the starting and resulting pointer must be either in bounds or one
-    ///   byte past the end of the same [allocated object].
+    /// * The computed offset, `count * size_of::<T>()` bytes, must not overflow `isize`.
     ///
-    /// * The computed offset, **in bytes**, cannot overflow an `isize`.
+    /// * If the computed offset is non-zero, then `self` must be derived from a pointer to some
+    ///   [allocated object], and the entire memory range between `self` and the result must be in
+    ///   bounds of that allocated object. In particular, this range must not "wrap around" the edge
+    ///   of the address space.
     ///
-    /// * The offset being in bounds cannot rely on "wrapping around" the address
-    ///   space. That is, the infinite-precision sum, **in bytes** must fit in a usize.
-    ///
-    /// The compiler and standard library generally tries to ensure allocations
-    /// never reach a size where an offset is a concern. For instance, `Vec`
-    /// and `Box` ensure they never allocate more than `isize::MAX` bytes, so
-    /// `vec.as_ptr().add(vec.len())` is always safe.
-    ///
-    /// Most platforms fundamentally can't even construct such an allocation.
-    /// For instance, no known 64-bit platform can ever serve a request
-    /// for 2<sup>63</sup> bytes due to page-table limitations or splitting the address space.
-    /// However, some 32-bit and 16-bit platforms may successfully serve a request for
-    /// more than `isize::MAX` bytes with things like Physical Address
-    /// Extension. As such, memory acquired directly from allocators or memory
-    /// mapped files *may* be too large to handle with this function.
+    /// Allocated objects can never be larger than `isize::MAX` bytes, so if the computed offset
+    /// stays in bounds of the allocated object, it is guaranteed to satisfy the first requirement.
+    /// This implies, for instance, that `vec.as_ptr().add(vec.len())` (for `vec: Vec<T>`) is always
+    /// safe.
     ///
     /// [allocated object]: crate::ptr#allocated-object
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(non_null_convenience)]
     /// use std::ptr::NonNull;
     ///
     /// let mut s = [1, 2, 3];
@@ -522,12 +512,12 @@ impl<T: ?Sized> NonNull<T> {
     ///     println!("{}", ptr.offset(2).read());
     /// }
     /// ```
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
-    #[must_use = "returns a new pointer rather than modifying its argument"]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
-    pub const unsafe fn offset(self, count: isize) -> NonNull<T>
+    #[must_use = "returns a new pointer rather than modifying its argument"]
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
+    pub const unsafe fn offset(self, count: isize) -> Self
     where
         T: Sized,
     {
@@ -548,11 +538,11 @@ impl<T: ?Sized> NonNull<T> {
     ///
     /// For non-`Sized` pointees this operation changes only the data pointer,
     /// leaving the metadata untouched.
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[must_use]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
     pub const unsafe fn byte_offset(self, count: isize) -> Self {
         // SAFETY: the caller must uphold the safety contract for `offset` and `byte_offset` has
         // the same safety contract.
@@ -562,43 +552,32 @@ impl<T: ?Sized> NonNull<T> {
         unsafe { NonNull { pointer: self.pointer.byte_offset(count) } }
     }
 
-    /// Calculates the offset from a pointer (convenience for `.offset(count as isize)`).
+    /// Adds an offset to a pointer (convenience for `.offset(count as isize)`).
     ///
     /// `count` is in units of T; e.g., a `count` of 3 represents a pointer
     /// offset of `3 * size_of::<T>()` bytes.
     ///
     /// # Safety
     ///
-    /// If any of the following conditions are violated, the result is Undefined
-    /// Behavior:
+    /// If any of the following conditions are violated, the result is Undefined Behavior:
     ///
-    /// * Both the starting and resulting pointer must be either in bounds or one
-    ///   byte past the end of the same [allocated object].
+    /// * The computed offset, `count * size_of::<T>()` bytes, must not overflow `isize`.
     ///
-    /// * The computed offset, **in bytes**, cannot overflow an `isize`.
+    /// * If the computed offset is non-zero, then `self` must be derived from a pointer to some
+    ///   [allocated object], and the entire memory range between `self` and the result must be in
+    ///   bounds of that allocated object. In particular, this range must not "wrap around" the edge
+    ///   of the address space.
     ///
-    /// * The offset being in bounds cannot rely on "wrapping around" the address
-    ///   space. That is, the infinite-precision sum must fit in a `usize`.
-    ///
-    /// The compiler and standard library generally tries to ensure allocations
-    /// never reach a size where an offset is a concern. For instance, `Vec`
-    /// and `Box` ensure they never allocate more than `isize::MAX` bytes, so
-    /// `vec.as_ptr().add(vec.len())` is always safe.
-    ///
-    /// Most platforms fundamentally can't even construct such an allocation.
-    /// For instance, no known 64-bit platform can ever serve a request
-    /// for 2<sup>63</sup> bytes due to page-table limitations or splitting the address space.
-    /// However, some 32-bit and 16-bit platforms may successfully serve a request for
-    /// more than `isize::MAX` bytes with things like Physical Address
-    /// Extension. As such, memory acquired directly from allocators or memory
-    /// mapped files *may* be too large to handle with this function.
+    /// Allocated objects can never be larger than `isize::MAX` bytes, so if the computed offset
+    /// stays in bounds of the allocated object, it is guaranteed to satisfy the first requirement.
+    /// This implies, for instance, that `vec.as_ptr().add(vec.len())` (for `vec: Vec<T>`) is always
+    /// safe.
     ///
     /// [allocated object]: crate::ptr#allocated-object
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(non_null_convenience)]
     /// use std::ptr::NonNull;
     ///
     /// let s: &str = "123";
@@ -609,11 +588,11 @@ impl<T: ?Sized> NonNull<T> {
     ///     println!("{}", ptr.add(2).read() as char);
     /// }
     /// ```
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
-    #[must_use = "returns a new pointer rather than modifying its argument"]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[must_use = "returns a new pointer rather than modifying its argument"]
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
     pub const unsafe fn add(self, count: usize) -> Self
     where
         T: Sized,
@@ -635,12 +614,12 @@ impl<T: ?Sized> NonNull<T> {
     ///
     /// For non-`Sized` pointees this operation changes only the data pointer,
     /// leaving the metadata untouched.
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[must_use]
     #[inline(always)]
-    #[rustc_allow_const_fn_unstable(set_ptr_value)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[rustc_allow_const_fn_unstable(set_ptr_value)]
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
     pub const unsafe fn byte_add(self, count: usize) -> Self {
         // SAFETY: the caller must uphold the safety contract for `add` and `byte_add` has the same
         // safety contract.
@@ -650,7 +629,7 @@ impl<T: ?Sized> NonNull<T> {
         unsafe { NonNull { pointer: self.pointer.byte_add(count) } }
     }
 
-    /// Calculates the offset from a pointer (convenience for
+    /// Subtracts an offset from a pointer (convenience for
     /// `.offset((count as isize).wrapping_neg())`).
     ///
     /// `count` is in units of T; e.g., a `count` of 3 represents a pointer
@@ -658,36 +637,25 @@ impl<T: ?Sized> NonNull<T> {
     ///
     /// # Safety
     ///
-    /// If any of the following conditions are violated, the result is Undefined
-    /// Behavior:
+    /// If any of the following conditions are violated, the result is Undefined Behavior:
     ///
-    /// * Both the starting and resulting pointer must be either in bounds or one
-    ///   byte past the end of the same [allocated object].
+    /// * The computed offset, `count * size_of::<T>()` bytes, must not overflow `isize`.
     ///
-    /// * The computed offset cannot exceed `isize::MAX` **bytes**.
+    /// * If the computed offset is non-zero, then `self` must be derived from a pointer to some
+    ///   [allocated object], and the entire memory range between `self` and the result must be in
+    ///   bounds of that allocated object. In particular, this range must not "wrap around" the edge
+    ///   of the address space.
     ///
-    /// * The offset being in bounds cannot rely on "wrapping around" the address
-    ///   space. That is, the infinite-precision sum must fit in a usize.
-    ///
-    /// The compiler and standard library generally tries to ensure allocations
-    /// never reach a size where an offset is a concern. For instance, `Vec`
-    /// and `Box` ensure they never allocate more than `isize::MAX` bytes, so
-    /// `vec.as_ptr().add(vec.len()).sub(vec.len())` is always safe.
-    ///
-    /// Most platforms fundamentally can't even construct such an allocation.
-    /// For instance, no known 64-bit platform can ever serve a request
-    /// for 2<sup>63</sup> bytes due to page-table limitations or splitting the address space.
-    /// However, some 32-bit and 16-bit platforms may successfully serve a request for
-    /// more than `isize::MAX` bytes with things like Physical Address
-    /// Extension. As such, memory acquired directly from allocators or memory
-    /// mapped files *may* be too large to handle with this function.
+    /// Allocated objects can never be larger than `isize::MAX` bytes, so if the computed offset
+    /// stays in bounds of the allocated object, it is guaranteed to satisfy the first requirement.
+    /// This implies, for instance, that `vec.as_ptr().add(vec.len())` (for `vec: Vec<T>`) is always
+    /// safe.
     ///
     /// [allocated object]: crate::ptr#allocated-object
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(non_null_convenience)]
     /// use std::ptr::NonNull;
     ///
     /// let s: &str = "123";
@@ -698,13 +666,12 @@ impl<T: ?Sized> NonNull<T> {
     ///     println!("{}", end.sub(2).read() as char);
     /// }
     /// ```
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
-    #[must_use = "returns a new pointer rather than modifying its argument"]
-    // We could always go back to wrapping if unchecked becomes unacceptable
-    #[rustc_allow_const_fn_unstable(const_int_unchecked_arith)]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[must_use = "returns a new pointer rather than modifying its argument"]
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_allow_const_fn_unstable(unchecked_neg)]
     pub const unsafe fn sub(self, count: usize) -> Self
     where
         T: Sized,
@@ -716,7 +683,7 @@ impl<T: ?Sized> NonNull<T> {
             // SAFETY: the caller must uphold the safety contract for `offset`.
             // Because the pointee is *not* a ZST, that means that `count` is
             // at most `isize::MAX`, and thus the negation cannot overflow.
-            unsafe { self.offset(intrinsics::unchecked_sub(0, count as isize)) }
+            unsafe { self.offset((count as isize).unchecked_neg()) }
         }
     }
 
@@ -731,12 +698,12 @@ impl<T: ?Sized> NonNull<T> {
     ///
     /// For non-`Sized` pointees this operation changes only the data pointer,
     /// leaving the metadata untouched.
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[must_use]
     #[inline(always)]
-    #[rustc_allow_const_fn_unstable(set_ptr_value)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[rustc_allow_const_fn_unstable(set_ptr_value)]
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
     pub const unsafe fn byte_sub(self, count: usize) -> Self {
         // SAFETY: the caller must uphold the safety contract for `sub` and `byte_sub` has the same
         // safety contract.
@@ -764,38 +731,21 @@ impl<T: ?Sized> NonNull<T> {
     ///
     /// # Safety
     ///
-    /// If any of the following conditions are violated, the result is Undefined
-    /// Behavior:
+    /// If any of the following conditions are violated, the result is Undefined Behavior:
     ///
-    /// * Both `self` and `origin` must be either in bounds or one
-    ///   byte past the end of the same [allocated object].
+    /// * `self` and `origin` must either
     ///
-    /// * Both pointers must be *derived from* a pointer to the same object.
-    ///   (See below for an example.)
+    ///   * both be *derived from* a pointer to the same [allocated object], and the memory range between
+    ///     the two pointers must be either empty or in bounds of that object. (See below for an example.)
+    ///   * or both be derived from an integer literal/constant, and point to the same address.
     ///
     /// * The distance between the pointers, in bytes, must be an exact multiple
     ///   of the size of `T`.
     ///
-    /// * The distance between the pointers, **in bytes**, cannot overflow an `isize`.
-    ///
-    /// * The distance being in bounds cannot rely on "wrapping around" the address space.
-    ///
-    /// Rust types are never larger than `isize::MAX` and Rust allocations never wrap around the
-    /// address space, so two pointers within some value of any Rust type `T` will always satisfy
-    /// the last two conditions. The standard library also generally ensures that allocations
-    /// never reach a size where an offset is a concern. For instance, `Vec` and `Box` ensure they
-    /// never allocate more than `isize::MAX` bytes, so `ptr_into_vec.offset_from(vec.as_ptr())`
-    /// always satisfies the last two conditions.
-    ///
-    /// Most platforms fundamentally can't even construct such a large allocation.
-    /// For instance, no known 64-bit platform can ever serve a request
-    /// for 2<sup>63</sup> bytes due to page-table limitations or splitting the address space.
-    /// However, some 32-bit and 16-bit platforms may successfully serve a request for
-    /// more than `isize::MAX` bytes with things like Physical Address
-    /// Extension. As such, memory acquired directly from allocators or memory
-    /// mapped files *may* be too large to handle with this function.
-    /// (Note that [`offset`] and [`add`] also have a similar limitation and hence cannot be used on
-    /// such large allocations either.)
+    /// As a consequence, the absolute distance between the pointers, in bytes, computed on
+    /// mathematical integers (without "wrapping around"), cannot overflow an `isize`. This is
+    /// implied by the in-bounds requirement, and the fact that no allocated object can be larger
+    /// than `isize::MAX` bytes.
     ///
     /// The requirement for pointers to be derived from the same allocated object is primarily
     /// needed for `const`-compatibility: the distance between pointers into *different* allocated
@@ -817,7 +767,6 @@ impl<T: ?Sized> NonNull<T> {
     /// Basic usage:
     ///
     /// ```
-    /// #![feature(non_null_convenience)]
     /// use std::ptr::NonNull;
     ///
     /// let a = [0; 5];
@@ -834,7 +783,7 @@ impl<T: ?Sized> NonNull<T> {
     /// *Incorrect* usage:
     ///
     /// ```rust,no_run
-    /// #![feature(non_null_convenience, strict_provenance)]
+    /// #![feature(strict_provenance)]
     /// use std::ptr::NonNull;
     ///
     /// let ptr1 = NonNull::new(Box::into_raw(Box::new(0u8))).unwrap();
@@ -846,14 +795,13 @@ impl<T: ?Sized> NonNull<T> {
     /// // Since ptr2_other and ptr2 are derived from pointers to different objects,
     /// // computing their offset is undefined behavior, even though
     /// // they point to the same address!
-    /// unsafe {
-    ///     let zero = ptr2_other.offset_from(ptr2); // Undefined Behavior
-    /// }
+    ///
+    /// let zero = unsafe { ptr2_other.offset_from(ptr2) }; // Undefined Behavior
     /// ```
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
     pub const unsafe fn offset_from(self, origin: NonNull<T>) -> isize
     where
         T: Sized,
@@ -871,10 +819,10 @@ impl<T: ?Sized> NonNull<T> {
     ///
     /// For non-`Sized` pointees this operation considers only the data pointers,
     /// ignoring the metadata.
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
     pub const unsafe fn byte_offset_from<U: ?Sized>(self, origin: NonNull<U>) -> isize {
         // SAFETY: the caller must uphold the safety contract for `byte_offset_from`.
         unsafe { self.pointer.byte_offset_from(origin.pointer) }
@@ -898,7 +846,7 @@ impl<T: ?Sized> NonNull<T> {
     /// to [`sub`](#method.sub)).  The following are all equivalent, assuming
     /// that their safety preconditions are met:
     /// ```rust
-    /// # #![feature(non_null_convenience)]
+    /// # #![feature(ptr_sub_ptr)]
     /// # unsafe fn blah(ptr: std::ptr::NonNull<u32>, origin: std::ptr::NonNull<u32>, count: usize) -> bool {
     /// ptr.sub_ptr(origin) == count
     /// # &&
@@ -927,7 +875,7 @@ impl<T: ?Sized> NonNull<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(non_null_convenience)]
+    /// #![feature(ptr_sub_ptr)]
     /// use std::ptr::NonNull;
     ///
     /// let a = [0; 5];
@@ -943,12 +891,10 @@ impl<T: ?Sized> NonNull<T> {
     /// // This would be incorrect, as the pointers are not correctly ordered:
     /// // ptr1.sub_ptr(ptr2)
     /// ```
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
-    // #[unstable(feature = "ptr_sub_ptr", issue = "95892")]
-    // #[rustc_const_unstable(feature = "const_ptr_sub_ptr", issue = "95892")]
     #[inline]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[unstable(feature = "ptr_sub_ptr", issue = "95892")]
+    #[rustc_const_unstable(feature = "const_ptr_sub_ptr", issue = "95892")]
     pub const unsafe fn sub_ptr(self, subtracted: NonNull<T>) -> usize
     where
         T: Sized,
@@ -963,10 +909,10 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::read`] for safety concerns and examples.
     ///
     /// [`ptr::read`]: crate::ptr::read()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
     pub const unsafe fn read(self) -> T
     where
         T: Sized,
@@ -985,9 +931,9 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::read_volatile`] for safety concerns and examples.
     ///
     /// [`ptr::read_volatile`]: crate::ptr::read_volatile()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
     pub unsafe fn read_volatile(self) -> T
     where
         T: Sized,
@@ -1004,10 +950,10 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::read_unaligned`] for safety concerns and examples.
     ///
     /// [`ptr::read_unaligned`]: crate::ptr::read_unaligned()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_stable(feature = "non_null_convenience", since = "1.80.0")]
     pub const unsafe fn read_unaligned(self) -> T
     where
         T: Sized,
@@ -1024,10 +970,10 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::copy`] for safety concerns and examples.
     ///
     /// [`ptr::copy`]: crate::ptr::copy()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_unstable(feature = "const_intrinsic_copy", issue = "80697")]
     pub const unsafe fn copy_to(self, dest: NonNull<T>, count: usize)
     where
         T: Sized,
@@ -1044,10 +990,10 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::copy_nonoverlapping`] for safety concerns and examples.
     ///
     /// [`ptr::copy_nonoverlapping`]: crate::ptr::copy_nonoverlapping()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_unstable(feature = "const_intrinsic_copy", issue = "80697")]
     pub const unsafe fn copy_to_nonoverlapping(self, dest: NonNull<T>, count: usize)
     where
         T: Sized,
@@ -1064,10 +1010,10 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::copy`] for safety concerns and examples.
     ///
     /// [`ptr::copy`]: crate::ptr::copy()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_unstable(feature = "const_intrinsic_copy", issue = "80697")]
     pub const unsafe fn copy_from(self, src: NonNull<T>, count: usize)
     where
         T: Sized,
@@ -1084,10 +1030,10 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::copy_nonoverlapping`] for safety concerns and examples.
     ///
     /// [`ptr::copy_nonoverlapping`]: crate::ptr::copy_nonoverlapping()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_unstable(feature = "const_intrinsic_copy", issue = "80697")]
     pub const unsafe fn copy_from_nonoverlapping(self, src: NonNull<T>, count: usize)
     where
         T: Sized,
@@ -1101,8 +1047,8 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::drop_in_place`] for safety concerns and examples.
     ///
     /// [`ptr::drop_in_place`]: crate::ptr::drop_in_place()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline(always)]
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
     pub unsafe fn drop_in_place(self) {
         // SAFETY: the caller must uphold the safety contract for `drop_in_place`.
         unsafe { ptr::drop_in_place(self.as_ptr()) }
@@ -1114,11 +1060,10 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::write`] for safety concerns and examples.
     ///
     /// [`ptr::write`]: crate::ptr::write()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
-    //#[rustc_const_unstable(feature = "const_ptr_write", issue = "86302")]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_unstable(feature = "const_ptr_write", issue = "86302")]
     pub const unsafe fn write(self, val: T)
     where
         T: Sized,
@@ -1133,12 +1078,11 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::write_bytes`] for safety concerns and examples.
     ///
     /// [`ptr::write_bytes`]: crate::ptr::write_bytes()
-    #[doc(alias = "memset")]
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
-    //#[rustc_const_unstable(feature = "const_ptr_write", issue = "86302")]
     #[inline(always)]
+    #[doc(alias = "memset")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_unstable(feature = "const_ptr_write", issue = "86302")]
     pub const unsafe fn write_bytes(self, val: u8, count: usize)
     where
         T: Sized,
@@ -1157,9 +1101,9 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::write_volatile`] for safety concerns and examples.
     ///
     /// [`ptr::write_volatile`]: crate::ptr::write_volatile()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
     pub unsafe fn write_volatile(self, val: T)
     where
         T: Sized,
@@ -1176,11 +1120,10 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::write_unaligned`] for safety concerns and examples.
     ///
     /// [`ptr::write_unaligned`]: crate::ptr::write_unaligned()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
-    //#[rustc_const_unstable(feature = "const_ptr_write", issue = "86302")]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_unstable(feature = "const_ptr_write", issue = "86302")]
     pub const unsafe fn write_unaligned(self, val: T)
     where
         T: Sized,
@@ -1195,8 +1138,8 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::replace`] for safety concerns and examples.
     ///
     /// [`ptr::replace`]: crate::ptr::replace()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
     #[inline(always)]
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
     pub unsafe fn replace(self, src: T) -> T
     where
         T: Sized,
@@ -1212,10 +1155,9 @@ impl<T: ?Sized> NonNull<T> {
     /// See [`ptr::swap`] for safety concerns and examples.
     ///
     /// [`ptr::swap`]: crate::ptr::swap()
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
-    //#[rustc_const_unstable(feature = "const_swap", issue = "83163")]
     #[inline(always)]
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_unstable(feature = "const_swap", issue = "83163")]
     pub const unsafe fn swap(self, with: NonNull<T>)
     where
         T: Sized,
@@ -1247,7 +1189,6 @@ impl<T: ?Sized> NonNull<T> {
     /// Accessing adjacent `u8` as `u16`
     ///
     /// ```
-    /// #![feature(non_null_convenience)]
     /// use std::mem::align_of;
     /// use std::ptr::NonNull;
     ///
@@ -1265,11 +1206,10 @@ impl<T: ?Sized> NonNull<T> {
     /// }
     /// # }
     /// ```
-    #[unstable(feature = "non_null_convenience", issue = "117691")]
-    #[rustc_const_unstable(feature = "non_null_convenience", issue = "117691")]
-    //#[rustc_const_unstable(feature = "const_align_offset", issue = "90962")]
-    #[must_use]
     #[inline]
+    #[must_use]
+    #[stable(feature = "non_null_convenience", since = "1.80.0")]
+    #[rustc_const_unstable(feature = "const_align_offset", issue = "90962")]
     pub const fn align_offset(self, align: usize) -> usize
     where
         T: Sized,
@@ -1289,7 +1229,6 @@ impl<T: ?Sized> NonNull<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(pointer_is_aligned)]
     /// use std::ptr::NonNull;
     ///
     /// // On some platforms, the alignment of i32 is less than 4.
@@ -1314,11 +1253,9 @@ impl<T: ?Sized> NonNull<T> {
     /// underlying allocation.
     ///
     /// ```
-    /// #![feature(pointer_is_aligned)]
-    /// #![feature(const_pointer_is_aligned)]
-    /// #![feature(non_null_convenience)]
-    /// #![feature(const_option)]
     /// #![feature(const_nonnull_new)]
+    /// #![feature(const_option)]
+    /// #![feature(const_pointer_is_aligned)]
     /// use std::ptr::NonNull;
     ///
     /// // On some platforms, the alignment of primitives is less than their size.
@@ -1344,7 +1281,6 @@ impl<T: ?Sized> NonNull<T> {
     /// pointer is aligned, even if the compiletime pointer wasn't aligned.
     ///
     /// ```
-    /// #![feature(pointer_is_aligned)]
     /// #![feature(const_pointer_is_aligned)]
     ///
     /// // On some platforms, the alignment of primitives is less than their size.
@@ -1370,7 +1306,6 @@ impl<T: ?Sized> NonNull<T> {
     /// runtime and compiletime.
     ///
     /// ```
-    /// #![feature(pointer_is_aligned)]
     /// #![feature(const_pointer_is_aligned)]
     /// #![feature(const_option)]
     /// #![feature(const_nonnull_new)]
@@ -1395,10 +1330,10 @@ impl<T: ?Sized> NonNull<T> {
     /// ```
     ///
     /// [tracking issue]: https://github.com/rust-lang/rust/issues/104203
-    #[unstable(feature = "pointer_is_aligned", issue = "96284")]
-    #[rustc_const_unstable(feature = "const_pointer_is_aligned", issue = "104203")]
-    #[must_use]
     #[inline]
+    #[must_use]
+    #[stable(feature = "pointer_is_aligned", since = "1.79.0")]
+    #[rustc_const_unstable(feature = "const_pointer_is_aligned", issue = "104203")]
     pub const fn is_aligned(self) -> bool
     where
         T: Sized,
@@ -1418,7 +1353,7 @@ impl<T: ?Sized> NonNull<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(pointer_is_aligned)]
+    /// #![feature(pointer_is_aligned_to)]
     ///
     /// // On some platforms, the alignment of i32 is less than 4.
     /// #[repr(align(4))]
@@ -1447,7 +1382,7 @@ impl<T: ?Sized> NonNull<T> {
     /// cannot be stricter aligned than the reference's underlying allocation.
     ///
     /// ```
-    /// #![feature(pointer_is_aligned)]
+    /// #![feature(pointer_is_aligned_to)]
     /// #![feature(const_pointer_is_aligned)]
     ///
     /// // On some platforms, the alignment of i32 is less than 4.
@@ -1472,7 +1407,7 @@ impl<T: ?Sized> NonNull<T> {
     /// pointer is aligned, even if the compiletime pointer wasn't aligned.
     ///
     /// ```
-    /// #![feature(pointer_is_aligned)]
+    /// #![feature(pointer_is_aligned_to)]
     /// #![feature(const_pointer_is_aligned)]
     ///
     /// // On some platforms, the alignment of i32 is less than 4.
@@ -1496,7 +1431,7 @@ impl<T: ?Sized> NonNull<T> {
     /// runtime and compiletime.
     ///
     /// ```
-    /// #![feature(pointer_is_aligned)]
+    /// #![feature(pointer_is_aligned_to)]
     /// #![feature(const_pointer_is_aligned)]
     ///
     /// const _: () = {
@@ -1510,10 +1445,10 @@ impl<T: ?Sized> NonNull<T> {
     /// ```
     ///
     /// [tracking issue]: https://github.com/rust-lang/rust/issues/104203
-    #[unstable(feature = "pointer_is_aligned", issue = "96284")]
-    #[rustc_const_unstable(feature = "const_pointer_is_aligned", issue = "104203")]
-    #[must_use]
     #[inline]
+    #[must_use]
+    #[unstable(feature = "pointer_is_aligned_to", issue = "96284")]
+    #[rustc_const_unstable(feature = "const_pointer_is_aligned", issue = "104203")]
     pub const fn is_aligned_to(self, align: usize) -> bool {
         self.pointer.is_aligned_to(align)
     }
@@ -1567,11 +1502,28 @@ impl<T> NonNull<[T]> {
     /// ```
     #[stable(feature = "slice_ptr_len_nonnull", since = "1.63.0")]
     #[rustc_const_stable(feature = "const_slice_ptr_len_nonnull", since = "1.63.0")]
-    #[rustc_allow_const_fn_unstable(const_slice_ptr_len)]
     #[must_use]
     #[inline]
     pub const fn len(self) -> usize {
         self.as_ptr().len()
+    }
+
+    /// Returns `true` if the non-null raw slice has a length of 0.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::ptr::NonNull;
+    ///
+    /// let slice: NonNull<[i8]> = NonNull::slice_from_raw_parts(NonNull::dangling(), 3);
+    /// assert!(!slice.is_empty());
+    /// ```
+    #[stable(feature = "slice_ptr_is_empty_nonnull", since = "1.79.0")]
+    #[rustc_const_stable(feature = "const_slice_ptr_is_empty_nonnull", since = "1.79.0")]
+    #[must_use]
+    #[inline]
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
     }
 
     /// Returns a non-null pointer to the slice's buffer.
@@ -1711,6 +1663,8 @@ impl<T> NonNull<[T]> {
     /// // Note that calling `memory.as_mut()` is not allowed here as the content may be uninitialized.
     /// # #[allow(unused_variables)]
     /// let slice: &mut [MaybeUninit<u8>] = unsafe { memory.as_uninit_slice_mut() };
+    /// # // Prevent leaks for Miri.
+    /// # unsafe { Global.deallocate(memory.cast(), Layout::new::<[u8; 32]>()); }
     /// # Ok::<_, std::alloc::AllocError>(())
     /// ```
     #[inline]
@@ -1801,6 +1755,7 @@ impl<T: ?Sized> PartialEq for NonNull<T> {
 #[stable(feature = "nonnull", since = "1.25.0")]
 impl<T: ?Sized> Ord for NonNull<T> {
     #[inline]
+    #[allow(ambiguous_wide_pointer_comparisons)]
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_ptr().cmp(&other.as_ptr())
     }
@@ -1809,6 +1764,7 @@ impl<T: ?Sized> Ord for NonNull<T> {
 #[stable(feature = "nonnull", since = "1.25.0")]
 impl<T: ?Sized> PartialOrd for NonNull<T> {
     #[inline]
+    #[allow(ambiguous_wide_pointer_comparisons)]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.as_ptr().partial_cmp(&other.as_ptr())
     }

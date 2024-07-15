@@ -10,6 +10,8 @@
 
 use core::any::Any;
 use core::borrow;
+#[cfg(not(no_global_oom_handling))]
+use core::clone::CloneToUninit;
 use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -18,10 +20,8 @@ use core::intrinsics::abort;
 #[cfg(not(no_global_oom_handling))]
 use core::iter;
 use core::marker::{PhantomData, Unsize};
-#[cfg(not(no_global_oom_handling))]
-use core::mem::size_of_val;
 use core::mem::{self, align_of_val_raw};
-use core::ops::{CoerceUnsized, Deref, DispatchFromDyn, Receiver};
+use core::ops::{CoerceUnsized, Deref, DerefPure, DispatchFromDyn, Receiver};
 use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::pin::Pin;
 use core::ptr::{self, NonNull};
@@ -32,8 +32,6 @@ use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 #[cfg(not(no_global_oom_handling))]
 use crate::alloc::handle_alloc_error;
-#[cfg(not(no_global_oom_handling))]
-use crate::alloc::WriteCloneIntoRaw;
 use crate::alloc::{AllocError, Allocator, Global, Layout};
 use crate::borrow::{Cow, ToOwned};
 use crate::boxed::Box;
@@ -199,11 +197,7 @@ macro_rules! acquire {
 ///
 /// Sharing some immutable data between threads:
 ///
-// Note that we **do not** run these tests here. The windows builders get super
-// unhappy if a thread outlives the main thread and then exits at the same time
-// (something deadlocks) so we just avoid this entirely by not running these
-// tests.
-/// ```no_run
+/// ```
 /// use std::sync::Arc;
 /// use std::thread;
 ///
@@ -222,7 +216,7 @@ macro_rules! acquire {
 ///
 /// [`AtomicUsize`]: core::sync::atomic::AtomicUsize "sync::atomic::AtomicUsize"
 ///
-/// ```no_run
+/// ```
 /// use std::sync::Arc;
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// use std::thread;
@@ -233,7 +227,7 @@ macro_rules! acquire {
 ///     let val = Arc::clone(&val);
 ///
 ///     thread::spawn(move || {
-///         let v = val.fetch_add(1, Ordering::SeqCst);
+///         let v = val.fetch_add(1, Ordering::Relaxed);
 ///         println!("{v:?}");
 ///     });
 /// }
@@ -280,8 +274,8 @@ impl<T: ?Sized> Arc<T> {
 
 impl<T: ?Sized, A: Allocator> Arc<T, A> {
     #[inline]
-    fn internal_into_inner_with_allocator(self) -> (NonNull<ArcInner<T>>, A) {
-        let this = mem::ManuallyDrop::new(self);
+    fn into_inner_with_allocator(this: Self) -> (NonNull<ArcInner<T>>, A) {
+        let this = mem::ManuallyDrop::new(this);
         (this.ptr, unsafe { ptr::read(&this.alloc) })
     }
 
@@ -683,16 +677,6 @@ impl<T> Arc<T> {
 }
 
 impl<T, A: Allocator> Arc<T, A> {
-    /// Returns a reference to the underlying allocator.
-    ///
-    /// Note: this is an associated function, which means that you have
-    /// to call it as `Arc::allocator(&a)` instead of `a.allocator()`. This
-    /// is so that there is no conflict with a method on the inner type.
-    #[inline]
-    #[unstable(feature = "allocator_api", issue = "32838")]
-    pub fn allocator(this: &Self) -> &A {
-        &this.alloc
-    }
     /// Constructs a new `Arc<T>` in the provided allocator.
     ///
     /// # Examples
@@ -807,7 +791,10 @@ impl<T, A: Allocator> Arc<T, A> {
     #[cfg(not(no_global_oom_handling))]
     #[unstable(feature = "allocator_api", issue = "32838")]
     #[inline]
-    pub fn pin_in(data: T, alloc: A) -> Pin<Arc<T, A>> {
+    pub fn pin_in(data: T, alloc: A) -> Pin<Arc<T, A>>
+    where
+        A: 'static,
+    {
         unsafe { Pin::new_unchecked(Arc::new_in(data, alloc)) }
     }
 
@@ -815,7 +802,10 @@ impl<T, A: Allocator> Arc<T, A> {
     /// fails.
     #[inline]
     #[unstable(feature = "allocator_api", issue = "32838")]
-    pub fn try_pin_in(data: T, alloc: A) -> Result<Pin<Arc<T, A>>, AllocError> {
+    pub fn try_pin_in(data: T, alloc: A) -> Result<Pin<Arc<T, A>>, AllocError>
+    where
+        A: 'static,
+    {
         unsafe { Ok(Pin::new_unchecked(Arc::try_new_in(data, alloc)?)) }
     }
 
@@ -936,15 +926,18 @@ impl<T, A: Allocator> Arc<T, A> {
     /// This will succeed even if there are outstanding weak references.
     ///
     /// It is strongly recommended to use [`Arc::into_inner`] instead if you don't
-    /// want to keep the `Arc` in the [`Err`] case.
-    /// Immediately dropping the [`Err`] payload, like in the expression
-    /// `Arc::try_unwrap(this).ok()`, can still cause the strong count to
-    /// drop to zero and the inner value of the `Arc` to be dropped:
-    /// For instance if two threads each execute this expression in parallel, then
-    /// there is a race condition. The threads could first both check whether they
-    /// have the last clone of their `Arc` via `Arc::try_unwrap`, and then
-    /// both drop their `Arc` in the call to [`ok`][`Result::ok`],
-    /// taking the strong count from two down to zero.
+    /// keep the `Arc` in the [`Err`] case.
+    /// Immediately dropping the [`Err`]-value, as the expression
+    /// `Arc::try_unwrap(this).ok()` does, can cause the strong count to
+    /// drop to zero and the inner value of the `Arc` to be dropped.
+    /// For instance, if two threads execute such an expression in parallel,
+    /// there is a race condition without the possibility of unsafety:
+    /// The threads could first both check whether they own the last instance
+    /// in `Arc::try_unwrap`, determine that they both do not, and then both
+    /// discard and drop their instance in the call to [`ok`][`Result::ok`].
+    /// In this scenario, the value inside the `Arc` is safely destroyed
+    /// by exactly one of the threads, but neither thread will ever be able
+    /// to use the value.
     ///
     /// # Examples
     ///
@@ -1062,7 +1055,9 @@ impl<T, A: Allocator> Arc<T, A> {
     ///
     /// // Create a long list and clone it
     /// let mut x = LinkedList::new();
-    /// for i in 0..100000 {
+    /// let size = 100000;
+    /// # let size = if cfg!(miri) { 100 } else { size };
+    /// for i in 0..size {
     ///     x.push(i); // Adds i to the front of x
     /// }
     /// let y = x.clone();
@@ -1282,7 +1277,7 @@ impl<T, A: Allocator> Arc<mem::MaybeUninit<T>, A> {
     #[must_use = "`self` will be dropped if the result is not used"]
     #[inline]
     pub unsafe fn assume_init(self) -> Arc<T, A> {
-        let (ptr, alloc) = self.internal_into_inner_with_allocator();
+        let (ptr, alloc) = Arc::into_inner_with_allocator(self);
         unsafe { Arc::from_inner_in(ptr.cast(), alloc) }
     }
 }
@@ -1324,7 +1319,7 @@ impl<T, A: Allocator> Arc<[mem::MaybeUninit<T>], A> {
     #[must_use = "`self` will be dropped if the result is not used"]
     #[inline]
     pub unsafe fn assume_init(self) -> Arc<[T], A> {
-        let (ptr, alloc) = self.internal_into_inner_with_allocator();
+        let (ptr, alloc) = Arc::into_inner_with_allocator(self);
         unsafe { Arc::from_ptr_in(ptr.as_ptr() as _, alloc) }
     }
 }
@@ -1419,6 +1414,8 @@ impl<T: ?Sized> Arc<T> {
     ///     // the `Arc` between threads.
     ///     let five = Arc::from_raw(ptr);
     ///     assert_eq!(2, Arc::strong_count(&five));
+    /// #   // Prevent leaks for Miri.
+    /// #   Arc::decrement_strong_count(ptr);
     /// }
     /// ```
     #[inline]
@@ -1465,6 +1462,17 @@ impl<T: ?Sized> Arc<T> {
 }
 
 impl<T: ?Sized, A: Allocator> Arc<T, A> {
+    /// Returns a reference to the underlying allocator.
+    ///
+    /// Note: this is an associated function, which means that you have
+    /// to call it as `Arc::allocator(&a)` instead of `a.allocator()`. This
+    /// is so that there is no conflict with a method on the inner type.
+    #[inline]
+    #[unstable(feature = "allocator_api", issue = "32838")]
+    pub fn allocator(this: &Self) -> &A {
+        &this.alloc
+    }
+
     /// Consumes the `Arc`, returning the wrapped pointer.
     ///
     /// To avoid a memory leak the pointer must be converted back to an `Arc` using
@@ -1478,6 +1486,8 @@ impl<T: ?Sized, A: Allocator> Arc<T, A> {
     /// let x = Arc::new("hello".to_owned());
     /// let x_ptr = Arc::into_raw(x);
     /// assert_eq!(unsafe { &*x_ptr }, "hello");
+    /// # // Prevent leaks for Miri.
+    /// # drop(unsafe { Arc::from_raw(x_ptr) });
     /// ```
     #[must_use = "losing the pointer will leak memory"]
     #[stable(feature = "rc_raw", since = "1.17.0")]
@@ -1486,6 +1496,34 @@ impl<T: ?Sized, A: Allocator> Arc<T, A> {
         let ptr = Self::as_ptr(&this);
         mem::forget(this);
         ptr
+    }
+
+    /// Consumes the `Arc`, returning the wrapped pointer and allocator.
+    ///
+    /// To avoid a memory leak the pointer must be converted back to an `Arc` using
+    /// [`Arc::from_raw_in`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(allocator_api)]
+    /// use std::sync::Arc;
+    /// use std::alloc::System;
+    ///
+    /// let x = Arc::new_in("hello".to_owned(), System);
+    /// let (ptr, alloc) = Arc::into_raw_with_allocator(x);
+    /// assert_eq!(unsafe { &*ptr }, "hello");
+    /// let x = unsafe { Arc::from_raw_in(ptr, alloc) };
+    /// assert_eq!(&*x, "hello");
+    /// ```
+    #[must_use = "losing the pointer will leak memory"]
+    #[unstable(feature = "allocator_api", issue = "32838")]
+    pub fn into_raw_with_allocator(this: Self) -> (*const T, A) {
+        let this = mem::ManuallyDrop::new(this);
+        let ptr = Self::as_ptr(&this);
+        // Safety: `this` is ManuallyDrop so the allocator will not be double-dropped
+        let alloc = unsafe { ptr::read(&this.alloc) };
+        (ptr, alloc)
     }
 
     /// Provides a raw pointer to the data.
@@ -1732,6 +1770,8 @@ impl<T: ?Sized, A: Allocator> Arc<T, A> {
     ///     // the `Arc` between threads.
     ///     let five = Arc::from_raw_in(ptr, System);
     ///     assert_eq!(2, Arc::strong_count(&five));
+    /// #   // Prevent leaks for Miri.
+    /// #   Arc::decrement_strong_count_in(ptr, System);
     /// }
     /// ```
     #[inline]
@@ -2107,10 +2147,14 @@ impl<T: ?Sized, A: Allocator> Deref for Arc<T, A> {
     }
 }
 
+#[unstable(feature = "deref_pure_trait", issue = "87121")]
+unsafe impl<T: ?Sized, A: Allocator> DerefPure for Arc<T, A> {}
+
 #[unstable(feature = "receiver_trait", issue = "none")]
 impl<T: ?Sized> Receiver for Arc<T> {}
 
-impl<T: Clone, A: Allocator + Clone> Arc<T, A> {
+#[cfg(not(no_global_oom_handling))]
+impl<T: ?Sized + CloneToUninit, A: Allocator + Clone> Arc<T, A> {
     /// Makes a mutable reference into the given `Arc`.
     ///
     /// If there are other `Arc` pointers to the same allocation, then `make_mut` will
@@ -2161,10 +2205,11 @@ impl<T: Clone, A: Allocator + Clone> Arc<T, A> {
     /// assert!(76 == *data);
     /// assert!(weak.upgrade().is_none());
     /// ```
-    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "arc_unique", since = "1.4.0")]
     pub fn make_mut(this: &mut Self) -> &mut T {
+        let size_of_val = mem::size_of_val::<T>(&**this);
+
         // Note that we hold both a strong reference and a weak reference.
         // Thus, releasing our strong reference only will not, by itself, cause
         // the memory to be deallocated.
@@ -2175,13 +2220,19 @@ impl<T: Clone, A: Allocator + Clone> Arc<T, A> {
         // deallocated.
         if this.inner().strong.compare_exchange(1, 0, Acquire, Relaxed).is_err() {
             // Another strong pointer exists, so we must clone.
-            // Pre-allocate memory to allow writing the cloned value directly.
-            let mut arc = Self::new_uninit_in(this.alloc.clone());
-            unsafe {
-                let data = Arc::get_mut_unchecked(&mut arc);
-                (**this).write_clone_into_raw(data.as_mut_ptr());
-                *this = arc.assume_init();
-            }
+
+            let this_data_ref: &T = &**this;
+            // `in_progress` drops the allocation if we panic before finishing initializing it.
+            let mut in_progress: UniqueArcUninit<T, A> =
+                UniqueArcUninit::new(this_data_ref, this.alloc.clone());
+
+            let initialized_clone = unsafe {
+                // Clone. If the clone panics, `in_progress` will be dropped and clean up.
+                this_data_ref.clone_to_uninit(in_progress.data_ptr());
+                // Cast type of pointer, now that it is initialized.
+                in_progress.into_arc()
+            };
+            *this = initialized_clone;
         } else if this.inner().weak.load(Relaxed) != 1 {
             // Relaxed suffices in the above because this is fundamentally an
             // optimization: we are always racing with weak pointers being
@@ -2200,11 +2251,22 @@ impl<T: Clone, A: Allocator + Clone> Arc<T, A> {
             let _weak = Weak { ptr: this.ptr, alloc: this.alloc.clone() };
 
             // Can just steal the data, all that's left is Weaks
-            let mut arc = Self::new_uninit_in(this.alloc.clone());
+            //
+            // We don't need panic-protection like the above branch does, but we might as well
+            // use the same mechanism.
+            let mut in_progress: UniqueArcUninit<T, A> =
+                UniqueArcUninit::new(&**this, this.alloc.clone());
             unsafe {
-                let data = Arc::get_mut_unchecked(&mut arc);
-                data.as_mut_ptr().copy_from_nonoverlapping(&**this, 1);
-                ptr::write(this, arc.assume_init());
+                // Initialize `in_progress` with move of **this.
+                // We have to express this in terms of bytes because `T: ?Sized`; there is no
+                // operation that just copies a value based on its `size_of_val()`.
+                ptr::copy_nonoverlapping(
+                    ptr::from_ref(&**this).cast::<u8>(),
+                    in_progress.data_ptr().cast::<u8>(),
+                    size_of_val,
+                );
+
+                ptr::write(this, in_progress.into_arc());
             }
         } else {
             // We were the sole reference of either kind; bump back up the
@@ -2216,7 +2278,9 @@ impl<T: Clone, A: Allocator + Clone> Arc<T, A> {
         // either unique to begin with, or became one upon cloning the contents.
         unsafe { Self::get_mut_unchecked(this) }
     }
+}
 
+impl<T: Clone, A: Allocator> Arc<T, A> {
     /// If we have the only reference to `T` then unwrap it. Otherwise, clone `T` and return the
     /// clone.
     ///
@@ -2455,6 +2519,14 @@ unsafe impl<#[may_dangle] T: ?Sized, A: Allocator> Drop for Arc<T, A> {
         // [2]: (https://github.com/rust-lang/rust/pull/41714)
         acquire!(self.inner().strong);
 
+        // Make sure we aren't trying to "drop" the shared static for empty slices
+        // used by Default::default.
+        debug_assert!(
+            !ptr::addr_eq(self.ptr.as_ptr(), &STATIC_INNER_SLICE.inner),
+            "Arcs backed by a static should never reach a strong count of 0. \
+            Likely decrement_strong_count or from_raw were called too many times.",
+        );
+
         unsafe {
             self.drop_slow();
         }
@@ -2488,7 +2560,7 @@ impl<A: Allocator> Arc<dyn Any + Send + Sync, A> {
     {
         if (*self).is::<T>() {
             unsafe {
-                let (ptr, alloc) = self.internal_into_inner_with_allocator();
+                let (ptr, alloc) = Arc::into_inner_with_allocator(self);
                 Ok(Arc::from_inner_in(ptr.cast(), alloc))
             }
         } else {
@@ -2529,7 +2601,7 @@ impl<A: Allocator> Arc<dyn Any + Send + Sync, A> {
         T: Any + Send + Sync,
     {
         unsafe {
-            let (ptr, alloc) = self.internal_into_inner_with_allocator();
+            let (ptr, alloc) = Arc::into_inner_with_allocator(self);
             Arc::from_inner_in(ptr.cast(), alloc)
         }
     }
@@ -2650,6 +2722,13 @@ impl<T: ?Sized> Weak<T> {
 }
 
 impl<T: ?Sized, A: Allocator> Weak<T, A> {
+    /// Returns a reference to the underlying allocator.
+    #[inline]
+    #[unstable(feature = "allocator_api", issue = "32838")]
+    pub fn allocator(&self) -> &A {
+        &self.alloc
+    }
+
     /// Returns a raw pointer to the object `T` pointed to by this `Weak<T>`.
     ///
     /// The pointer is valid only if there are some strong references. The pointer may be dangling,
@@ -2719,12 +2798,51 @@ impl<T: ?Sized, A: Allocator> Weak<T, A> {
     ///
     /// [`from_raw`]: Weak::from_raw
     /// [`as_ptr`]: Weak::as_ptr
-    #[must_use = "`self` will be dropped if the result is not used"]
+    #[must_use = "losing the pointer will leak memory"]
     #[stable(feature = "weak_into_raw", since = "1.45.0")]
     pub fn into_raw(self) -> *const T {
         let result = self.as_ptr();
         mem::forget(self);
         result
+    }
+
+    /// Consumes the `Weak<T>`, returning the wrapped pointer and allocator.
+    ///
+    /// This converts the weak pointer into a raw pointer, while still preserving the ownership of
+    /// one weak reference (the weak count is not modified by this operation). It can be turned
+    /// back into the `Weak<T>` with [`from_raw_in`].
+    ///
+    /// The same restrictions of accessing the target of the pointer as with
+    /// [`as_ptr`] apply.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(allocator_api)]
+    /// use std::sync::{Arc, Weak};
+    /// use std::alloc::System;
+    ///
+    /// let strong = Arc::new_in("hello".to_owned(), System);
+    /// let weak = Arc::downgrade(&strong);
+    /// let (raw, alloc) = weak.into_raw_with_allocator();
+    ///
+    /// assert_eq!(1, Arc::weak_count(&strong));
+    /// assert_eq!("hello", unsafe { &*raw });
+    ///
+    /// drop(unsafe { Weak::from_raw_in(raw, alloc) });
+    /// assert_eq!(0, Arc::weak_count(&strong));
+    /// ```
+    ///
+    /// [`from_raw_in`]: Weak::from_raw_in
+    /// [`as_ptr`]: Weak::as_ptr
+    #[must_use = "losing the pointer will leak memory"]
+    #[unstable(feature = "allocator_api", issue = "32838")]
+    pub fn into_raw_with_allocator(self) -> (*const T, A) {
+        let this = mem::ManuallyDrop::new(self);
+        let result = this.as_ptr();
+        // Safety: `this` is ManuallyDrop so the allocator will not be double-dropped
+        let alloc = unsafe { ptr::read(&this.alloc) };
+        (result, alloc)
     }
 
     /// Converts a raw pointer previously created by [`into_raw`] back into `Weak<T>` in the provided
@@ -3046,6 +3164,15 @@ unsafe impl<#[may_dangle] T: ?Sized, A: Allocator> Drop for Weak<T, A> {
 
         if inner.weak.fetch_sub(1, Release) == 1 {
             acquire!(inner.weak);
+
+            // Make sure we aren't trying to "deallocate" the shared static for empty slices
+            // used by Default::default.
+            debug_assert!(
+                !ptr::addr_eq(self.ptr.as_ptr(), &STATIC_INNER_SLICE.inner),
+                "Arc/Weaks backed by a static should never be deallocated. \
+                Likely decrement_strong_count or from_raw were called too many times.",
+            );
+
             unsafe {
                 self.alloc.deallocate(self.ptr.cast(), Layout::for_value_raw(self.ptr.as_ptr()))
             }
@@ -3287,6 +3414,89 @@ impl<T: Default> Default for Arc<T> {
     }
 }
 
+/// Struct to hold the static `ArcInner` used for empty `Arc<str/CStr/[T]>` as
+/// returned by `Default::default`.
+///
+/// Layout notes:
+/// * `repr(align(16))` so we can use it for `[T]` with `align_of::<T>() <= 16`.
+/// * `repr(C)` so `inner` is at offset 0 (and thus guaranteed to actually be aligned to 16).
+/// * `[u8; 1]` (to be initialized with 0) so it can be used for `Arc<CStr>`.
+#[repr(C, align(16))]
+struct SliceArcInnerForStatic {
+    inner: ArcInner<[u8; 1]>,
+}
+#[cfg(not(no_global_oom_handling))]
+const MAX_STATIC_INNER_SLICE_ALIGNMENT: usize = 16;
+
+static STATIC_INNER_SLICE: SliceArcInnerForStatic = SliceArcInnerForStatic {
+    inner: ArcInner {
+        strong: atomic::AtomicUsize::new(1),
+        weak: atomic::AtomicUsize::new(1),
+        data: [0],
+    },
+};
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "more_rc_default_impls", since = "1.80.0")]
+impl Default for Arc<str> {
+    /// Creates an empty str inside an Arc
+    ///
+    /// This may or may not share an allocation with other Arcs.
+    #[inline]
+    fn default() -> Self {
+        let arc: Arc<[u8]> = Default::default();
+        debug_assert!(core::str::from_utf8(&*arc).is_ok());
+        let (ptr, alloc) = Arc::into_inner_with_allocator(arc);
+        unsafe { Arc::from_ptr_in(ptr.as_ptr() as *mut ArcInner<str>, alloc) }
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "more_rc_default_impls", since = "1.80.0")]
+impl Default for Arc<core::ffi::CStr> {
+    /// Creates an empty CStr inside an Arc
+    ///
+    /// This may or may not share an allocation with other Arcs.
+    #[inline]
+    fn default() -> Self {
+        use core::ffi::CStr;
+        let inner: NonNull<ArcInner<[u8]>> = NonNull::from(&STATIC_INNER_SLICE.inner);
+        let inner: NonNull<ArcInner<CStr>> =
+            NonNull::new(inner.as_ptr() as *mut ArcInner<CStr>).unwrap();
+        // `this` semantically is the Arc "owned" by the static, so make sure not to drop it.
+        let this: mem::ManuallyDrop<Arc<CStr>> =
+            unsafe { mem::ManuallyDrop::new(Arc::from_inner(inner)) };
+        (*this).clone()
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "more_rc_default_impls", since = "1.80.0")]
+impl<T> Default for Arc<[T]> {
+    /// Creates an empty `[T]` inside an Arc
+    ///
+    /// This may or may not share an allocation with other Arcs.
+    #[inline]
+    fn default() -> Self {
+        if mem::align_of::<T>() <= MAX_STATIC_INNER_SLICE_ALIGNMENT {
+            // We take a reference to the whole struct instead of the ArcInner<[u8; 1]> inside it so
+            // we don't shrink the range of bytes the ptr is allowed to access under Stacked Borrows.
+            // (Miri complains on 32-bit targets with Arc<[Align16]> otherwise.)
+            // (Note that NonNull::from(&STATIC_INNER_SLICE.inner) is fine under Tree Borrows.)
+            let inner: NonNull<SliceArcInnerForStatic> = NonNull::from(&STATIC_INNER_SLICE);
+            let inner: NonNull<ArcInner<[T; 0]>> = inner.cast();
+            // `this` semantically is the Arc "owned" by the static, so make sure not to drop it.
+            let this: mem::ManuallyDrop<Arc<[T; 0]>> =
+                unsafe { mem::ManuallyDrop::new(Arc::from_inner(inner)) };
+            return (*this).clone();
+        }
+
+        // If T's alignment is too large for the static, make a new unique allocation.
+        let arr: [T; 0] = [];
+        Arc::from(arr)
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized + Hash, A: Allocator> Hash for Arc<T, A> {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -3495,7 +3705,7 @@ impl<T, A: Allocator, const N: usize> TryFrom<Arc<[T], A>> for Arc<[T; N], A> {
 
     fn try_from(boxed_slice: Arc<[T], A>) -> Result<Self, Self::Error> {
         if boxed_slice.len() == N {
-            let (ptr, alloc) = boxed_slice.internal_into_inner_with_allocator();
+            let (ptr, alloc) = Arc::into_inner_with_allocator(boxed_slice);
             Ok(unsafe { Arc::from_inner_in(ptr.cast(), alloc) })
         } else {
             Err(boxed_slice)
@@ -3626,6 +3836,68 @@ unsafe fn data_offset<T: ?Sized>(ptr: *const T) -> usize {
 fn data_offset_align(align: usize) -> usize {
     let layout = Layout::new::<ArcInner<()>>();
     layout.size() + layout.padding_needed_for(align)
+}
+
+/// A unique owning pointer to a [`ArcInner`] **that does not imply the contents are initialized,**
+/// but will deallocate it (without dropping the value) when dropped.
+///
+/// This is a helper for [`Arc::make_mut()`] to ensure correct cleanup on panic.
+#[cfg(not(no_global_oom_handling))]
+struct UniqueArcUninit<T: ?Sized, A: Allocator> {
+    ptr: NonNull<ArcInner<T>>,
+    layout_for_value: Layout,
+    alloc: Option<A>,
+}
+
+#[cfg(not(no_global_oom_handling))]
+impl<T: ?Sized, A: Allocator> UniqueArcUninit<T, A> {
+    /// Allocate a ArcInner with layout suitable to contain `for_value` or a clone of it.
+    fn new(for_value: &T, alloc: A) -> UniqueArcUninit<T, A> {
+        let layout = Layout::for_value(for_value);
+        let ptr = unsafe {
+            Arc::allocate_for_layout(
+                layout,
+                |layout_for_arcinner| alloc.allocate(layout_for_arcinner),
+                |mem| mem.with_metadata_of(ptr::from_ref(for_value) as *const ArcInner<T>),
+            )
+        };
+        Self { ptr: NonNull::new(ptr).unwrap(), layout_for_value: layout, alloc: Some(alloc) }
+    }
+
+    /// Returns the pointer to be written into to initialize the [`Arc`].
+    fn data_ptr(&mut self) -> *mut T {
+        let offset = data_offset_align(self.layout_for_value.align());
+        unsafe { self.ptr.as_ptr().byte_add(offset) as *mut T }
+    }
+
+    /// Upgrade this into a normal [`Arc`].
+    ///
+    /// # Safety
+    ///
+    /// The data must have been initialized (by writing to [`Self::data_ptr()`]).
+    unsafe fn into_arc(mut self) -> Arc<T, A> {
+        let ptr = self.ptr;
+        let alloc = self.alloc.take().unwrap();
+        mem::forget(self);
+        // SAFETY: The pointer is valid as per `UniqueArcUninit::new`, and the caller is responsible
+        // for having initialized the data.
+        unsafe { Arc::from_ptr_in(ptr.as_ptr(), alloc) }
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+impl<T: ?Sized, A: Allocator> Drop for UniqueArcUninit<T, A> {
+    fn drop(&mut self) {
+        // SAFETY:
+        // * new() produced a pointer safe to deallocate.
+        // * We own the pointer unless into_arc() was called, which forgets us.
+        unsafe {
+            self.alloc.take().unwrap().deallocate(
+                self.ptr.cast(),
+                arcinner_layout_for_value_layout(self.layout_for_value),
+            );
+        }
+    }
 }
 
 #[stable(feature = "arc_error", since = "1.52.0")]

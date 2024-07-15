@@ -1,7 +1,7 @@
 //@ check-fail
 // Tests error conditions for specifying diagnostics using #[derive(Diagnostic)]
-//@ normalize-stderr-test "the following other types implement trait `IntoDiagnosticArg`:(?:.*\n){0,9}\s+and \d+ others" -> "normalized in stderr"
-//@ normalize-stderr-test "(COMPILER_DIR/.*\.rs):[0-9]+:[0-9]+" -> "$1:LL:CC"
+//@ normalize-stderr-test: "the following other types implement trait `IntoDiagArg`:(?:.*\n){0,9}\s+and \d+ others" -> "normalized in stderr"
+//@ normalize-stderr-test: "(COMPILER_DIR/.*\.rs):[0-9]+:[0-9]+" -> "$1:LL:CC"
 
 // The proc_macro2 crate handles spans differently when on beta/stable release rather than nightly,
 // changing the output of this test. Since Diagnostic is strictly internal to the compiler
@@ -25,7 +25,7 @@ extern crate rustc_middle;
 use rustc_middle::ty::Ty;
 
 extern crate rustc_errors;
-use rustc_errors::{Applicability, DiagnosticMessage, ErrCode, MultiSpan, SubdiagnosticMessage};
+use rustc_errors::{Applicability, DiagMessage, ErrCode, MultiSpan, SubdiagMessage};
 
 extern crate rustc_session;
 
@@ -347,7 +347,7 @@ struct ArgFieldWithoutSkip {
     #[primary_span]
     span: Span,
     other: Hello,
-    //~^ ERROR the trait bound `Hello: IntoDiagnosticArg` is not satisfied
+    //~^ ERROR the trait bound `Hello: IntoDiagArg` is not satisfied
 }
 
 #[derive(Diagnostic)]
@@ -355,7 +355,7 @@ struct ArgFieldWithoutSkip {
 struct ArgFieldWithSkip {
     #[primary_span]
     span: Span,
-    // `Hello` does not implement `IntoDiagnosticArg` so this would result in an error if
+    // `Hello` does not implement `IntoDiagArg` so this would result in an error if
     // not for `#[skip_arg]`.
     #[skip_arg]
     other: Hello,
@@ -603,7 +603,6 @@ struct LintAttributeOnSessionDiag {}
 #[derive(LintDiagnostic)]
 #[lint(no_crate_example, code = E0123)]
 //~^ ERROR `#[lint(...)]` is not a valid attribute
-//~| ERROR `#[lint(...)]` is not a valid attribute
 //~| ERROR diagnostic slug not specified
 //~| ERROR cannot find attribute `lint` in this scope
 struct LintAttributeOnLintDiag {}

@@ -25,9 +25,9 @@ use rustc_session::lint::builtin::{INEFFECTIVE_UNSTABLE_TRAIT_IMPL, USELESS_DEPR
 use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
-
 use std::mem::replace;
 use std::num::NonZero;
+use tracing::{debug, info};
 
 #[derive(PartialEq)]
 enum AnnotationKind {
@@ -173,10 +173,7 @@ impl<'a, 'tcx> Annotator<'a, 'tcx> {
         // If the current node is a function, has const stability attributes and if it doesn not have an intrinsic ABI,
         // check if the function/method is const or the parent impl block is const
         if let (Some(const_span), Some(fn_sig)) = (const_span, fn_sig) {
-            if fn_sig.header.abi != Abi::RustIntrinsic
-                && fn_sig.header.abi != Abi::PlatformIntrinsic
-                && !fn_sig.header.is_const()
-            {
+            if fn_sig.header.abi != Abi::RustIntrinsic && !fn_sig.header.is_const() {
                 if !self.in_trait_impl
                     || (self.in_trait_impl && !self.tcx.is_const_fn_raw(def_id.to_def_id()))
                 {
@@ -939,12 +936,6 @@ pub fn check_unused_or_stable_features(tcx: TyCtxt<'_>) {
     let declared_lib_features = &tcx.features().declared_lib_features;
     let mut remaining_lib_features = FxIndexMap::default();
     for (feature, span) in declared_lib_features {
-        if !tcx.sess.opts.unstable_features.is_nightly_build() {
-            tcx.dcx().emit_err(errors::FeatureOnlyOnNightly {
-                span: *span,
-                release_channel: env!("CFG_RELEASE_CHANNEL"),
-            });
-        }
         if remaining_lib_features.contains_key(&feature) {
             // Warn if the user enables a lib feature multiple times.
             tcx.dcx().emit_err(errors::DuplicateFeatureErr { span: *span, feature: *feature });

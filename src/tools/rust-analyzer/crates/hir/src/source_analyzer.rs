@@ -24,11 +24,12 @@ use hir_def::{
     LocalFieldId, Lookup, ModuleDefId, TraitId, VariantId,
 };
 use hir_expand::{
-    builtin_fn_macro::BuiltinFnLikeExpander,
     mod_path::path,
-    name,
-    name::{AsName, Name},
-    HirFileId, InFile, MacroFileId, MacroFileIdExt,
+    HirFileId, InFile, InMacroFile, MacroFileId, MacroFileIdExt,
+    {
+        name,
+        name::{AsName, Name},
+    },
 };
 use hir_ty::{
     diagnostics::{
@@ -118,7 +119,7 @@ impl SourceAnalyzer {
     fn expr_id(&self, db: &dyn HirDatabase, expr: &ast::Expr) -> Option<ExprId> {
         let src = match expr {
             ast::Expr::MacroExpr(expr) => {
-                self.expand_expr(db, InFile::new(self.file_id, expr.macro_call()?))?
+                self.expand_expr(db, InFile::new(self.file_id, expr.macro_call()?))?.into()
             }
             _ => InFile::new(self.file_id, expr.clone()),
         };
@@ -145,20 +146,20 @@ impl SourceAnalyzer {
         &self,
         db: &dyn HirDatabase,
         expr: InFile<ast::MacroCall>,
-    ) -> Option<InFile<ast::Expr>> {
+    ) -> Option<InMacroFile<ast::Expr>> {
         let macro_file = self.body_source_map()?.node_macro_file(expr.as_ref())?;
-        let expanded = db.parse_or_expand(macro_file);
+        let expanded = db.parse_macro_expansion(macro_file).value.0.syntax_node();
         let res = if let Some(stmts) = ast::MacroStmts::cast(expanded.clone()) {
             match stmts.expr()? {
                 ast::Expr::MacroExpr(mac) => {
-                    self.expand_expr(db, InFile::new(macro_file, mac.macro_call()?))?
+                    self.expand_expr(db, InFile::new(macro_file.into(), mac.macro_call()?))?
                 }
-                expr => InFile::new(macro_file, expr),
+                expr => InMacroFile::new(macro_file, expr),
             }
         } else if let Some(call) = ast::MacroCall::cast(expanded.clone()) {
-            self.expand_expr(db, InFile::new(macro_file, call))?
+            self.expand_expr(db, InFile::new(macro_file.into(), call))?
         } else {
-            InFile::new(macro_file, ast::Expr::cast(expanded)?)
+            InMacroFile::new(macro_file, ast::Expr::cast(expanded)?)
         };
 
         Some(res)
@@ -219,11 +220,10 @@ impl SourceAnalyzer {
     pub(crate) fn type_of_self(
         &self,
         db: &dyn HirDatabase,
-        param: &ast::SelfParam,
+        _param: &ast::SelfParam,
     ) -> Option<Type> {
-        let src = InFile { file_id: self.file_id, value: param };
-        let pat_id = self.body_source_map()?.node_self_param(src)?;
-        let ty = self.infer.as_ref()?[pat_id].clone();
+        let binding = self.body()?.self_param?;
+        let ty = self.infer.as_ref()?[binding].clone();
         Some(Type::new_with_resolver(db, &self.resolver, ty))
     }
 
@@ -303,6 +303,15 @@ impl SourceAnalyzer {
         }
     }
 
+    pub(crate) fn resolve_expr_as_callable(
+        &self,
+        db: &dyn HirDatabase,
+        call: &ast::Expr,
+    ) -> Option<Callable> {
+        let (orig, adjusted) = self.type_of_expr(db, &call.clone())?;
+        adjusted.unwrap_or(orig).as_callable(db)
+    }
+
     pub(crate) fn resolve_field(
         &self,
         db: &dyn HirDatabase,
@@ -377,14 +386,34 @@ impl SourceAnalyzer {
         db: &dyn HirDatabase,
         prefix_expr: &ast::PrefixExpr,
     ) -> Option<FunctionId> {
-        let (lang_item, fn_name) = match prefix_expr.op_kind()? {
-            ast::UnaryOp::Deref => (LangItem::Deref, name![deref]),
-            ast::UnaryOp::Not => (LangItem::Not, name![not]),
-            ast::UnaryOp::Neg => (LangItem::Neg, name![neg]),
+        let (op_trait, op_fn) = match prefix_expr.op_kind()? {
+            ast::UnaryOp::Deref => {
+                // This can be either `Deref::deref` or `DerefMut::deref_mut`.
+                // Since deref kind is inferenced and stored in `InferenceResult.method_resolution`,
+                // use that result to find out which one it is.
+                let (deref_trait, deref) =
+                    self.lang_trait_fn(db, LangItem::Deref, &name![deref])?;
+                self.infer
+                    .as_ref()
+                    .and_then(|infer| {
+                        let expr = self.expr_id(db, &prefix_expr.clone().into())?;
+                        let (func, _) = infer.method_resolution(expr)?;
+                        let (deref_mut_trait, deref_mut) =
+                            self.lang_trait_fn(db, LangItem::DerefMut, &name![deref_mut])?;
+                        if func == deref_mut {
+                            Some((deref_mut_trait, deref_mut))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or((deref_trait, deref))
+            }
+            ast::UnaryOp::Not => self.lang_trait_fn(db, LangItem::Not, &name![not])?,
+            ast::UnaryOp::Neg => self.lang_trait_fn(db, LangItem::Neg, &name![neg])?,
         };
+
         let ty = self.ty_of_expr(db, &prefix_expr.expr()?)?;
 
-        let (op_trait, op_fn) = self.lang_trait_fn(db, lang_item, &fn_name)?;
         // HACK: subst for all methods coincides with that for their trait because the methods
         // don't have any generic parameters, so we skip building another subst for the methods.
         let substs = hir_ty::TyBuilder::subst_for_def(db, op_trait, None).push(ty.clone()).build();
@@ -400,7 +429,22 @@ impl SourceAnalyzer {
         let base_ty = self.ty_of_expr(db, &index_expr.base()?)?;
         let index_ty = self.ty_of_expr(db, &index_expr.index()?)?;
 
-        let (op_trait, op_fn) = self.lang_trait_fn(db, LangItem::Index, &name![index])?;
+        let (index_trait, index_fn) = self.lang_trait_fn(db, LangItem::Index, &name![index])?;
+        let (op_trait, op_fn) = self
+            .infer
+            .as_ref()
+            .and_then(|infer| {
+                let expr = self.expr_id(db, &index_expr.clone().into())?;
+                let (func, _) = infer.method_resolution(expr)?;
+                let (index_mut_trait, index_mut_fn) =
+                    self.lang_trait_fn(db, LangItem::IndexMut, &name![index_mut])?;
+                if func == index_mut_fn {
+                    Some((index_mut_trait, index_mut_fn))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((index_trait, index_fn));
         // HACK: subst for all methods coincides with that for their trait because the methods
         // don't have any generic parameters, so we skip building another subst for the methods.
         let substs = hir_ty::TyBuilder::subst_for_def(db, op_trait, None)
@@ -506,7 +550,7 @@ impl SourceAnalyzer {
         db: &dyn HirDatabase,
         macro_call: InFile<&ast::MacroCall>,
     ) -> Option<Macro> {
-        let ctx = LowerCtx::with_file_id(db.upcast(), macro_call.file_id);
+        let ctx = LowerCtx::new(db.upcast(), macro_call.file_id);
         let path = macro_call.value.path().and_then(|ast| Path::from_src(&ctx, ast))?;
         self.resolver
             .resolve_path_as_macro(db.upcast(), path.mod_path()?, Some(MacroSubNs::Bang))
@@ -619,7 +663,7 @@ impl SourceAnalyzer {
         }
 
         // This must be a normal source file rather than macro file.
-        let ctx = LowerCtx::with_span_map(db.upcast(), db.span_map(self.file_id));
+        let ctx = LowerCtx::new(db.upcast(), self.file_id);
         let hir_path = Path::from_src(&ctx, path.clone())?;
 
         // Case where path is a qualifier of a use tree, e.g. foo::bar::{Baz, Qux} where we are
@@ -779,8 +823,10 @@ impl SourceAnalyzer {
         macro_call: InFile<&ast::MacroCall>,
     ) -> Option<MacroFileId> {
         let krate = self.resolver.krate();
+        // FIXME: This causes us to parse, generally this is the wrong approach for resolving a
+        // macro call to a macro call id!
         let macro_call_id = macro_call.as_call_id(db.upcast(), krate, |path| {
-            self.resolver.resolve_path_as_macro_def(db.upcast(), &path, Some(MacroSubNs::Bang))
+            self.resolver.resolve_path_as_macro_def(db.upcast(), path, Some(MacroSubNs::Bang))
         })?;
         // why the 64?
         Some(macro_call_id.as_macro_file()).filter(|it| it.expansion_level(db.upcast()) < 64)
@@ -796,37 +842,13 @@ impl SourceAnalyzer {
         infer.variant_resolution_for_expr(expr_id)
     }
 
-    pub(crate) fn is_unsafe_macro_call(
+    pub(crate) fn is_unsafe_macro_call_expr(
         &self,
         db: &dyn HirDatabase,
-        macro_call: InFile<&ast::MacroCall>,
+        macro_expr: InFile<&ast::MacroExpr>,
     ) -> bool {
-        // check for asm/global_asm
-        if let Some(mac) = self.resolve_macro_call(db, macro_call) {
-            let ex = match mac.id {
-                hir_def::MacroId::Macro2Id(it) => it.lookup(db.upcast()).expander,
-                hir_def::MacroId::MacroRulesId(it) => it.lookup(db.upcast()).expander,
-                _ => hir_def::MacroExpander::Declarative,
-            };
-            match ex {
-                hir_def::MacroExpander::BuiltIn(e)
-                    if e == BuiltinFnLikeExpander::Asm || e == BuiltinFnLikeExpander::GlobalAsm =>
-                {
-                    return true
-                }
-                _ => (),
-            }
-        }
-        let macro_expr = match macro_call
-            .map(|it| it.syntax().parent().and_then(ast::MacroExpr::cast))
-            .transpose()
-        {
-            Some(it) => it,
-            None => return false,
-        };
-
         if let (Some((def, body, sm)), Some(infer)) = (&self.def, &self.infer) {
-            if let Some(expanded_expr) = sm.macro_expansion_expr(macro_expr.as_ref()) {
+            if let Some(expanded_expr) = sm.macro_expansion_expr(macro_expr) {
                 let mut is_unsafe = false;
                 unsafe_expressions(
                     db,

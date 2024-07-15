@@ -1,21 +1,26 @@
+use crate::infer::error_reporting::hir::Path;
+use core::ops::ControlFlow;
 use hir::def::CtorKind;
 use hir::intravisit::{walk_expr, walk_stmt, Visitor};
+use hir::{LetStmt, QPath};
 use rustc_data_structures::fx::FxIndexSet;
-use rustc_errors::{Applicability, DiagnosticBuilder};
+use rustc_errors::{Applicability, Diag};
 use rustc_hir as hir;
+use rustc_hir::def::Res;
+use rustc_hir::MatchSource;
+use rustc_hir::Node;
 use rustc_middle::traits::{
     IfExpressionCause, MatchExpressionArmCause, ObligationCause, ObligationCauseCode,
     StatementAsExpression,
 };
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self as ty, GenericArgKind, IsSuggestable, Ty, TypeVisitableExt};
-use rustc_span::{sym, BytePos, Span};
+use rustc_span::{sym, Span};
 
 use crate::errors::{
     ConsiderAddingAwait, FnConsiderCasting, FnItemsAreDistinct, FnUniqTypes,
-    FunctionPointerSuggestion, SuggestAccessingField, SuggestBoxingForReturnImplTrait,
-    SuggestRemoveSemiOrReturnBinding, SuggestTuplePatternMany, SuggestTuplePatternOne,
-    TypeErrorAdditionalDiags,
+    FunctionPointerSuggestion, SuggestAccessingField, SuggestRemoveSemiOrReturnBinding,
+    SuggestTuplePatternMany, SuggestTuplePatternOne, TypeErrorAdditionalDiags,
 };
 
 use super::TypeErrCtxt;
@@ -74,33 +79,11 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         }
     }
 
-    pub(super) fn suggest_boxing_for_return_impl_trait(
-        &self,
-        err: &mut DiagnosticBuilder<'_>,
-        return_sp: Span,
-        arm_spans: impl Iterator<Item = Span>,
-    ) {
-        let sugg = SuggestBoxingForReturnImplTrait::ChangeReturnType {
-            start_sp: return_sp.with_hi(return_sp.lo() + BytePos(4)),
-            end_sp: return_sp.shrink_to_hi(),
-        };
-        err.subdiagnostic(self.dcx(), sugg);
-
-        let mut starts = Vec::new();
-        let mut ends = Vec::new();
-        for span in arm_spans {
-            starts.push(span.shrink_to_lo());
-            ends.push(span.shrink_to_hi());
-        }
-        let sugg = SuggestBoxingForReturnImplTrait::BoxReturnExpr { starts, ends };
-        err.subdiagnostic(self.dcx(), sugg);
-    }
-
     pub(super) fn suggest_tuple_pattern(
         &self,
         cause: &ObligationCause<'tcx>,
         exp_found: &ty::error::ExpectedFound<Ty<'tcx>>,
-        diag: &mut DiagnosticBuilder<'_>,
+        diag: &mut Diag<'_>,
     ) {
         // Heavily inspired by `FnCtxt::suggest_compatible_variants`, with
         // some modifications due to that being in typeck and this being in infer.
@@ -138,7 +121,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                             span_low: cause.span.shrink_to_lo(),
                             span_high: cause.span.shrink_to_hi(),
                         };
-                        diag.subdiagnostic(self.dcx(), sugg);
+                        diag.subdiagnostic(sugg);
                     }
                     _ => {
                         // More than one matching variant.
@@ -147,7 +130,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                             cause_span: cause.span,
                             compatible_variants,
                         };
-                        diag.subdiagnostic(self.dcx(), sugg);
+                        diag.subdiagnostic(sugg);
                     }
                 }
             }
@@ -177,14 +160,14 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         cause: &ObligationCause<'tcx>,
         exp_span: Span,
         exp_found: &ty::error::ExpectedFound<Ty<'tcx>>,
-        diag: &mut DiagnosticBuilder<'_>,
+        diag: &mut Diag<'_>,
     ) {
         debug!(
             "suggest_await_on_expect_found: exp_span={:?}, expected_ty={:?}, found_ty={:?}",
             exp_span, exp_found.expected, exp_found.found,
         );
 
-        if let ObligationCauseCode::CompareImplItemObligation { .. } = cause.code() {
+        if let ObligationCauseCode::CompareImplItem { .. } = cause.code() {
             return;
         }
 
@@ -219,16 +202,17 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             },
             (_, Some(ty)) if self.same_type_modulo_infer(exp_found.expected, ty) => {
                 // FIXME: Seems like we can't have a suggestion and a note with different spans in a single subdiagnostic
-                diag.subdiagnostic(
-                    self.dcx(),
-                    ConsiderAddingAwait::FutureSugg { span: exp_span.shrink_to_hi() },
-                );
+                diag.subdiagnostic(ConsiderAddingAwait::FutureSugg {
+                    span: exp_span.shrink_to_hi(),
+                });
                 Some(ConsiderAddingAwait::FutureSuggNote { span: exp_span })
             }
             (Some(ty), _) if self.same_type_modulo_infer(ty, exp_found.found) => match cause.code()
             {
-                ObligationCauseCode::Pattern { span: Some(then_span), .. } => {
-                    Some(ConsiderAddingAwait::FutureSugg { span: then_span.shrink_to_hi() })
+                ObligationCauseCode::Pattern { span: Some(then_span), origin_expr, .. } => {
+                    origin_expr.then_some(ConsiderAddingAwait::FutureSugg {
+                        span: then_span.shrink_to_hi(),
+                    })
                 }
                 ObligationCauseCode::IfExpression(box IfExpressionCause { then_id, .. }) => {
                     let then_span = self.find_block_span_from_hir_id(*then_id);
@@ -250,7 +234,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             _ => None,
         };
         if let Some(subdiag) = subdiag {
-            diag.subdiagnostic(self.dcx(), subdiag);
+            diag.subdiagnostic(subdiag);
         }
     }
 
@@ -258,7 +242,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         &self,
         cause: &ObligationCause<'tcx>,
         exp_found: &ty::error::ExpectedFound<Ty<'tcx>>,
-        diag: &mut DiagnosticBuilder<'_>,
+        diag: &mut Diag<'_>,
     ) {
         debug!(
             "suggest_accessing_field_where_appropriate(cause={:?}, exp_found={:?})",
@@ -286,10 +270,102 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                         } else {
                             return;
                         };
-                        diag.subdiagnostic(self.dcx(), suggestion);
+                        diag.subdiagnostic(suggestion);
                     }
                 }
             }
+        }
+    }
+
+    pub(super) fn suggest_turning_stmt_into_expr(
+        &self,
+        cause: &ObligationCause<'tcx>,
+        exp_found: &ty::error::ExpectedFound<Ty<'tcx>>,
+        diag: &mut Diag<'_>,
+    ) {
+        let ty::error::ExpectedFound { expected, found } = exp_found;
+        if !found.peel_refs().is_unit() {
+            return;
+        }
+
+        let ObligationCauseCode::BlockTailExpression(hir_id, MatchSource::Normal) = cause.code()
+        else {
+            return;
+        };
+
+        let node = self.tcx.hir_node(*hir_id);
+        let mut blocks = vec![];
+        if let hir::Node::Block(block) = node
+            && let Some(expr) = block.expr
+            && let hir::ExprKind::Path(QPath::Resolved(_, Path { res, .. })) = expr.kind
+            && let Res::Local(local) = res
+            && let Node::LetStmt(LetStmt { init: Some(init), .. }) =
+                self.tcx.parent_hir_node(*local)
+        {
+            fn collect_blocks<'hir>(expr: &hir::Expr<'hir>, blocks: &mut Vec<&hir::Block<'hir>>) {
+                match expr.kind {
+                    // `blk1` and `blk2` must be have the same types, it will be reported before reaching here
+                    hir::ExprKind::If(_, blk1, Some(blk2)) => {
+                        collect_blocks(blk1, blocks);
+                        collect_blocks(blk2, blocks);
+                    }
+                    hir::ExprKind::Match(_, arms, _) => {
+                        // all arms must have same types
+                        for arm in arms.iter() {
+                            collect_blocks(arm.body, blocks);
+                        }
+                    }
+                    hir::ExprKind::Block(blk, _) => {
+                        blocks.push(blk);
+                    }
+                    _ => {}
+                }
+            }
+            collect_blocks(init, &mut blocks);
+        }
+
+        let expected_inner: Ty<'_> = expected.peel_refs();
+        for block in blocks.iter() {
+            self.consider_removing_semicolon(block, expected_inner, diag);
+        }
+    }
+
+    /// A common error is to add an extra semicolon:
+    ///
+    /// ```compile_fail,E0308
+    /// fn foo() -> usize {
+    ///     22;
+    /// }
+    /// ```
+    ///
+    /// This routine checks if the final statement in a block is an
+    /// expression with an explicit semicolon whose type is compatible
+    /// with `expected_ty`. If so, it suggests removing the semicolon.
+    pub fn consider_removing_semicolon(
+        &self,
+        blk: &'tcx hir::Block<'tcx>,
+        expected_ty: Ty<'tcx>,
+        diag: &mut Diag<'_>,
+    ) -> bool {
+        if let Some((span_semi, boxed)) = self.could_remove_semicolon(blk, expected_ty) {
+            if let StatementAsExpression::NeedsBoxing = boxed {
+                diag.span_suggestion_verbose(
+                    span_semi,
+                    "consider removing this semicolon and boxing the expression",
+                    "",
+                    Applicability::HasPlaceholders,
+                );
+            } else {
+                diag.span_suggestion_short(
+                    span_semi,
+                    "remove this semicolon to return this value",
+                    "",
+                    Applicability::MachineApplicable,
+                );
+            }
+            true
+        } else {
+            false
         }
     }
 
@@ -298,7 +374,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         cause: &ObligationCause<'tcx>,
         span: Span,
         exp_found: &ty::error::ExpectedFound<Ty<'tcx>>,
-        diag: &mut DiagnosticBuilder<'_>,
+        diag: &mut Diag<'_>,
     ) {
         debug!("suggest_function_pointers(cause={:?}, exp_found={:?})", cause, exp_found);
         let ty::error::ExpectedFound { expected, found } = exp_found;
@@ -326,15 +402,15 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     (true, false) => FunctionPointerSuggestion::UseRef { span, fn_name },
                     (false, true) => FunctionPointerSuggestion::RemoveRef { span, fn_name },
                     (true, true) => {
-                        diag.subdiagnostic(self.dcx(), FnItemsAreDistinct);
+                        diag.subdiagnostic(FnItemsAreDistinct);
                         FunctionPointerSuggestion::CastRef { span, fn_name, sig: *sig }
                     }
                     (false, false) => {
-                        diag.subdiagnostic(self.dcx(), FnItemsAreDistinct);
+                        diag.subdiagnostic(FnItemsAreDistinct);
                         FunctionPointerSuggestion::Cast { span, fn_name, sig: *sig }
                     }
                 };
-                diag.subdiagnostic(self.dcx(), sugg);
+                diag.subdiagnostic(sugg);
             }
             (ty::FnDef(did1, args1), ty::FnDef(did2, args2)) => {
                 let expected_sig =
@@ -343,7 +419,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     &(self.normalize_fn_sig)(self.tcx.fn_sig(*did2).instantiate(self.tcx, args2));
 
                 if self.same_type_modulo_infer(*expected_sig, *found_sig) {
-                    diag.subdiagnostic(self.dcx(), FnUniqTypes);
+                    diag.subdiagnostic(FnUniqTypes);
                 }
 
                 if !self.same_type_modulo_infer(*found_sig, *expected_sig)
@@ -372,7 +448,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     }
                 };
 
-                diag.subdiagnostic(self.dcx(), sug);
+                diag.subdiagnostic(sug);
             }
             (ty::FnDef(did, args), ty::FnPtr(sig)) => {
                 let expected_sig =
@@ -391,7 +467,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     format!("{fn_name} as {found_sig}")
                 };
 
-                diag.subdiagnostic(self.dcx(), FnConsiderCasting { casting });
+                diag.subdiagnostic(FnConsiderCasting { casting });
             }
             _ => {
                 return;
@@ -467,62 +543,50 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         cause: &ObligationCause<'_>,
         span: Span,
     ) -> Option<TypeErrorAdditionalDiags> {
-        let hir = self.tcx.hir();
-        if let Some(body_id) = self.tcx.hir().maybe_body_owned_by(cause.body_id) {
-            let body = hir.body(body_id);
+        /// Find the if expression with given span
+        struct IfVisitor {
+            pub found_if: bool,
+            pub err_span: Span,
+        }
 
-            /// Find the if expression with given span
-            struct IfVisitor {
-                pub result: bool,
-                pub found_if: bool,
-                pub err_span: Span,
-            }
-
-            impl<'v> Visitor<'v> for IfVisitor {
-                fn visit_expr(&mut self, ex: &'v hir::Expr<'v>) {
-                    if self.result {
-                        return;
+        impl<'v> Visitor<'v> for IfVisitor {
+            type Result = ControlFlow<()>;
+            fn visit_expr(&mut self, ex: &'v hir::Expr<'v>) -> Self::Result {
+                match ex.kind {
+                    hir::ExprKind::If(cond, _, _) => {
+                        self.found_if = true;
+                        walk_expr(self, cond)?;
+                        self.found_if = false;
+                        ControlFlow::Continue(())
                     }
-                    match ex.kind {
-                        hir::ExprKind::If(cond, _, _) => {
-                            self.found_if = true;
-                            walk_expr(self, cond);
-                            self.found_if = false;
-                        }
-                        _ => walk_expr(self, ex),
-                    }
-                }
-
-                fn visit_stmt(&mut self, ex: &'v hir::Stmt<'v>) {
-                    if let hir::StmtKind::Local(hir::Local {
-                        span,
-                        pat: hir::Pat { .. },
-                        ty: None,
-                        init: Some(_),
-                        ..
-                    }) = &ex.kind
-                        && self.found_if
-                        && span.eq(&self.err_span)
-                    {
-                        self.result = true;
-                    }
-                    walk_stmt(self, ex);
-                }
-
-                fn visit_body(&mut self, body: &'v hir::Body<'v>) {
-                    hir::intravisit::walk_body(self, body);
+                    _ => walk_expr(self, ex),
                 }
             }
 
-            let mut visitor = IfVisitor { err_span: span, found_if: false, result: false };
-            visitor.visit_body(body);
-            if visitor.result {
-                return Some(TypeErrorAdditionalDiags::AddLetForLetChains {
-                    span: span.shrink_to_lo(),
-                });
+            fn visit_stmt(&mut self, ex: &'v hir::Stmt<'v>) -> Self::Result {
+                if let hir::StmtKind::Let(LetStmt {
+                    span,
+                    pat: hir::Pat { .. },
+                    ty: None,
+                    init: Some(_),
+                    ..
+                }) = &ex.kind
+                    && self.found_if
+                    && span.eq(&self.err_span)
+                {
+                    ControlFlow::Break(())
+                } else {
+                    walk_stmt(self, ex)
+                }
             }
         }
-        None
+
+        self.tcx.hir().maybe_body_owned_by(cause.body_id).and_then(|body| {
+            IfVisitor { err_span: span, found_if: false }
+                .visit_body(&body)
+                .is_break()
+                .then(|| TypeErrorAdditionalDiags::AddLetForLetChains { span: span.shrink_to_lo() })
+        })
     }
 
     /// For "one type is more general than the other" errors on closures, suggest changing the lifetime
@@ -531,8 +595,8 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         &self,
         span: Span,
         hir: hir::Node<'_>,
-        exp_found: &ty::error::ExpectedFound<ty::PolyTraitRef<'tcx>>,
-        diag: &mut DiagnosticBuilder<'_>,
+        exp_found: &ty::error::ExpectedFound<ty::TraitRef<'tcx>>,
+        diag: &mut Diag<'_>,
     ) {
         // 0. Extract fn_decl from hir
         let hir::Node::Expr(hir::Expr {
@@ -546,10 +610,10 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
 
         // 1. Get the args of the closure.
         // 2. Assume exp_found is FnOnce / FnMut / Fn, we can extract function parameters from [1].
-        let Some(expected) = exp_found.expected.skip_binder().args.get(1) else {
+        let Some(expected) = exp_found.expected.args.get(1) else {
             return;
         };
-        let Some(found) = exp_found.found.skip_binder().args.get(1) else {
+        let Some(found) = exp_found.found.args.get(1) else {
             return;
         };
         let expected = expected.unpack();
@@ -695,8 +759,14 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             let mac_call = rustc_span::source_map::original_sp(last_stmt.span, blk.span);
             self.tcx.sess.source_map().mac_call_stmt_semi_span(mac_call)?
         } else {
-            last_stmt.span.with_lo(last_stmt.span.hi() - BytePos(1))
+            self.tcx
+                .sess
+                .source_map()
+                .span_extend_while_whitespace(last_expr.span)
+                .shrink_to_hi()
+                .with_hi(last_stmt.span.hi())
         };
+
         Some((span, needs_box))
     }
 
@@ -734,7 +804,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
 
         let hir = self.tcx.hir();
         for stmt in blk.stmts.iter().rev() {
-            let hir::StmtKind::Local(local) = &stmt.kind else {
+            let hir::StmtKind::Let(local) = &stmt.kind else {
                 continue;
             };
             local.pat.walk(&mut find_compatible_candidates);
@@ -799,10 +869,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                         format!(" {ident} ")
                     };
                     let left_span = sm.span_through_char(blk.span, '{').shrink_to_hi();
-                    (
-                        sm.span_extend_while(left_span, |c| c.is_whitespace()).unwrap_or(left_span),
-                        sugg,
-                    )
+                    (sm.span_extend_while_whitespace(left_span), sugg)
                 };
                 Some(SuggestRemoveSemiOrReturnBinding::Add { sp: span, code: sugg, ident: *ident })
             }
@@ -818,12 +885,12 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         &self,
         blk: &'tcx hir::Block<'tcx>,
         expected_ty: Ty<'tcx>,
-        err: &mut DiagnosticBuilder<'_>,
+        err: &mut Diag<'_>,
     ) -> bool {
         let diag = self.consider_returning_binding_diag(blk, expected_ty);
         match diag {
             Some(diag) => {
-                err.subdiagnostic(self.dcx(), diag);
+                err.subdiagnostic(diag);
                 true
             }
             None => false,

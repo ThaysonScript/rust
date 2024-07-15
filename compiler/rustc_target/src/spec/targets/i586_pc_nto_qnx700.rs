@@ -3,6 +3,12 @@ use crate::spec::{base, Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetOpt
 pub fn target() -> Target {
     Target {
         llvm_target: "i586-pc-unknown".into(),
+        metadata: crate::spec::TargetMetadata {
+            description: Some("32-bit x86 QNX Neutrino 7.0 RTOS".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(false),
+        },
         pointer_width: 32,
         data_layout: "e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-\
             i128:128-f64:32:64-f80:32-n8:16:32-S128"

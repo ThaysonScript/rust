@@ -1,6 +1,8 @@
 use crate::mir::mono::Linkage;
 use rustc_attr::{InlineAttr, InstructionSetAttr, OptimizeAttr};
+use rustc_macros::{HashStable, TyDecodable, TyEncodable};
 use rustc_span::symbol::Symbol;
+use rustc_target::abi::Align;
 use rustc_target::spec::SanitizerSet;
 
 #[derive(Clone, TyEncodable, TyDecodable, HashStable, Debug)]
@@ -42,12 +44,38 @@ pub struct CodegenFnAttrs {
     pub instruction_set: Option<InstructionSetAttr>,
     /// The `#[repr(align(...))]` attribute. Indicates the value of which the function should be
     /// aligned to.
-    pub alignment: Option<u32>,
+    pub alignment: Option<Align>,
+    /// The `#[patchable_function_entry(...)]` attribute. Indicates how many nops should be around
+    /// the function entry.
+    pub patchable_function_entry: Option<PatchableFunctionEntry>,
+}
+
+#[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, HashStable)]
+pub struct PatchableFunctionEntry {
+    /// Nops to prepend to the function
+    prefix: u8,
+    /// Nops after entry, but before body
+    entry: u8,
+}
+
+impl PatchableFunctionEntry {
+    pub fn from_config(config: rustc_session::config::PatchableFunctionEntry) -> Self {
+        Self { prefix: config.prefix(), entry: config.entry() }
+    }
+    pub fn from_prefix_and_entry(prefix: u8, entry: u8) -> Self {
+        Self { prefix, entry }
+    }
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
+    pub fn entry(&self) -> u8 {
+        self.entry
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, TyEncodable, TyDecodable, HashStable)]
 pub struct CodegenFnAttrFlags(u32);
-bitflags! {
+bitflags::bitflags! {
     impl CodegenFnAttrFlags: u32 {
         /// `#[cold]`: a hint to LLVM that this function, when called, is never on
         /// the hot path.
@@ -85,10 +113,7 @@ bitflags! {
         /// #[cmse_nonsecure_entry]: with a TrustZone-M extension, declare a
         /// function as an entry function from Non-Secure code.
         const CMSE_NONSECURE_ENTRY      = 1 << 13;
-        /// `#[coverage(off)]`: indicates that the function should be ignored by
-        /// the MIR `InstrumentCoverage` pass and not added to the coverage map
-        /// during codegen.
-        const NO_COVERAGE               = 1 << 14;
+        // (Bit 14 was used for `#[coverage(off)]`, but is now unused.)
         /// `#[used(linker)]`:
         /// indicates that neither LLVM nor the linker will eliminate this function.
         const USED_LINKER               = 1 << 15;
@@ -122,6 +147,7 @@ impl CodegenFnAttrs {
             no_sanitize: SanitizerSet::empty(),
             instruction_set: None,
             alignment: None,
+            patchable_function_entry: None,
         }
     }
 

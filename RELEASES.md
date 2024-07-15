@@ -1,3 +1,546 @@
+Version 1.80 (2024-07-25)
+==========================
+
+<a id="1.80-Language"></a>
+
+Language
+--------
+- [Document maximum allocation size](https://github.com/rust-lang/rust/pull/116675/)
+- [Allow zero-byte offsets and ZST read/writes on arbitrary pointers](https://github.com/rust-lang/rust/pull/117329/)
+- [Support C23's variadics without a named parameter](https://github.com/rust-lang/rust/pull/124048/)
+- [Stabilize `exclusive_range_pattern` feature](https://github.com/rust-lang/rust/pull/124459/)
+- [Guarantee layout and ABI of `Result` in some scenarios](https://github.com/rust-lang/rust/pull/124870)
+
+<a id="1.80-Compiler"></a>
+
+Compiler
+--------
+- [Update cc crate to v1.0.97 allowing additional spectre mitigations on MSVC targets](https://github.com/rust-lang/rust/pull/124892/)
+- [Allow field reordering on types marked `repr(packed(1))`](https://github.com/rust-lang/rust/pull/125360/)
+- [Add a lint against never type fallback affecting unsafe code](https://github.com/rust-lang/rust/pull/123939/)
+- [Disallow cast with trailing braced macro in let-else](https://github.com/rust-lang/rust/pull/125049/)
+- [Expand `for_loops_over_fallibles` lint to lint on fallibles behind references.](https://github.com/rust-lang/rust/pull/125156/)
+- [self-contained linker: retry linking without `-fuse-ld=lld` on CCs that don't support it](https://github.com/rust-lang/rust/pull/125417/)
+- [Do not parse CVarArgs (`...`) as a type in trait bounds](https://github.com/rust-lang/rust/pull/125863/)
+- Improvements to LLDB formatting [#124458](https://github.com/rust-lang/rust/pull/124458) [#124500](https://github.com/rust-lang/rust/pull/124500)
+- [For the wasm32-wasip2 target default to PIC and do not use `-fuse-ld=lld`](https://github.com/rust-lang/rust/pull/124858/)
+- [Add x86_64-unknown-linux-none as a tier 3 target](https://github.com/rust-lang/rust/pull/125023/)
+- [Lint on `foo.into_iter()` resolving to `&Box<[T]>: IntoIterator`](https://github.com/rust-lang/rust/pull/124097/)
+
+<a id="1.80-Libraries"></a>
+
+Libraries
+---------
+- [Add `size_of` and `size_of_val` and `align_of` and `align_of_val` to the prelude](https://github.com/rust-lang/rust/pull/123168/)
+- [Abort a process when FD ownership is violated](https://github.com/rust-lang/rust/pull/124210/)
+- [io::Write::write_fmt: panic if the formatter fails when the stream does not fail](https://github.com/rust-lang/rust/pull/125012/)
+- [Panic if `PathBuf::set_extension` would add a path separator](https://github.com/rust-lang/rust/pull/125070/)
+- [Add assert_unsafe_precondition to unchecked_{add,sub,neg,mul,shl,shr} methods](https://github.com/rust-lang/rust/pull/121571/)
+- [Update `c_char` on AIX to use the correct type](https://github.com/rust-lang/rust/pull/122986/)
+- [`offset_of!` no longer returns a temporary](https://github.com/rust-lang/rust/pull/124484/)
+- [Handle sigma in `str.to_lowercase` correctly](https://github.com/rust-lang/rust/pull/124773/)
+- [Raise `DEFAULT_MIN_STACK_SIZE` to at least 64KiB](https://github.com/rust-lang/rust/pull/126059/)
+
+<a id="1.80-Stabilized-APIs"></a>
+
+Stabilized APIs
+---------------
+- [`impl Default for Rc<CStr>`](https://doc.rust-lang.org/beta/alloc/rc/struct.Rc.html#impl-Default-for-Rc%3CCStr%3E)
+- [`impl Default for Rc<str>`](https://doc.rust-lang.org/beta/alloc/rc/struct.Rc.html#impl-Default-for-Rc%3Cstr%3E)
+- [`impl Default for Rc<[T]>`](https://doc.rust-lang.org/beta/alloc/rc/struct.Rc.html#impl-Default-for-Rc%3C%5BT%5D%3E)
+- [`impl Default for Arc<str>`](https://doc.rust-lang.org/beta/alloc/sync/struct.Arc.html#impl-Default-for-Arc%3Cstr%3E)
+- [`impl Default for Arc<CStr>`](https://doc.rust-lang.org/beta/alloc/sync/struct.Arc.html#impl-Default-for-Arc%3CCStr%3E)
+- [`impl Default for Arc<[T]>`](https://doc.rust-lang.org/beta/alloc/sync/struct.Arc.html#impl-Default-for-Arc%3C%5BT%5D%3E)
+- [`impl IntoIterator for Box<[T]>`](https://doc.rust-lang.org/beta/alloc/boxed/struct.Box.html#impl-IntoIterator-for-Box%3C%5BI%5D,+A%3E)
+- [`impl FromIterator<String> for Box<str>`](https://doc.rust-lang.org/beta/alloc/boxed/struct.Box.html#impl-FromIterator%3CString%3E-for-Box%3Cstr%3E) 
+- [`impl FromIterator<char> for Box<str>`](https://doc.rust-lang.org/beta/alloc/boxed/struct.Box.html#impl-FromIterator%3Cchar%3E-for-Box%3Cstr%3E)
+- [`LazyCell`](https://doc.rust-lang.org/beta/core/cell/struct.LazyCell.html)
+- [`LazyLock`](https://doc.rust-lang.org/beta/std/sync/struct.LazyLock.html)
+- [`Duration::div_duration_f32`](https://doc.rust-lang.org/beta/std/time/struct.Duration.html#method.div_duration_f32)
+- [`Duration::div_duration_f64`](https://doc.rust-lang.org/beta/std/time/struct.Duration.html#method.div_duration_f64)
+- [`Option::take_if`](https://doc.rust-lang.org/beta/std/option/enum.Option.html#method.take_if)
+- [`Seek::seek_relative`](https://doc.rust-lang.org/beta/std/io/trait.Seek.html#method.seek_relative)
+- [`BinaryHeap::as_slice`](https://doc.rust-lang.org/beta/std/collections/struct.BinaryHeap.html#method.as_slice)
+- [`NonNull::offset`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.offset)
+- [`NonNull::byte_offset`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.byte_offset)
+- [`NonNull::add`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.add)
+- [`NonNull::byte_add`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.byte_add)
+- [`NonNull::sub`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.sub)
+- [`NonNull::byte_sub`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.byte_sub)
+- [`NonNull:offset_from`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.offset_from)
+- [`NonNull::byte_offset_from`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.byte_offset_from)
+- [`NonNull::read`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.read)
+- [`NonNull::read_volatile`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.read_volatile)
+- [`NonNull::read_unaligned`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.read_unaligned)
+- [`NonNull::write`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.write)
+- [`NonNull::write_volatile`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.write_volatile)
+- [`NonNull::write_unaligned`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.write_unaligned)
+- [`NonNull::write_bytes`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.write_bytes)
+- [`NonNull::copy_to`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.copy_to)
+- [`NonNull::copy_to_nonoverlapping`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.copy_to_nonoverlapping)
+- [`NonNull::copy_from`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.copy_from)
+- [`NonNull::copy_from_nonoverlapping`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.copy_from_nonoverlapping)
+- [`NonNull::replace`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.replace)
+- [`NonNull::swap`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.swap)
+- [`NonNull::drop_in_place`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.drop_in_place)
+- [`NonNull::align_offset`](https://doc.rust-lang.org/beta/std/ptr/struct.NonNull.html#method.align_offset)
+- [`<[T]>::split_at_checked`](https://doc.rust-lang.org/beta/std/primitive.slice.html#method.split_at_checked)
+- [`<[T]>::split_at_mut_checked`](https://doc.rust-lang.org/beta/std/primitive.slice.html#method.split_at_mut_checked)
+- [`str::split_at_checked`](https://doc.rust-lang.org/beta/std/primitive.str.html#method.split_at_checked)
+- [`str::split_at_mut_checked`](https://doc.rust-lang.org/beta/std/primitive.str.html#method.split_at_mut_checked)
+- [`str::trim_ascii`](https://doc.rust-lang.org/beta/std/primitive.str.html#method.trim_ascii)
+- [`str::trim_ascii_start`](https://doc.rust-lang.org/beta/std/primitive.str.html#method.trim_ascii_start)
+- [`str::trim_ascii_end`](https://doc.rust-lang.org/beta/std/primitive.str.html#method.trim_ascii_end)
+- [`<[AsciiChar]>::trim_ascii`](https://doc.rust-lang.org/beta/core/primitive.slice.html#method.trim_ascii)
+- [`<[AsciiChar]>::trim_ascii_start`](https://doc.rust-lang.org/beta/core/primitive.slice.html#method.trim_ascii_start)
+- [`<[AsciiChar]>::trim_ascii_end`](https://doc.rust-lang.org/beta/core/primitive.slice.html#method.trim_ascii_end)
+- [`Ipv4Addr::BITS`](https://doc.rust-lang.org/beta/core/net/struct.Ipv4Addr.html#associatedconstant.BITS)
+- [`Ipv4Addr::to_bits`](https://doc.rust-lang.org/beta/core/net/struct.Ipv4Addr.html#method.to_bits)
+- [`Ipv4Addr::from_bits`](https://doc.rust-lang.org/beta/core/net/struct.Ipv4Addr.html#method.from_bits)
+- [`Ipv6Addr::BITS`](https://doc.rust-lang.org/beta/core/net/struct.Ipv6Addr.html#associatedconstant.BITS)
+- [`Ipv6Addr::to_bits`](https://doc.rust-lang.org/beta/core/net/struct.Ipv6Addr.html#method.to_bits)
+- [`Ipv6Addr::from_bits`](https://doc.rust-lang.org/beta/core/net/struct.Ipv6Addr.html#method.from_bits)
+- [`Vec::<[T; N]>::into_flattened`](https://doc.rust-lang.org/beta/alloc/vec/struct.Vec.html#method.into_flattened)
+- [`<[[T; N]]>::as_flattened`](https://doc.rust-lang.org/beta/core/primitive.slice.html#method.as_flattened)
+- [`<[[T; N]]>::as_flattened_mut`](https://doc.rust-lang.org/beta/core/primitive.slice.html#method.as_flattened_mut)
+
+These APIs are now stable in const contexts:
+
+- [`<[T]>::last_chunk`](https://doc.rust-lang.org/beta/core/primitive.slice.html#method.last_chunk)
+- [`BinaryHeap::new`](https://doc.rust-lang.org/beta/std/collections/struct.BinaryHeap.html#method.new)
+
+<a id="1.80-Cargo"></a>
+
+Cargo
+-----
+- [Stabilize `-Zcheck-cfg` as always enabled](https://github.com/rust-lang/cargo/pull/13571/)
+- [Warn, rather than fail publish, if a target is excluded](https://github.com/rust-lang/cargo/pull/13713/)
+- [Add special `check-cfg` lint config for the `unexpected_cfgs` lint](https://github.com/rust-lang/cargo/pull/13913/)
+- [Stabilize `cargo update --precise <yanked>`](https://github.com/rust-lang/cargo/pull/13974/)
+- [Don't change file permissions on `Cargo.toml` when using `cargo add`](https://github.com/rust-lang/cargo/pull/13898/)
+- [Support using `cargo fix` on IPv6-only networks](https://github.com/rust-lang/cargo/pull/13907/)
+
+<a id="1.80-Rustdoc"></a>
+
+Rustdoc
+-----
+
+- [Allow searching for references](https://github.com/rust-lang/rust/pull/124148/)
+- [Stabilize `custom_code_classes_in_docs` feature](https://github.com/rust-lang/rust/pull/124577/)
+- [fix: In cross-crate scenarios show enum variants on type aliases of enums](https://github.com/rust-lang/rust/pull/125300/)
+
+<a id="1.80-Compatibility-Notes"></a>
+
+Compatibility Notes
+-------------------
+- [rustfmt estimates line lengths differently when using non-ascii characters](https://github.com/rust-lang/rustfmt/issues/6203)
+- [Type aliases are now handled correctly in orphan check](https://github.com/rust-lang/rust/pull/117164/)
+- [Allow instructing rustdoc to read from stdin via `-`](https://github.com/rust-lang/rust/pull/124611/)
+- [`std::env::{set_var, remove_var}` can no longer be converted to safe function pointers and no longer implement the `Fn` family of traits](https://github.com/rust-lang/rust/pull/124636)
+- [Warn (or error) when `Self` constructor from outer item is referenced in inner nested item](https://github.com/rust-lang/rust/pull/124187/)
+- [Turn `indirect_structural_match` and `pointer_structural_match` lints into hard errors](https://github.com/rust-lang/rust/pull/124661/)
+- [Make `where_clause_object_safety` lint a regular object safety violation](https://github.com/rust-lang/rust/pull/125380/)
+- [Turn `proc_macro_back_compat` lint into a hard error.](https://github.com/rust-lang/rust/pull/125596/)
+- [Detect unused structs even when implementing private traits](https://github.com/rust-lang/rust/pull/122382/)
+- [`std::sync::ReentrantLockGuard<T>` is no longer `Sync` if `T: !Sync`](https://github.com/rust-lang/rust/pull/125527) which means [`std::io::StdoutLock` and `std::io::StderrLock` are no longer Sync](https://github.com/rust-lang/rust/issues/127340)
+
+<a id="1.80-Internal-Changes"></a>
+
+Internal Changes
+----------------
+
+These changes do not affect any public interfaces of Rust, but they represent
+significant improvements to the performance or internals of rustc and related
+tools.
+
+- Misc improvements to size of generated html by rustdoc e.g. [#124738](https://github.com/rust-lang/rust/pull/124738/) and [#123734](https://github.com/rust-lang/rust/pull/123734/)
+- [MSVC targets no longer depend on libc](https://github.com/rust-lang/rust/pull/124050/)
+
+Version 1.79.0 (2024-06-13)
+==========================
+
+<a id="1.79.0-Language"></a>
+
+Language
+--------
+- [Stabilize inline `const {}` expressions.](https://github.com/rust-lang/rust/pull/104087/)
+- [Prevent opaque types being instantiated twice with different regions within the same function.](https://github.com/rust-lang/rust/pull/116935/)
+- [Stabilize WebAssembly target features that are in phase 4 and 5.](https://github.com/rust-lang/rust/pull/117457/)
+- [Add the `redundant_lifetimes` lint to detect lifetimes which are semantically redundant.](https://github.com/rust-lang/rust/pull/118391/)
+- [Stabilize the `unnameable_types` lint for public types that can't be named.](https://github.com/rust-lang/rust/pull/120144/)
+- [Enable debuginfo in macros, and stabilize `-C collapse-macro-debuginfo` and `#[collapse_debuginfo]`.](https://github.com/rust-lang/rust/pull/120845/)
+- [Propagate temporary lifetime extension into `if` and `match` expressions.](https://github.com/rust-lang/rust/pull/121346/)
+- [Restrict promotion of `const fn` calls.](https://github.com/rust-lang/rust/pull/121557/)
+- [Warn against refining impls of crate-private traits with `refining_impl_trait` lint.](https://github.com/rust-lang/rust/pull/121720/)
+- [Stabilize associated type bounds (RFC 2289).](https://github.com/rust-lang/rust/pull/122055/)
+- [Stabilize importing `main` from other modules or crates.](https://github.com/rust-lang/rust/pull/122060/)
+- [Check return types of function types for well-formedness](https://github.com/rust-lang/rust/pull/115538)
+- [Rework `impl Trait` lifetime inference](https://github.com/rust-lang/rust/pull/116891/)
+- [Change inductive trait solver cycles to be ambiguous](https://github.com/rust-lang/rust/pull/122791)
+
+<a id="1.79.0-Compiler"></a>
+
+Compiler
+--------
+- [Define `-C strip` to only affect binaries, not artifacts like `.pdb`.](https://github.com/rust-lang/rust/pull/115120/)
+- [Stabilize `-Crelro-level` for controlling runtime link hardening.](https://github.com/rust-lang/rust/pull/121694/)
+- [Stabilize checking of `cfg` names and values at compile-time with `--check-cfg`.](https://github.com/rust-lang/rust/pull/123501/)
+  *Note that this only stabilizes the compiler part, the Cargo part is still unstable in this release.*
+- [Add `aarch64-apple-visionos` and `aarch64-apple-visionos-sim` tier 3 targets.](https://github.com/rust-lang/rust/pull/121419/)
+- [Add `riscv32ima-unknown-none-elf` tier 3 target.](https://github.com/rust-lang/rust/pull/122696/)
+- [Promote several Windows targets to tier 2](https://github.com/rust-lang/rust/pull/121712): `aarch64-pc-windows-gnullvm`, `i686-pc-windows-gnullvm`, and `x86_64-pc-windows-gnullvm`.
+
+Refer to Rust's [platform support page][platform-support-doc]
+for more information on Rust's tiered platform support.
+
+<a id="1.79.0-Libraries"></a>
+
+Libraries
+---------
+
+- [Implement `FromIterator` for `(impl Default + Extend, impl Default + Extend)`.](https://github.com/rust-lang/rust/pull/107462/)
+- [Implement `{Div,Rem}Assign<NonZero<X>>` on `X`.](https://github.com/rust-lang/rust/pull/121952/)
+- [Document overrides of `clone_from()` in core/std.](https://github.com/rust-lang/rust/pull/122201/)
+- [Link MSVC default lib in core.](https://github.com/rust-lang/rust/pull/122268/)
+- [Caution against using `transmute` between pointers and integers.](https://github.com/rust-lang/rust/pull/122379/)
+- [Enable frame pointers for the standard library.](https://github.com/rust-lang/rust/pull/122646/)
+
+<a id="1.79.0-Stabilized-APIs"></a>
+
+Stabilized APIs
+---------------
+
+- [`{integer}::unchecked_add`](https://doc.rust-lang.org/stable/core/primitive.i32.html#method.unchecked_add)
+- [`{integer}::unchecked_mul`](https://doc.rust-lang.org/stable/core/primitive.i32.html#method.unchecked_mul)
+- [`{integer}::unchecked_sub`](https://doc.rust-lang.org/stable/core/primitive.i32.html#method.unchecked_sub)
+- [`<[T]>::split_at_unchecked`](https://doc.rust-lang.org/stable/core/primitive.slice.html#method.split_at_unchecked)
+- [`<[T]>::split_at_mut_unchecked`](https://doc.rust-lang.org/stable/core/primitive.slice.html#method.split_at_mut_unchecked)
+- [`<[u8]>::utf8_chunks`](https://doc.rust-lang.org/stable/core/primitive.slice.html#method.utf8_chunks)
+- [`str::Utf8Chunks`](https://doc.rust-lang.org/stable/core/str/struct.Utf8Chunks.html)
+- [`str::Utf8Chunk`](https://doc.rust-lang.org/stable/core/str/struct.Utf8Chunk.html)
+- [`<*const T>::is_aligned`](https://doc.rust-lang.org/stable/core/primitive.pointer.html#method.is_aligned)
+- [`<*mut T>::is_aligned`](https://doc.rust-lang.org/stable/core/primitive.pointer.html#method.is_aligned-1)
+- [`NonNull::is_aligned`](https://doc.rust-lang.org/stable/core/ptr/struct.NonNull.html#method.is_aligned)
+- [`<*const [T]>::len`](https://doc.rust-lang.org/stable/core/primitive.pointer.html#method.len)
+- [`<*mut [T]>::len`](https://doc.rust-lang.org/stable/core/primitive.pointer.html#method.len-1)
+- [`<*const [T]>::is_empty`](https://doc.rust-lang.org/stable/core/primitive.pointer.html#method.is_empty)
+- [`<*mut [T]>::is_empty`](https://doc.rust-lang.org/stable/core/primitive.pointer.html#method.is_empty-1)
+- [`NonNull::<[T]>::is_empty`](https://doc.rust-lang.org/stable/core/ptr/struct.NonNull.html#method.is_empty)
+- [`CStr::count_bytes`](https://doc.rust-lang.org/stable/core/ffi/c_str/struct.CStr.html#method.count_bytes)
+- [`io::Error::downcast`](https://doc.rust-lang.org/stable/std/io/struct.Error.html#method.downcast)
+- [`num::NonZero<T>`](https://doc.rust-lang.org/stable/core/num/struct.NonZero.html)
+- [`path::absolute`](https://doc.rust-lang.org/stable/std/path/fn.absolute.html)
+- [`proc_macro::Literal::byte_character`](https://doc.rust-lang.org/stable/proc_macro/struct.Literal.html#method.byte_character)
+- [`proc_macro::Literal::c_string`](https://doc.rust-lang.org/stable/proc_macro/struct.Literal.html#method.c_string)
+
+These APIs are now stable in const contexts:
+
+- [`Atomic*::into_inner`](https://doc.rust-lang.org/stable/core/sync/atomic/struct.AtomicUsize.html#method.into_inner)
+- [`io::Cursor::new`](https://doc.rust-lang.org/stable/std/io/struct.Cursor.html#method.new)
+- [`io::Cursor::get_ref`](https://doc.rust-lang.org/stable/std/io/struct.Cursor.html#method.get_ref)
+- [`io::Cursor::position`](https://doc.rust-lang.org/stable/std/io/struct.Cursor.html#method.position)
+- [`io::empty`](https://doc.rust-lang.org/stable/std/io/fn.empty.html)
+- [`io::repeat`](https://doc.rust-lang.org/stable/std/io/fn.repeat.html)
+- [`io::sink`](https://doc.rust-lang.org/stable/std/io/fn.sink.html)
+- [`panic::Location::caller`](https://doc.rust-lang.org/stable/std/panic/struct.Location.html#method.caller)
+- [`panic::Location::file`](https://doc.rust-lang.org/stable/std/panic/struct.Location.html#method.file)
+- [`panic::Location::line`](https://doc.rust-lang.org/stable/std/panic/struct.Location.html#method.line)
+- [`panic::Location::column`](https://doc.rust-lang.org/stable/std/panic/struct.Location.html#method.column)
+
+<a id="1.79.0-Cargo"></a>
+
+Cargo
+-----
+
+- [Prevent dashes in `lib.name`, always normalizing to `_`.](https://github.com/rust-lang/cargo/pull/12783/)
+- [Stabilize MSRV-aware version requirement selection in `cargo add`.](https://github.com/rust-lang/cargo/pull/13608/)
+- [Switch to using `gitoxide` by default for listing files.](https://github.com/rust-lang/cargo/pull/13696/)
+
+<a id="1.79.0-Rustdoc"></a>
+
+Rustdoc
+-----
+
+- [Always display stability version even if it's the same as the containing item.](https://github.com/rust-lang/rust/pull/118441/)
+- [Show a single search result for items with multiple paths.](https://github.com/rust-lang/rust/pull/119912/)
+- [Support typing `/` in docs to begin a search.](https://github.com/rust-lang/rust/pull/123355/)
+
+<a id="1.79.0-Misc"></a>
+
+Misc
+----
+
+<a id="1.79.0-Compatibility-Notes"></a>
+
+Compatibility Notes
+-------------------
+
+- [Update the minimum external LLVM to 17.](https://github.com/rust-lang/rust/pull/122649/)
+- [`RustcEncodable` and `RustcDecodable` are soft-destabilized, to be removed
+  from the prelude in next edition.](https://github.com/rust-lang/rust/pull/116016/)
+- [The `wasm_c_abi` future-incompatibility lint will warn about use of the
+  non-spec-compliant C ABI.](https://github.com/rust-lang/rust/pull/117918/)
+  Use `wasm-bindgen v0.2.88` to generate forward-compatible bindings.
+- [Check return types of function types for well-formedness](https://github.com/rust-lang/rust/pull/115538)
+
+Version 1.78.0 (2024-05-02)
+==========================
+
+<a id="1.78.0-Language"></a>
+
+Language
+--------
+- [Stabilize `#[cfg(target_abi = ...)]`](https://github.com/rust-lang/rust/pull/119590/)
+- [Stabilize the `#[diagnostic]` namespace and `#[diagnostic::on_unimplemented]` attribute](https://github.com/rust-lang/rust/pull/119888/)
+- [Make async-fn-in-trait implementable with concrete signatures](https://github.com/rust-lang/rust/pull/120103/)
+- [Make matching on NaN a hard error, and remove the rest of `illegal_floating_point_literal_pattern`](https://github.com/rust-lang/rust/pull/116284/)
+- [static mut: allow mutable reference to arbitrary types, not just slices and arrays](https://github.com/rust-lang/rust/pull/117614/)
+- [Extend `invalid_reference_casting` to include references casting to bigger memory layout](https://github.com/rust-lang/rust/pull/118983/)
+- [Add `non_contiguous_range_endpoints` lint for singleton gaps after exclusive ranges](https://github.com/rust-lang/rust/pull/118879/)
+- [Add `wasm_c_abi` lint for use of older wasm-bindgen versions](https://github.com/rust-lang/rust/pull/117918/)
+  This lint currently only works when using Cargo.
+- [Update `indirect_structural_match` and `pointer_structural_match` lints to match RFC](https://github.com/rust-lang/rust/pull/120423/)
+- [Make non-`PartialEq`-typed consts as patterns a hard error](https://github.com/rust-lang/rust/pull/120805/)
+- [Split `refining_impl_trait` lint into `_reachable`, `_internal` variants](https://github.com/rust-lang/rust/pull/121720/)
+- [Remove unnecessary type inference when using associated types inside of higher ranked `where`-bounds](https://github.com/rust-lang/rust/pull/119849)
+- [Weaken eager detection of cyclic types during type inference](https://github.com/rust-lang/rust/pull/119989)
+- [`trait Trait: Auto {}`: allow upcasting from `dyn Trait` to `dyn Trait + Auto`](https://github.com/rust-lang/rust/pull/119338)
+
+<a id="1.78.0-Compiler"></a>
+
+Compiler
+--------
+
+- [Made `INVALID_DOC_ATTRIBUTES` lint deny by default](https://github.com/rust-lang/rust/pull/111505/)
+- [Increase accuracy of redundant `use` checking](https://github.com/rust-lang/rust/pull/117772/)
+- [Suggest moving definition if non-found macro_rules! is defined later](https://github.com/rust-lang/rust/pull/121130/)
+- [Lower transmutes from int to pointer type as gep on null](https://github.com/rust-lang/rust/pull/121282/)
+
+Target changes:
+
+- [Windows tier 1 targets now require at least Windows 10](https://github.com/rust-lang/rust/pull/115141/)
+  - [Enable CMPXCHG16B, SSE3, SAHF/LAHF and 128-bit Atomics in tier 1 Windows](https://github.com/rust-lang/rust/pull/120820/)
+- [Add `wasm32-wasip1` tier 2 (without host tools) target](https://github.com/rust-lang/rust/pull/120468/)
+- [Add `wasm32-wasip2` tier 3 target](https://github.com/rust-lang/rust/pull/119616/)
+- [Rename `wasm32-wasi-preview1-threads` to `wasm32-wasip1-threads`](https://github.com/rust-lang/rust/pull/122170/)
+- [Add `arm64ec-pc-windows-msvc` tier 3 target](https://github.com/rust-lang/rust/pull/119199/)
+- [Add `armv8r-none-eabihf` tier 3 target for the Cortex-R52](https://github.com/rust-lang/rust/pull/110482/)
+- [Add `loongarch64-unknown-linux-musl` tier 3 target](https://github.com/rust-lang/rust/pull/121832/)
+
+Refer to Rust's [platform support page][platform-support-doc]
+for more information on Rust's tiered platform support.
+
+<a id="1.78.0-Libraries"></a>
+
+Libraries
+---------
+
+- [Bump Unicode to version 15.1.0, regenerate tables](https://github.com/rust-lang/rust/pull/120777/)
+- [Make align_offset, align_to well-behaved in all cases](https://github.com/rust-lang/rust/pull/121201/)
+- [PartialEq, PartialOrd: document expectations for transitive chains](https://github.com/rust-lang/rust/pull/115386/)
+- [Optimize away poison guards when std is built with panic=abort](https://github.com/rust-lang/rust/pull/100603/)
+- [Replace pthread `RwLock` with custom implementation](https://github.com/rust-lang/rust/pull/110211/)
+- [Implement unwind safety for Condvar on all platforms](https://github.com/rust-lang/rust/pull/121768/)
+- [Add ASCII fast-path for `char::is_grapheme_extended`](https://github.com/rust-lang/rust/pull/121138/)
+
+<a id="1.78.0-Stabilized-APIs"></a>
+
+Stabilized APIs
+---------------
+
+- [`impl Read for &Stdin`](https://doc.rust-lang.org/stable/std/io/struct.Stdin.html#impl-Read-for-%26Stdin)
+- [Accept non `'static` lifetimes for several `std::error::Error` related implementations](https://github.com/rust-lang/rust/pull/113833/)
+- [Make `impl<Fd: AsFd>` impl take `?Sized`](https://github.com/rust-lang/rust/pull/114655/)
+- [`impl From<TryReserveError> for io::Error`](https://doc.rust-lang.org/stable/std/io/struct.Error.html#impl-From%3CTryReserveError%3E-for-Error)
+
+These APIs are now stable in const contexts:
+
+- [`Barrier::new()`](https://doc.rust-lang.org/stable/std/sync/struct.Barrier.html#method.new)
+
+<a id="1.78.0-Cargo"></a>
+
+Cargo
+-----
+
+- [Stabilize lockfile v4](https://github.com/rust-lang/cargo/pull/12852/)
+- [Respect `rust-version` when generating lockfile](https://github.com/rust-lang/cargo/pull/12861/)
+- [Control `--charset` via auto-detecting config value](https://github.com/rust-lang/cargo/pull/13337/)
+- [Support `target.<triple>.rustdocflags` officially](https://github.com/rust-lang/cargo/pull/13197/)
+- [Stabilize global cache data tracking](https://github.com/rust-lang/cargo/pull/13492/)
+
+<a id="1.78.0-Misc"></a>
+
+Misc
+----
+
+- [rustdoc: add `--test-builder-wrapper` arg to support wrappers such as RUSTC_WRAPPER when building doctests](https://github.com/rust-lang/rust/pull/114651/)
+
+<a id="1.78.0-Compatibility-Notes"></a>
+
+Compatibility Notes
+-------------------
+
+- [Many unsafe precondition checks now run for user code with debug assertions enabled](https://github.com/rust-lang/rust/pull/120594/)
+  This change helps users catch undefined behavior in their code, though the details of how much is checked are generally not stable.
+- [riscv only supports split_debuginfo=off for now](https://github.com/rust-lang/rust/pull/120518/)
+- [Consistently check bounds on hidden types of `impl Trait`](https://github.com/rust-lang/rust/pull/121679)
+- [Change equality of higher ranked types to not rely on subtyping](https://github.com/rust-lang/rust/pull/118247)
+- [When called, additionally check bounds on normalized function return type](https://github.com/rust-lang/rust/pull/118882)
+- [Expand coverage for `arithmetic_overflow` lint](https://github.com/rust-lang/rust/pull/119432/)
+- [Fix detection of potential interior mutability in `const` initializers](https://github.com/rust-lang/rust/issues/121250)
+  This code was accidentally accepted. The fix can break generic code that borrows a value of unknown type,
+  as there is currently no way to declare "this type has no interior mutability". In the future, stabilizing
+  the [`Freeze` trait](https://github.com/rust-lang/rust/issues/121675) will allow proper support for such code.
+
+<a id="1.78.0-Internal-Changes"></a>
+
+Internal Changes
+----------------
+
+These changes do not affect any public interfaces of Rust, but they represent
+significant improvements to the performance or internals of rustc and related
+tools.
+
+- [Update to LLVM 18](https://github.com/rust-lang/rust/pull/120055/)
+- [Build `rustc` with 1CGU on `x86_64-pc-windows-msvc`](https://github.com/rust-lang/rust/pull/112267/)
+- [Build `rustc` with 1CGU on `x86_64-apple-darwin`](https://github.com/rust-lang/rust/pull/112268/)
+- [Introduce `run-make` V2 infrastructure, a `run_make_support` library and port over 2 tests as example](https://github.com/rust-lang/rust/pull/113026/)
+- [Windows: Implement condvar, mutex and rwlock using futex](https://github.com/rust-lang/rust/pull/121956/)
+
+Version 1.77.2 (2024-04-09)
+===========================
+
+<a id="1.77.2"></a>
+
+- [CVE-2024-24576: fix escaping of Windows batch file arguments in `std::process::Command`](https://blog.rust-lang.org/2024/04/09/cve-2024-24576.html)
+
+Version 1.77.1 (2024-03-28)
+===========================
+
+<a id="1.77.1"></a>
+
+- [Revert stripping debuginfo by default for Windows](https://github.com/rust-lang/cargo/pull/13654)
+  This fixes a regression in 1.77 by reverting to the previous default.
+  Platforms other than Windows are not affected.
+- Internal: [Fix heading anchor rendering in doc pages](https://github.com/rust-lang/rust/pull/122693)
+
+Version 1.77.0 (2024-03-21)
+==========================
+
+<a id="1.77.0-Language"></a>
+
+Language
+--------
+
+- [Reveal opaque types within the defining body for exhaustiveness checking.](https://github.com/rust-lang/rust/pull/116821/)
+- [Stabilize C-string literals.](https://github.com/rust-lang/rust/pull/117472/)
+- [Stabilize THIR unsafeck.](https://github.com/rust-lang/rust/pull/117673/)
+- [Add lint `static_mut_refs` to warn on references to mutable statics.](https://github.com/rust-lang/rust/pull/117556/)
+- [Support async recursive calls (as long as they have indirection).](https://github.com/rust-lang/rust/pull/117703/)
+- [Undeprecate lint `unstable_features` and make use of it in the compiler.](https://github.com/rust-lang/rust/pull/118639/)
+- [Make inductive cycles in coherence ambiguous always.](https://github.com/rust-lang/rust/pull/118649/)
+- [Get rid of type-driven traversal in const-eval interning](https://github.com/rust-lang/rust/pull/119044/),
+  only as a [future compatiblity lint](https://github.com/rust-lang/rust/pull/122204) for now.
+- [Deny braced macro invocations in let-else.](https://github.com/rust-lang/rust/pull/119062/)
+
+<a id="1.77.0-Compiler"></a>
+
+Compiler
+--------
+
+- [Include lint `soft_unstable` in future breakage reports.](https://github.com/rust-lang/rust/pull/116274/)
+- [Make `i128` and `u128` 16-byte aligned on x86-based targets.](https://github.com/rust-lang/rust/pull/116672/)
+- [Use `--verbose` in diagnostic output.](https://github.com/rust-lang/rust/pull/119129/)
+- [Improve spacing between printed tokens.](https://github.com/rust-lang/rust/pull/120227/)
+- [Merge the `unused_tuple_struct_fields` lint into `dead_code`.](https://github.com/rust-lang/rust/pull/118297/)
+- [Error on incorrect implied bounds in well-formedness check](https://github.com/rust-lang/rust/pull/118553/),
+  with a temporary exception for Bevy.
+- [Fix coverage instrumentation/reports for non-ASCII source code.](https://github.com/rust-lang/rust/pull/119033/)
+- [Fix `fn`/`const` items implied bounds and well-formedness check.](https://github.com/rust-lang/rust/pull/120019/)
+- [Promote `riscv32{im|imafc}-unknown-none-elf` targets to tier 2.](https://github.com/rust-lang/rust/pull/118704/)
+- Add several new tier 3 targets:
+  - [`aarch64-unknown-illumos`](https://github.com/rust-lang/rust/pull/112936/)
+  - [`hexagon-unknown-none-elf`](https://github.com/rust-lang/rust/pull/117601/)
+  - [`riscv32imafc-esp-espidf`](https://github.com/rust-lang/rust/pull/119738/)
+  - [`riscv32im-risc0-zkvm-elf`](https://github.com/rust-lang/rust/pull/117958/)
+
+Refer to Rust's [platform support page][platform-support-doc]
+for more information on Rust's tiered platform support.
+
+<a id="1.77.0-Libraries"></a>
+
+Libraries
+---------
+
+- [Implement `From<&[T; N]>` for `Cow<[T]>`.](https://github.com/rust-lang/rust/pull/113489/)
+- [Remove special-case handling of `vec.split_off(0)`.](https://github.com/rust-lang/rust/pull/119917/)
+
+<a id="1.77.0-Stabilized-APIs"></a>
+
+Stabilized APIs
+---------------
+
+- [`array::each_ref`](https://doc.rust-lang.org/stable/std/primitive.array.html#method.each_ref)
+- [`array::each_mut`](https://doc.rust-lang.org/stable/std/primitive.array.html#method.each_mut)
+- [`core::net`](https://doc.rust-lang.org/stable/core/net/index.html)
+- [`f32::round_ties_even`](https://doc.rust-lang.org/stable/std/primitive.f32.html#method.round_ties_even)
+- [`f64::round_ties_even`](https://doc.rust-lang.org/stable/std/primitive.f64.html#method.round_ties_even)
+- [`mem::offset_of!`](https://doc.rust-lang.org/stable/std/mem/macro.offset_of.html)
+- [`slice::first_chunk`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.first_chunk)
+- [`slice::first_chunk_mut`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.first_chunk_mut)
+- [`slice::split_first_chunk`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.split_first_chunk)
+- [`slice::split_first_chunk_mut`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.split_first_chunk_mut)
+- [`slice::last_chunk`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.last_chunk)
+- [`slice::last_chunk_mut`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.last_chunk_mut)
+- [`slice::split_last_chunk`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.split_last_chunk)
+- [`slice::split_last_chunk_mut`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.split_last_chunk_mut)
+- [`slice::chunk_by`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.chunk_by)
+- [`slice::chunk_by_mut`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.chunk_by_mut)
+- [`Bound::map`](https://doc.rust-lang.org/stable/std/ops/enum.Bound.html#method.map)
+- [`File::create_new`](https://doc.rust-lang.org/stable/std/fs/struct.File.html#method.create_new)
+- [`Mutex::clear_poison`](https://doc.rust-lang.org/stable/std/sync/struct.Mutex.html#method.clear_poison)
+- [`RwLock::clear_poison`](https://doc.rust-lang.org/stable/std/sync/struct.RwLock.html#method.clear_poison)
+
+<a id="1.77.0-Cargo"></a>
+
+Cargo
+-----
+
+- [Extend the build directive syntax with `cargo::`.](https://github.com/rust-lang/cargo/pull/12201/)
+- [Stabilize metadata `id` format as `PackageIDSpec`.](https://github.com/rust-lang/cargo/pull/12914/)
+- [Pull out `cargo-util-schemas` as a crate.](https://github.com/rust-lang/cargo/pull/13178/)
+- [Strip all debuginfo when debuginfo is not requested.](https://github.com/rust-lang/cargo/pull/13257/)
+- [Inherit jobserver from env for all kinds of runners.](https://github.com/rust-lang/cargo/pull/12776/)
+- [Deprecate rustc plugin support in cargo.](https://github.com/rust-lang/cargo/pull/13248/)
+
+<a id="1.77.0-Rustdoc"></a>
+
+Rustdoc
+-----
+
+- [Allows links in markdown headings.](https://github.com/rust-lang/rust/pull/117662/)
+- [Search for tuples and unit by type with `()`.](https://github.com/rust-lang/rust/pull/118194/)
+- [Clean up the source sidebar's hide button.](https://github.com/rust-lang/rust/pull/119066/)
+- [Prevent JS injection from `localStorage`.](https://github.com/rust-lang/rust/pull/120250/)
+
+<a id="1.77.0-Misc"></a>
+
+Misc
+----
+
+- [Recommend version-sorting for all sorting in style guide.](https://github.com/rust-lang/rust/pull/115046/)
+
+<a id="1.77.0-Internal-Changes"></a>
+
+Internal Changes
+----------------
+
+These changes do not affect any public interfaces of Rust, but they represent
+significant improvements to the performance or internals of rustc and related
+tools.
+
+- [Add more weirdness to `weird-exprs.rs`.](https://github.com/rust-lang/rust/pull/119028/)
+
 Version 1.76.0 (2024-02-08)
 ==========================
 

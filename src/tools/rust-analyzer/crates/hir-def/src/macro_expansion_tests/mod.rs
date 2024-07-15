@@ -96,7 +96,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         let res = macro_call
             .as_call_id_with_errors(&db, krate, |path| {
                 resolver
-                    .resolve_path_as_macro(&db, &path, Some(MacroSubNs::Bang))
+                    .resolve_path_as_macro(&db, path, Some(MacroSubNs::Bang))
                     .map(|(it, _)| db.macro_def(it))
             })
             .unwrap();
@@ -316,8 +316,11 @@ impl ProcMacroExpander for IdentityWhenValidProcMacroExpander {
         _: Span,
         _: Span,
     ) -> Result<Subtree, ProcMacroExpansionError> {
-        let (parse, _) =
-            ::mbe::token_tree_to_syntax_node(subtree, ::mbe::TopEntryPoint::MacroItems);
+        let (parse, _) = ::mbe::token_tree_to_syntax_node(
+            subtree,
+            ::mbe::TopEntryPoint::MacroItems,
+            span::Edition::CURRENT,
+        );
         if parse.errors().is_empty() {
             Ok(subtree.clone())
         } else {

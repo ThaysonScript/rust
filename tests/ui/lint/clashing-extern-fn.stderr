@@ -1,5 +1,5 @@
 warning: `extern` block uses type `Option<TransparentNoNiche>`, which is not FFI-safe
-  --> $DIR/clashing-extern-fn.rs:433:55
+  --> $DIR/clashing-extern-fn.rs:429:55
    |
 LL |             fn hidden_niche_transparent_no_niche() -> Option<TransparentNoNiche>;
    |                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^ not FFI-safe
@@ -9,10 +9,10 @@ LL |             fn hidden_niche_transparent_no_niche() -> Option<TransparentNoN
    = note: `#[warn(improper_ctypes)]` on by default
 
 warning: `extern` block uses type `Option<UnsafeCell<NonZero<usize>>>`, which is not FFI-safe
-  --> $DIR/clashing-extern-fn.rs:437:46
+  --> $DIR/clashing-extern-fn.rs:433:46
    |
-LL |             fn hidden_niche_unsafe_cell() -> Option<UnsafeCell<NonZeroUsize>>;
-   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not FFI-safe
+LL |             fn hidden_niche_unsafe_cell() -> Option<UnsafeCell<NonZero<usize>>>;
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not FFI-safe
    |
    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
    = note: enum has no representation hint
@@ -157,8 +157,8 @@ LL |             fn missing_return_type();
 warning: `non_zero_usize` redeclared with a different signature
   --> $DIR/clashing-extern-fn.rs:277:13
    |
-LL |             fn non_zero_usize() -> core::num::NonZeroUsize;
-   |             ---------------------------------------------- `non_zero_usize` previously declared here
+LL |             fn non_zero_usize() -> core::num::NonZero<usize>;
+   |             ------------------------------------------------ `non_zero_usize` previously declared here
 ...
 LL |             fn non_zero_usize() -> usize;
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this signature doesn't match the previous declaration
@@ -179,7 +179,7 @@ LL |             fn non_null_ptr() -> *const usize;
               found `unsafe extern "C" fn() -> *const usize`
 
 warning: `option_non_zero_usize_incorrect` redeclared with a different signature
-  --> $DIR/clashing-extern-fn.rs:377:13
+  --> $DIR/clashing-extern-fn.rs:373:13
    |
 LL |             fn option_non_zero_usize_incorrect() -> usize;
    |             --------------------------------------------- `option_non_zero_usize_incorrect` previously declared here
@@ -191,7 +191,7 @@ LL |             fn option_non_zero_usize_incorrect() -> isize;
               found `unsafe extern "C" fn() -> isize`
 
 warning: `option_non_null_ptr_incorrect` redeclared with a different signature
-  --> $DIR/clashing-extern-fn.rs:379:13
+  --> $DIR/clashing-extern-fn.rs:375:13
    |
 LL |             fn option_non_null_ptr_incorrect() -> *const usize;
    |             -------------------------------------------------- `option_non_null_ptr_incorrect` previously declared here
@@ -203,7 +203,7 @@ LL |             fn option_non_null_ptr_incorrect() -> *const isize;
               found `unsafe extern "C" fn() -> *const isize`
 
 warning: `hidden_niche_transparent_no_niche` redeclared with a different signature
-  --> $DIR/clashing-extern-fn.rs:433:13
+  --> $DIR/clashing-extern-fn.rs:429:13
    |
 LL |             fn hidden_niche_transparent_no_niche() -> usize;
    |             ----------------------------------------------- `hidden_niche_transparent_no_niche` previously declared here
@@ -215,13 +215,13 @@ LL |             fn hidden_niche_transparent_no_niche() -> Option<TransparentNoN
               found `unsafe extern "C" fn() -> Option<TransparentNoNiche>`
 
 warning: `hidden_niche_unsafe_cell` redeclared with a different signature
-  --> $DIR/clashing-extern-fn.rs:437:13
+  --> $DIR/clashing-extern-fn.rs:433:13
    |
 LL |             fn hidden_niche_unsafe_cell() -> usize;
    |             -------------------------------------- `hidden_niche_unsafe_cell` previously declared here
 ...
-LL |             fn hidden_niche_unsafe_cell() -> Option<UnsafeCell<NonZeroUsize>>;
-   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this signature doesn't match the previous declaration
+LL |             fn hidden_niche_unsafe_cell() -> Option<UnsafeCell<NonZero<usize>>>;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this signature doesn't match the previous declaration
    |
    = note: expected `unsafe extern "C" fn() -> usize`
               found `unsafe extern "C" fn() -> Option<UnsafeCell<NonZero<usize>>>`

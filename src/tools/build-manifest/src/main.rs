@@ -25,6 +25,7 @@ static HOSTS: &[&str] = &[
     "i686-pc-windows-msvc",
     "i686-unknown-linux-gnu",
     "loongarch64-unknown-linux-gnu",
+    "loongarch64-unknown-linux-musl",
     "mips-unknown-linux-gnu",
     "mips64-unknown-linux-gnuabi64",
     "mips64el-unknown-linux-gnuabi64",
@@ -56,10 +57,12 @@ static TARGETS: &[&str] = &[
     "aarch64-apple-ios-sim",
     "aarch64-unknown-fuchsia",
     "aarch64-linux-android",
+    "aarch64-pc-windows-gnullvm",
     "aarch64-pc-windows-msvc",
     "aarch64-unknown-hermit",
     "aarch64-unknown-linux-gnu",
     "aarch64-unknown-linux-musl",
+    "aarch64-unknown-linux-ohos",
     "aarch64-unknown-none",
     "aarch64-unknown-none-softfloat",
     "aarch64-unknown-redox",
@@ -69,6 +72,7 @@ static TARGETS: &[&str] = &[
     "arm-unknown-linux-gnueabihf",
     "arm-unknown-linux-musleabi",
     "arm-unknown-linux-musleabihf",
+    "arm64ec-pc-windows-msvc",
     "armv5te-unknown-linux-gnueabi",
     "armv5te-unknown-linux-musleabi",
     "armv7-linux-androideabi",
@@ -79,6 +83,7 @@ static TARGETS: &[&str] = &[
     "thumbv7neon-unknown-linux-gnueabihf",
     "armv7-unknown-linux-musleabi",
     "armv7-unknown-linux-musleabihf",
+    "armv7-unknown-linux-ohos",
     "armebv7r-none-eabi",
     "armebv7r-none-eabihf",
     "armv7r-none-eabi",
@@ -94,12 +99,15 @@ static TARGETS: &[&str] = &[
     "i686-apple-darwin",
     "i686-linux-android",
     "i686-pc-windows-gnu",
+    "i686-pc-windows-gnullvm",
     "i686-pc-windows-msvc",
     "i686-unknown-freebsd",
     "i686-unknown-linux-gnu",
     "i686-unknown-linux-musl",
+    "i686-unknown-redox",
     "i686-unknown-uefi",
     "loongarch64-unknown-linux-gnu",
+    "loongarch64-unknown-linux-musl",
     "loongarch64-unknown-none",
     "loongarch64-unknown-none-softfloat",
     "m68k-unknown-linux-gnu",
@@ -124,6 +132,7 @@ static TARGETS: &[&str] = &[
     "riscv32i-unknown-none-elf",
     "riscv32im-risc0-zkvm-elf",
     "riscv32im-unknown-none-elf",
+    "riscv32ima-unknown-none-elf",
     "riscv32imc-unknown-none-elf",
     "riscv32imac-unknown-none-elf",
     "riscv32imafc-unknown-none-elf",
@@ -146,13 +155,15 @@ static TARGETS: &[&str] = &[
     "wasm32-unknown-emscripten",
     "wasm32-unknown-unknown",
     "wasm32-wasi",
-    "wasm32-wasi-preview1-threads",
+    "wasm32-wasip1",
+    "wasm32-wasip1-threads",
     "x86_64-apple-darwin",
     "x86_64-apple-ios",
     "x86_64-fortanix-unknown-sgx",
     "x86_64-unknown-fuchsia",
     "x86_64-linux-android",
     "x86_64-pc-windows-gnu",
+    "x86_64-pc-windows-gnullvm",
     "x86_64-pc-windows-msvc",
     "x86_64-pc-solaris",
     "x86_64-unikraft-linux-musl",
@@ -161,6 +172,7 @@ static TARGETS: &[&str] = &[
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-gnux32",
     "x86_64-unknown-linux-musl",
+    "x86_64-unknown-linux-ohos",
     "x86_64-unknown-netbsd",
     "x86_64-unknown-none",
     "x86_64-unknown-redox",
@@ -228,7 +240,7 @@ fn main() {
     let num_threads = if let Some(num) = env::var_os("BUILD_MANIFEST_NUM_THREADS") {
         num.to_str().unwrap().parse().expect("invalid number for BUILD_MANIFEST_NUM_THREADS")
     } else {
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     };
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
@@ -459,7 +471,8 @@ impl Builder {
                 | PkgType::LlvmTools
                 | PkgType::RustAnalysis
                 | PkgType::JsonDocs
-                | PkgType::RustcCodegenCranelift => {
+                | PkgType::RustcCodegenCranelift
+                | PkgType::LlvmBitcodeLinker => {
                     extensions.push(host_component(pkg));
                 }
                 PkgType::RustcDev | PkgType::RustcDocs => {
@@ -485,7 +498,7 @@ impl Builder {
                 Some(p) => p,
                 None => return false,
             };
-            pkg.target.get(&c.target).is_some()
+            pkg.target.contains_key(&c.target)
         };
         extensions.retain(&has_component);
         components.retain(&has_component);

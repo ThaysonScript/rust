@@ -1,7 +1,8 @@
 use crate::ImplTraitPosition;
 
 use super::errors::{
-    AsyncBoundNotOnTrait, AsyncBoundOnlyForFnTraits, GenericTypeWithParentheses, UseAngleBrackets,
+    AsyncBoundNotOnTrait, AsyncBoundOnlyForFnTraits, BadReturnTypeNotation,
+    GenericTypeWithParentheses, UseAngleBrackets,
 };
 use super::ResolverAstLoweringExt;
 use super::{GenericArgsCtor, LifetimeRes, ParenthesizedGenericArgs};
@@ -18,6 +19,7 @@ use rustc_span::symbol::{kw, sym, Ident};
 use rustc_span::{BytePos, DesugaringKind, Span, Symbol, DUMMY_SP};
 
 use smallvec::{smallvec, SmallVec};
+use tracing::{debug, instrument};
 
 impl<'a, 'hir> LoweringContext<'a, 'hir> {
     #[instrument(level = "trace", skip(self))]
@@ -106,8 +108,6 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         param_mode,
                         parenthesized_generic_args,
                         itctx,
-                        // if this is the last segment, add constness to the trait path
-                        if i == proj_start - 1 { modifiers.map(|m| m.constness) } else { None },
                         bound_modifier_allowed_features.clone(),
                     )
                 },
@@ -164,7 +164,6 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 ParenthesizedGenericArgs::Err,
                 itctx,
                 None,
-                None,
             ));
             let qpath = hir::QPath::TypeRelative(ty, hir_segment);
 
@@ -207,7 +206,6 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     ParenthesizedGenericArgs::Err,
                     ImplTraitContext::Disallowed(ImplTraitPosition::Path),
                     None,
-                    None,
                 )
             })),
             span: self.lower_span(p.span),
@@ -221,7 +219,6 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         param_mode: ParamMode,
         parenthesized_generic_args: ParenthesizedGenericArgs,
         itctx: ImplTraitContext,
-        constness: Option<ast::BoundConstness>,
         // Additional features ungated with a bound modifier like `async`.
         // This is passed down to the implicit associated type binding in
         // parenthesized bounds.
@@ -275,22 +272,30 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         )
                     }
                 },
+                GenericArgs::ParenthesizedElided(span) => {
+                    self.dcx().emit_err(BadReturnTypeNotation::Position { span: *span });
+                    (
+                        GenericArgsCtor {
+                            args: Default::default(),
+                            constraints: &[],
+                            parenthesized: hir::GenericArgsParentheses::ReturnTypeNotation,
+                            span: *span,
+                        },
+                        false,
+                    )
+                }
             }
         } else {
             (
                 GenericArgsCtor {
                     args: Default::default(),
-                    bindings: &[],
+                    constraints: &[],
                     parenthesized: hir::GenericArgsParentheses::No,
                     span: path_span.shrink_to_hi(),
                 },
                 param_mode == ParamMode::Optional,
             )
         };
-
-        if let Some(constness) = constness {
-            generic_args.push_constness(self, constness);
-        }
 
         let has_lifetimes =
             generic_args.args.iter().any(|arg| matches!(arg, GenericArg::Lifetime(_)));
@@ -389,13 +394,16 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 AngleBracketedArg::Constraint(_) => None,
             })
             .collect();
-        let bindings = self.arena.alloc_from_iter(data.args.iter().filter_map(|arg| match arg {
-            AngleBracketedArg::Constraint(c) => Some(self.lower_assoc_ty_constraint(c, itctx)),
-            AngleBracketedArg::Arg(_) => None,
-        }));
+        let constraints =
+            self.arena.alloc_from_iter(data.args.iter().filter_map(|arg| match arg {
+                AngleBracketedArg::Constraint(c) => {
+                    Some(self.lower_assoc_item_constraint(c, itctx))
+                }
+                AngleBracketedArg::Arg(_) => None,
+            }));
         let ctor = GenericArgsCtor {
             args,
-            bindings,
+            constraints,
             parenthesized: hir::GenericArgsParentheses::No,
             span: data.span,
         };
@@ -423,7 +431,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             // fn f(_: impl Fn() -> impl Debug) -> impl Fn() -> impl Debug
             // //      disallowed --^^^^^^^^^^        allowed --^^^^^^^^^^
             // ```
-            FnRetTy::Ty(ty) if matches!(itctx, ImplTraitContext::ReturnPositionOpaqueTy { .. }) => {
+            FnRetTy::Ty(ty) if matches!(itctx, ImplTraitContext::OpaqueTy { .. }) => {
                 if self.tcx.features().impl_trait_in_fn_trait_return {
                     self.lower_ty(ty, itctx)
                 } else {
@@ -453,12 +461,12 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 Some(bound_modifier_allowed_features),
             );
         }
-        let binding = self.assoc_ty_binding(sym::Output, output_span, output_ty);
+        let constraint = self.assoc_ty_binding(sym::Output, output_span, output_ty);
 
         (
             GenericArgsCtor {
                 args,
-                bindings: arena_vec![self; binding],
+                constraints: arena_vec![self; constraint],
                 parenthesized: hir::GenericArgsParentheses::ParenSugar,
                 span: data.inputs_span,
             },
@@ -466,24 +474,24 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         )
     }
 
-    /// An associated type binding `$assoc_ty_name = $ty`.
+    /// An associated type binding (i.e., associated type equality constraint).
     pub(crate) fn assoc_ty_binding(
         &mut self,
         assoc_ty_name: rustc_span::Symbol,
         span: Span,
         ty: &'hir hir::Ty<'hir>,
-    ) -> hir::TypeBinding<'hir> {
+    ) -> hir::AssocItemConstraint<'hir> {
         let ident = Ident::with_dummy_span(assoc_ty_name);
-        let kind = hir::TypeBindingKind::Equality { term: ty.into() };
+        let kind = hir::AssocItemConstraintKind::Equality { term: ty.into() };
         let args = arena_vec![self;];
-        let bindings = arena_vec![self;];
+        let constraints = arena_vec![self;];
         let gen_args = self.arena.alloc(hir::GenericArgs {
             args,
-            bindings,
+            constraints,
             parenthesized: hir::GenericArgsParentheses::No,
             span_ext: DUMMY_SP,
         });
-        hir::TypeBinding {
+        hir::AssocItemConstraint {
             hir_id: self.next_id(),
             gen_args,
             span: self.lower_span(span),

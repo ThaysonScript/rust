@@ -1,8 +1,8 @@
 use jsonpath_lib::select;
-use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::sync::OnceLock;
 use std::{env, fmt, fs};
 
 mod cache;
@@ -56,6 +56,8 @@ pub enum CommandKind {
 
 impl CommandKind {
     fn validate(&self, args: &[String], lineno: usize) -> bool {
+        // FIXME(adotinthevoid): We should "parse, don't validate" here, so we avoid ad-hoc
+        // indexing in check_command.
         let count = match self {
             CommandKind::Has => (1..=2).contains(&args.len()),
             CommandKind::IsMany => args.len() >= 2,
@@ -71,7 +73,7 @@ impl CommandKind {
         if let CommandKind::Count = self {
             if args[1].parse::<usize>().is_err() {
                 print_err(
-                    &format!("Second argument to @count must be a valid usize (got `{}`)", args[2]),
+                    &format!("Second argument to @count must be a valid usize (got `{}`)", args[1]),
                     lineno,
                 );
                 return false;
@@ -95,7 +97,8 @@ impl fmt::Display for CommandKind {
     }
 }
 
-static LINE_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static LINE_PATTERN: OnceLock<Regex> = OnceLock::new();
+fn line_pattern() -> Regex {
     RegexBuilder::new(
         r#"
         \s(?P<invalid>!?)@(?P<negated>!?)
@@ -107,7 +110,7 @@ static LINE_PATTERN: Lazy<Regex> = Lazy::new(|| {
     .unicode(true)
     .build()
     .unwrap()
-});
+}
 
 fn print_err(msg: &str, lineno: usize) {
     eprintln!("Invalid command: {} on line {}", msg, lineno)
@@ -123,7 +126,7 @@ fn get_commands(template: &str) -> Result<Vec<Command>, ()> {
     for (lineno, line) in file.split('\n').enumerate() {
         let lineno = lineno + 1;
 
-        let cap = match LINE_PATTERN.captures(line) {
+        let cap = match LINE_PATTERN.get_or_init(line_pattern).captures(line) {
             Some(c) => c,
             None => continue,
         };

@@ -7,14 +7,18 @@
 //! to reimplement all the rendering logic in this module because of that.
 
 use crate::core::builder::Builder;
+use crate::utils::exec::BootstrapCommand;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Stdio};
 use std::time::Duration;
 use termcolor::{Color, ColorSpec, WriteColor};
 
 const TERSE_TESTS_PER_LINE: usize = 88;
 
-pub(crate) fn add_flags_and_try_run_tests(builder: &Builder<'_>, cmd: &mut Command) -> bool {
+pub(crate) fn add_flags_and_try_run_tests(
+    builder: &Builder<'_>,
+    cmd: &mut BootstrapCommand,
+) -> bool {
     if !cmd.get_args().any(|arg| arg == "--") {
         cmd.arg("--");
     }
@@ -23,8 +27,13 @@ pub(crate) fn add_flags_and_try_run_tests(builder: &Builder<'_>, cmd: &mut Comma
     try_run_tests(builder, cmd, false)
 }
 
-pub(crate) fn try_run_tests(builder: &Builder<'_>, cmd: &mut Command, stream: bool) -> bool {
+pub(crate) fn try_run_tests(
+    builder: &Builder<'_>,
+    cmd: &mut BootstrapCommand,
+    stream: bool,
+) -> bool {
     if builder.config.dry_run() {
+        cmd.mark_as_executed();
         return true;
     }
 
@@ -41,10 +50,11 @@ pub(crate) fn try_run_tests(builder: &Builder<'_>, cmd: &mut Command, stream: bo
     }
 }
 
-fn run_tests(builder: &Builder<'_>, cmd: &mut Command, stream: bool) -> bool {
+fn run_tests(builder: &Builder<'_>, cmd: &mut BootstrapCommand, stream: bool) -> bool {
+    let cmd = cmd.as_command_mut();
     cmd.stdout(Stdio::piped());
 
-    builder.verbose(&format!("running: {cmd:?}"));
+    builder.verbose(|| println!("running: {cmd:?}"));
 
     let mut process = cmd.spawn().unwrap();
 
@@ -166,7 +176,7 @@ impl<'a> Renderer<'a> {
         println!();
     }
 
-    fn render_test_outcome_terse(&mut self, outcome: Outcome<'_>, _: &TestOutcome) {
+    fn render_test_outcome_terse(&mut self, outcome: Outcome<'_>, test: &TestOutcome) {
         if self.terse_tests_in_line != 0 && self.terse_tests_in_line % TERSE_TESTS_PER_LINE == 0 {
             if let Some(total) = self.tests_count {
                 let total = total.to_string();
@@ -178,7 +188,7 @@ impl<'a> Renderer<'a> {
         }
 
         self.terse_tests_in_line += 1;
-        self.builder.colored_stdout(|stdout| outcome.write_short(stdout)).unwrap();
+        self.builder.colored_stdout(|stdout| outcome.write_short(stdout, &test.name)).unwrap();
         let _ = std::io::stdout().flush();
     }
 
@@ -215,8 +225,8 @@ impl<'a> Renderer<'a> {
             for bench in &self.benches {
                 rows.push((
                     &bench.name,
-                    format!("{:.2?}/iter", Duration::from_nanos(bench.median)),
-                    format!("+/- {:.2?}", Duration::from_nanos(bench.deviation)),
+                    format!("{:.2?}/iter", bench.median),
+                    format!("+/- {:.2?}", bench.deviation),
                 ));
             }
 
@@ -231,14 +241,16 @@ impl<'a> Renderer<'a> {
         print!("\ntest result: ");
         self.builder.colored_stdout(|stdout| outcome.write_long(stdout)).unwrap();
         println!(
-            ". {} passed; {} failed; {} ignored; {} measured; {} filtered out; \
-             finished in {:.2?}\n",
+            ". {} passed; {} failed; {} ignored; {} measured; {} filtered out{time}\n",
             suite.passed,
             suite.failed,
             suite.ignored,
             suite.measured,
             suite.filtered_out,
-            Duration::from_secs_f64(suite.exec_time)
+            time = match suite.exec_time {
+                Some(t) => format!("; finished in {:.2?}", Duration::from_secs_f64(t)),
+                None => String::new(),
+            }
         );
     }
 
@@ -300,7 +312,7 @@ enum Outcome<'a> {
 }
 
 impl Outcome<'_> {
-    fn write_short(&self, writer: &mut dyn WriteColor) -> Result<(), std::io::Error> {
+    fn write_short(&self, writer: &mut dyn WriteColor, name: &str) -> Result<(), std::io::Error> {
         match self {
             Outcome::Ok => {
                 writer.set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
@@ -311,8 +323,11 @@ impl Outcome<'_> {
                 write!(writer, "b")?;
             }
             Outcome::Failed => {
+                // Put failed tests on their own line and include the test name, so that it's faster
+                // to see which test failed without having to wait for them all to run.
+                writeln!(writer)?;
                 writer.set_color(ColorSpec::new().set_fg(Some(Color::Red)))?;
-                write!(writer, "F")?;
+                writeln!(writer, "{name} ... F")?;
             }
             Outcome::Ignored { .. } => {
                 writer.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
@@ -371,7 +386,9 @@ struct SuiteOutcome {
     ignored: usize,
     measured: usize,
     filtered_out: usize,
-    exec_time: f64,
+    /// The time it took to execute this test suite, or `None` if time measurement was not possible
+    /// (e.g. due to running on wasm).
+    exec_time: Option<f64>,
 }
 
 #[derive(serde_derive::Deserialize)]
@@ -387,8 +404,8 @@ enum TestMessage {
 #[derive(serde_derive::Deserialize)]
 struct BenchOutcome {
     name: String,
-    median: u64,
-    deviation: u64,
+    median: f64,
+    deviation: f64,
 }
 
 #[derive(serde_derive::Deserialize)]

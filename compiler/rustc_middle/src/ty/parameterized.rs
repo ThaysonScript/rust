@@ -33,8 +33,8 @@ impl<T: ParameterizedOverTcx> ParameterizedOverTcx for ty::Binder<'static, T> {
     type Value<'tcx> = ty::Binder<'tcx, T::Value<'tcx>>;
 }
 
-impl<T: ParameterizedOverTcx> ParameterizedOverTcx for ty::EarlyBinder<T> {
-    type Value<'tcx> = ty::EarlyBinder<T::Value<'tcx>>;
+impl<T: ParameterizedOverTcx> ParameterizedOverTcx for ty::EarlyBinder<'static, T> {
+    type Value<'tcx> = ty::EarlyBinder<'tcx, T::Value<'tcx>>;
 }
 
 #[macro_export]
@@ -75,6 +75,7 @@ trivially_parameterized_over_tcx! {
     ty::Visibility<DefIndex>,
     ty::adjustment::CoerceUnsizedInfo,
     ty::fast_reject::SimplifiedType,
+    ty::IntrinsicDef,
     rustc_ast::Attribute,
     rustc_ast::DelimArgs,
     rustc_ast::expand::StrippedCfgItem<rustc_hir::def_id::DefIndex>,

@@ -3,14 +3,16 @@ use rustc_ast::CRATE_NODE_ID;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::temp_dir::MaybeTempDir;
-use rustc_errors::{DiagCtxt, ErrorGuaranteed, FatalError};
+use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed, FatalError};
 use rustc_fs_util::{fix_windows_verbatim_for_gcc, try_canonicalize};
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_metadata::find_native_static_library;
 use rustc_metadata::fs::{copy_to_stdout, emit_wrapper_file, METADATA_FILENAME};
+use rustc_middle::bug;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::SymbolExportKind;
+use rustc_session::config::LinkerFeaturesCli;
 use rustc_session::config::{self, CFGuard, CrateType, DebugInfo, OutFileName, Strip};
 use rustc_session::config::{OutputFilenames, OutputType, PrintKind, SplitDwarfKind};
 use rustc_session::cstore::DllImport;
@@ -22,9 +24,10 @@ use rustc_session::utils::NativeLibKind;
 use rustc_session::{filesearch, Session};
 use rustc_span::symbol::Symbol;
 use rustc_target::spec::crt_objects::CrtObjects;
-use rustc_target::spec::LinkSelfContainedComponents;
 use rustc_target::spec::LinkSelfContainedDefault;
+use rustc_target::spec::LinkerFlavorCli;
 use rustc_target::spec::{Cc, LinkOutputKind, LinkerFlavor, Lld, PanicStrategy};
+use rustc_target::spec::{LinkSelfContainedComponents, LinkerFeatures};
 use rustc_target::spec::{RelocModel, RelroLevel, SanitizerSet, SplitDebuginfo};
 
 use super::archive::{ArchiveBuilder, ArchiveBuilderBuilder};
@@ -41,26 +44,17 @@ use regex::Regex;
 use tempfile::Builder as TempFileBuilder;
 
 use itertools::Itertools;
-use std::cell::OnceCell;
 use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{read, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
 use std::{env, fmt, fs, io, mem, str};
+use tracing::{debug, info, warn};
 
-#[derive(Default)]
-pub struct SearchPaths(OnceCell<Vec<PathBuf>>);
-
-impl SearchPaths {
-    pub(super) fn get(&self, sess: &Session) -> &[PathBuf] {
-        self.0.get_or_init(|| archive_search_paths(sess))
-    }
-}
-
-pub fn ensure_removed(dcx: &DiagCtxt, path: &Path) {
+pub fn ensure_removed(dcx: DiagCtxtHandle<'_>, path: &Path) {
     if let Err(e) = fs::remove_file(path) {
         if e.kind() != io::ErrorKind::NotFound {
             dcx.err(format!("failed to remove {}: {}", path.display(), e));
@@ -70,8 +64,8 @@ pub fn ensure_removed(dcx: &DiagCtxt, path: &Path) {
 
 /// Performs the linkage portion of the compilation phase. This will generate all
 /// of the requested outputs for this compilation session.
-pub fn link_binary<'a>(
-    sess: &'a Session,
+pub fn link_binary(
+    sess: &Session,
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     codegen_results: &CodegenResults,
     outputs: &OutputFilenames,
@@ -308,15 +302,16 @@ fn link_rlib<'a>(
     codegen_results: &CodegenResults,
     flavor: RlibFlavor,
     tmpdir: &MaybeTempDir,
-) -> Result<Box<dyn ArchiveBuilder<'a> + 'a>, ErrorGuaranteed> {
-    let lib_search_paths = archive_search_paths(sess);
-
+) -> Result<Box<dyn ArchiveBuilder + 'a>, ErrorGuaranteed> {
     let mut ab = archive_builder_builder.new_archive_builder(sess);
 
     let trailing_metadata = match flavor {
         RlibFlavor::Normal => {
-            let (metadata, metadata_position) =
-                create_wrapper_file(sess, b".rmeta".to_vec(), codegen_results.metadata.raw_data());
+            let (metadata, metadata_position) = create_wrapper_file(
+                sess,
+                ".rmeta".to_string(),
+                codegen_results.metadata.raw_data(),
+            );
             let metadata = emit_wrapper_file(sess, &metadata, tmpdir, METADATA_FILENAME);
             match metadata_position {
                 MetadataPosition::First => {
@@ -381,19 +376,14 @@ fn link_rlib<'a>(
         if flavor == RlibFlavor::Normal
             && let Some(filename) = lib.filename
         {
-            let path = find_native_static_library(filename.as_str(), true, &lib_search_paths, sess);
+            let path = find_native_static_library(filename.as_str(), true, sess);
             let src = read(path)
                 .map_err(|e| sess.dcx().emit_fatal(errors::ReadFileError { message: e }))?;
-            let (data, _) = create_wrapper_file(sess, b".bundled_lib".to_vec(), &src);
+            let (data, _) = create_wrapper_file(sess, ".bundled_lib".to_string(), &src);
             let wrapper_file = emit_wrapper_file(sess, &data, tmpdir, filename.as_str());
             packed_bundled_libs.push(wrapper_file);
         } else {
-            let path = find_native_static_library(
-                lib.name.as_str(),
-                lib.verbatim,
-                &lib_search_paths,
-                sess,
-            );
+            let path = find_native_static_library(lib.name.as_str(), lib.verbatim, sess);
             ab.add_archive(&path, Box::new(|_| false)).unwrap_or_else(|error| {
                 sess.dcx().emit_fatal(errors::AddNativeLibrary { library_path: path, error })
             });
@@ -460,9 +450,9 @@ fn link_rlib<'a>(
 /// then the CodegenResults value contains one NativeLib instance for each block. However, the
 /// linker appears to expect only a single import library for each library used, so we need to
 /// collate the symbols together by library name before generating the import libraries.
-fn collate_raw_dylibs<'a, 'b>(
-    sess: &'a Session,
-    used_libraries: impl IntoIterator<Item = &'b NativeLib>,
+fn collate_raw_dylibs<'a>(
+    sess: &Session,
+    used_libraries: impl IntoIterator<Item = &'a NativeLib>,
 ) -> Result<Vec<(String, Vec<DllImport>)>, ErrorGuaranteed> {
     // Use index maps to preserve original order of imports and libraries.
     let mut dylib_table = FxIndexMap::<String, FxIndexMap<Symbol, &DllImport>>::default();
@@ -509,8 +499,8 @@ fn collate_raw_dylibs<'a, 'b>(
 ///
 /// There's no need to include metadata in a static archive, so ensure to not link in the metadata
 /// object file (and also don't prepare the archive with a metadata file).
-fn link_staticlib<'a>(
-    sess: &'a Session,
+fn link_staticlib(
+    sess: &Session,
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     codegen_results: &CodegenResults,
     out_filename: &Path,
@@ -622,11 +612,7 @@ fn link_staticlib<'a>(
 
 /// Use `thorin` (rust implementation of a dwarf packaging utility) to link DWARF objects into a
 /// DWARF package.
-fn link_dwarf_object<'a>(
-    sess: &'a Session,
-    cg_results: &CodegenResults,
-    executable_out_filename: &Path,
-) {
+fn link_dwarf_object(sess: &Session, cg_results: &CodegenResults, executable_out_filename: &Path) {
     let mut dwp_out_filename = executable_out_filename.to_path_buf().into_os_string();
     dwp_out_filename.push(".dwp");
     debug!(?dwp_out_filename, ?executable_out_filename);
@@ -730,8 +716,8 @@ fn link_dwarf_object<'a>(
 ///
 /// This will invoke the system linker/cc to create the resulting file. This links to all upstream
 /// files as well.
-fn link_natively<'a>(
-    sess: &'a Session,
+fn link_natively(
+    sess: &Session,
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     crate_type: CrateType,
     out_filename: &Path,
@@ -781,7 +767,7 @@ fn link_natively<'a>(
     let mut i = 0;
     loop {
         i += 1;
-        prog = sess.time("run_linker", || exec_linker(sess, &cmd, out_filename, tmpdir));
+        prog = sess.time("run_linker", || exec_linker(sess, &cmd, out_filename, flavor, tmpdir));
         let Ok(ref output) = prog else {
             break;
         };
@@ -801,12 +787,33 @@ fn link_natively<'a>(
         if matches!(flavor, LinkerFlavor::Gnu(Cc::Yes, _))
             && unknown_arg_regex.is_match(&out)
             && out.contains("-no-pie")
-            && cmd.get_args().iter().any(|e| e.to_string_lossy() == "-no-pie")
+            && cmd.get_args().iter().any(|e| e == "-no-pie")
         {
             info!("linker output: {:?}", out);
             warn!("Linker does not support -no-pie command line option. Retrying without.");
             for arg in cmd.take_args() {
-                if arg.to_string_lossy() != "-no-pie" {
+                if arg != "-no-pie" {
+                    cmd.arg(arg);
+                }
+            }
+            info!("{:?}", &cmd);
+            continue;
+        }
+
+        // Check if linking failed with an error message that indicates the driver didn't recognize
+        // the `-fuse-ld=lld` option. If so, re-perform the link step without it. This avoids having
+        // to spawn multiple instances on the happy path to do version checking, and ensures things
+        // keep working on the tier 1 baseline of GLIBC 2.17+. That is generally understood as GCCs
+        // circa RHEL/CentOS 7, 4.5 or so, whereas lld support was added in GCC 9.
+        if matches!(flavor, LinkerFlavor::Gnu(Cc::Yes, Lld::Yes))
+            && unknown_arg_regex.is_match(&out)
+            && out.contains("-fuse-ld=lld")
+            && cmd.get_args().iter().any(|e| e.to_string_lossy() == "-fuse-ld=lld")
+        {
+            info!("linker output: {:?}", out);
+            warn!("The linker driver does not support `-fuse-ld=lld`. Retrying without it.");
+            for arg in cmd.take_args() {
+                if arg.to_string_lossy() != "-fuse-ld=lld" {
                     cmd.arg(arg);
                 }
             }
@@ -819,7 +826,7 @@ fn link_natively<'a>(
         if matches!(flavor, LinkerFlavor::Gnu(Cc::Yes, _))
             && unknown_arg_regex.is_match(&out)
             && (out.contains("-static-pie") || out.contains("--no-dynamic-linker"))
-            && cmd.get_args().iter().any(|e| e.to_string_lossy() == "-static-pie")
+            && cmd.get_args().iter().any(|e| e == "-static-pie")
         {
             info!("linker output: {:?}", out);
             warn!(
@@ -858,7 +865,7 @@ fn link_natively<'a>(
             assert!(pre_objects_static.is_empty() || !pre_objects_static_pie.is_empty());
             assert!(post_objects_static.is_empty() || !post_objects_static_pie.is_empty());
             for arg in cmd.take_args() {
-                if arg.to_string_lossy() == "-static-pie" {
+                if arg == "-static-pie" {
                     // Replace the output kind.
                     cmd.arg("-static");
                 } else if pre_objects_static_pie.contains(&arg) {
@@ -1077,11 +1084,26 @@ fn link_natively<'a>(
         }
     }
 
+    if sess.target.is_like_aix {
+        let stripcmd = "/usr/bin/strip";
+        match strip {
+            Strip::Debuginfo => {
+                // FIXME: AIX's strip utility only offers option to strip line number information.
+                strip_symbols_with_external_utility(sess, stripcmd, out_filename, Some("-l"))
+            }
+            Strip::Symbols => {
+                // Must be noted this option might remove symbol __aix_rust_metadata and thus removes .info section which contains metadata.
+                strip_symbols_with_external_utility(sess, stripcmd, out_filename, Some("-r"))
+            }
+            Strip::None => {}
+        }
+    }
+
     Ok(())
 }
 
-fn strip_symbols_with_external_utility<'a>(
-    sess: &'a Session,
+fn strip_symbols_with_external_utility(
+    sess: &Session,
     util: &str,
     out_filename: &Path,
     option: Option<&str>,
@@ -1197,20 +1219,29 @@ fn add_sanitizer_libraries(
     crate_type: CrateType,
     linker: &mut dyn Linker,
 ) {
+    if sess.target.is_like_android {
+        // Sanitizer runtime libraries are provided dynamically on Android
+        // targets.
+        return;
+    }
+
+    if sess.opts.unstable_opts.external_clangrt {
+        // Linking against in-tree sanitizer runtimes is disabled via
+        // `-Z external-clangrt`
+        return;
+    }
+
+    if matches!(crate_type, CrateType::Rlib | CrateType::Staticlib) {
+        return;
+    }
+
     // On macOS and Windows using MSVC the runtimes are distributed as dylibs
     // which should be linked to both executables and dynamic libraries.
     // Everywhere else the runtimes are currently distributed as static
     // libraries which should be linked to executables only.
-    let needs_runtime = !sess.target.is_like_android
-        && match crate_type {
-            CrateType::Executable => true,
-            CrateType::Dylib | CrateType::Cdylib | CrateType::ProcMacro => {
-                sess.target.is_like_osx || sess.target.is_like_msvc
-            }
-            CrateType::Rlib | CrateType::Staticlib => false,
-        };
-
-    if !needs_runtime {
+    if matches!(crate_type, CrateType::Dylib | CrateType::Cdylib | CrateType::ProcMacro)
+        && !(sess.target.is_like_osx || sess.target.is_like_msvc)
+    {
         return;
     }
 
@@ -1218,7 +1249,13 @@ fn add_sanitizer_libraries(
     if sanitizer.contains(SanitizerSet::ADDRESS) {
         link_sanitizer_runtime(sess, flavor, linker, "asan");
     }
-    if sanitizer.contains(SanitizerSet::LEAK) {
+    if sanitizer.contains(SanitizerSet::DATAFLOW) {
+        link_sanitizer_runtime(sess, flavor, linker, "dfsan");
+    }
+    if sanitizer.contains(SanitizerSet::LEAK)
+        && !sanitizer.contains(SanitizerSet::ADDRESS)
+        && !sanitizer.contains(SanitizerSet::HWADDRESS)
+    {
         link_sanitizer_runtime(sess, flavor, linker, "lsan");
     }
     if sanitizer.contains(SanitizerSet::MEMORY) {
@@ -1269,12 +1306,12 @@ fn link_sanitizer_runtime(
         let filename = format!("rustc{channel}_rt.{name}");
         let path = find_sanitizer_runtime(sess, &filename);
         let rpath = path.to_str().expect("non-utf8 component in path");
-        linker.args(&["-Wl,-rpath", "-Xlinker", rpath]);
+        linker.cc_args(&["-Wl,-rpath", "-Xlinker", rpath]);
         linker.link_dylib_by_name(&filename, false, true);
     } else if sess.target.is_like_msvc && flavor == LinkerFlavor::Msvc(Lld::No) && name == "asan" {
         // MSVC provides the `/INFERASANLIBS` argument to automatically find the
         // compatible ASAN library.
-        linker.arg("/INFERASANLIBS");
+        linker.link_arg("/INFERASANLIBS");
     } else {
         let filename = format!("librustc{channel}_rt.{name}.a");
         let path = find_sanitizer_runtime(sess, &filename).join(&filename);
@@ -1306,7 +1343,9 @@ pub fn linker_and_flavor(sess: &Session) -> (PathBuf, LinkerFlavor) {
         sess: &Session,
         linker: Option<PathBuf>,
         flavor: Option<LinkerFlavor>,
+        features: LinkerFeaturesCli,
     ) -> Option<(PathBuf, LinkerFlavor)> {
+        let flavor = flavor.map(|flavor| adjust_flavor_to_features(flavor, features));
         match (linker, flavor) {
             (Some(linker), Some(flavor)) => Some((linker, flavor)),
             // only the linker flavor is known; use the default linker for the selected flavor
@@ -1344,6 +1383,7 @@ pub fn linker_and_flavor(sess: &Session) -> (PathBuf, LinkerFlavor) {
                         }
                     }
                     LinkerFlavor::Bpf => "bpf-linker",
+                    LinkerFlavor::Llbc => "llvm-bitcode-linker",
                     LinkerFlavor::Ptx => "rust-ptx-linker",
                 }),
                 flavor,
@@ -1353,17 +1393,47 @@ pub fn linker_and_flavor(sess: &Session) -> (PathBuf, LinkerFlavor) {
                     sess.dcx().emit_fatal(errors::LinkerFileStem);
                 });
                 let flavor = sess.target.linker_flavor.with_linker_hints(stem);
+                let flavor = adjust_flavor_to_features(flavor, features);
                 Some((linker, flavor))
             }
             (None, None) => None,
         }
     }
 
+    // While linker flavors and linker features are isomorphic (and thus targets don't need to
+    // define features separately), we use the flavor as the root piece of data and have the
+    // linker-features CLI flag influence *that*, so that downstream code does not have to check for
+    // both yet.
+    fn adjust_flavor_to_features(
+        flavor: LinkerFlavor,
+        features: LinkerFeaturesCli,
+    ) -> LinkerFlavor {
+        // Note: a linker feature cannot be both enabled and disabled on the CLI.
+        if features.enabled.contains(LinkerFeatures::LLD) {
+            flavor.with_lld_enabled()
+        } else if features.disabled.contains(LinkerFeatures::LLD) {
+            flavor.with_lld_disabled()
+        } else {
+            flavor
+        }
+    }
+
+    let features = sess.opts.unstable_opts.linker_features;
+
     // linker and linker flavor specified via command line have precedence over what the target
     // specification specifies
-    let linker_flavor =
-        sess.opts.cg.linker_flavor.map(|flavor| sess.target.linker_flavor.with_cli_hints(flavor));
-    if let Some(ret) = infer_from(sess, sess.opts.cg.linker.clone(), linker_flavor) {
+    let linker_flavor = match sess.opts.cg.linker_flavor {
+        // The linker flavors that are non-target specific can be directly translated to LinkerFlavor
+        Some(LinkerFlavorCli::Llbc) => Some(LinkerFlavor::Llbc),
+        Some(LinkerFlavorCli::Ptx) => Some(LinkerFlavor::Ptx),
+        // The linker flavors that corresponds to targets needs logic that keeps the base LinkerFlavor
+        _ => sess
+            .opts
+            .cg
+            .linker_flavor
+            .map(|flavor| sess.target.linker_flavor.with_cli_hints(flavor)),
+    };
+    if let Some(ret) = infer_from(sess, sess.opts.cg.linker.clone(), linker_flavor, features) {
         return ret;
     }
 
@@ -1371,6 +1441,7 @@ pub fn linker_and_flavor(sess: &Session) -> (PathBuf, LinkerFlavor) {
         sess,
         sess.target.linker.as_deref().map(PathBuf::from),
         Some(sess.target.linker_flavor),
+        features,
     ) {
         return ret;
     }
@@ -1404,10 +1475,6 @@ fn preserve_objects_for_their_debuginfo(sess: &Session) -> (bool, bool) {
     }
 }
 
-fn archive_search_paths(sess: &Session) -> Vec<PathBuf> {
-    sess.target_filesearch(PathKind::Native).search_path_dirs()
-}
-
 #[derive(PartialEq)]
 enum RlibFlavor {
     Normal,
@@ -1423,11 +1490,6 @@ fn print_native_static_libs(
     let mut lib_args: Vec<_> = all_native_libs
         .iter()
         .filter(|l| relevant_lib(sess, l))
-        // Deduplication of successive repeated libraries, see rust-lang/rust#113209
-        //
-        // note: we don't use PartialEq/Eq because NativeLib transitively depends on local
-        // elements like spans, which we don't care about and would make the deduplication impossible
-        .dedup_by(|l1, l2| l1.name == l2.name && l1.kind == l2.kind && l1.verbatim == l2.verbatim)
         .filter_map(|lib| {
             let name = lib.name;
             match lib.kind {
@@ -1454,6 +1516,8 @@ fn print_native_static_libs(
                 | NativeLibKind::RawDylib => None,
             }
         })
+        // deduplication of consecutive repeated libraries, see rust-lang/rust#113209
+        .dedup()
         .collect();
     for path in all_rust_dylibs {
         // FIXME deduplicate with add_dynamic_crate
@@ -1535,6 +1599,7 @@ fn exec_linker(
     sess: &Session,
     cmd: &Command,
     out_filename: &Path,
+    flavor: LinkerFlavor,
     tmpdir: &Path,
 ) -> io::Result<Output> {
     // When attempting to spawn the linker we run a risk of blowing out the
@@ -1543,9 +1608,9 @@ fn exec_linker(
     //
     // Here we attempt to handle errors from the OS saying "your list of
     // arguments is too big" by reinvoking the linker again with an `@`-file
-    // that contains all the arguments. The theory is that this is then
-    // accepted on all linkers and the linker will read all its options out of
-    // there instead of looking at the command line.
+    // that contains all the arguments (aka 'response' files).
+    // The theory is that this is then accepted on all linkers and the linker
+    // will read all its options out of there instead of looking at the command line.
     if !cmd.very_likely_to_exceed_some_spawn_limit() {
         match cmd.command().stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
             Ok(child) => {
@@ -1565,8 +1630,12 @@ fn exec_linker(
     let mut args = String::new();
     for arg in cmd2.take_args() {
         args.push_str(
-            &Escape { arg: arg.to_str().unwrap(), is_like_msvc: sess.target.is_like_msvc }
-                .to_string(),
+            &Escape {
+                arg: arg.to_str().unwrap(),
+                // LLD also uses MSVC-like parsing for @-files by default when running on windows hosts
+                is_like_msvc: sess.target.is_like_msvc || (cfg!(windows) && flavor.uses_lld()),
+            }
+            .to_string(),
         );
         args.push('\n');
     }
@@ -1819,9 +1888,9 @@ fn add_post_link_objects(
 /// FIXME: Determine where exactly these args need to be inserted.
 fn add_pre_link_args(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor) {
     if let Some(args) = sess.target.pre_link_args.get(&flavor) {
-        cmd.args(args.iter().map(Deref::deref));
+        cmd.verbatim_args(args.iter().map(Deref::deref));
     }
-    cmd.args(&sess.opts.unstable_opts.pre_link_args);
+    cmd.verbatim_args(&sess.opts.unstable_opts.pre_link_args);
 }
 
 /// Add a link script embedded in the target, if applicable.
@@ -1839,8 +1908,7 @@ fn add_link_script(cmd: &mut dyn Linker, sess: &Session, tmpdir: &Path, crate_ty
                 sess.dcx().emit_fatal(errors::LinkScriptWriteFailure { path, error });
             }
 
-            cmd.arg("--script");
-            cmd.arg(path);
+            cmd.link_arg("--script").link_arg(path);
         }
         _ => {}
     }
@@ -1849,7 +1917,7 @@ fn add_link_script(cmd: &mut dyn Linker, sess: &Session, tmpdir: &Path, crate_ty
 /// Add arbitrary "user defined" args defined from command line.
 /// FIXME: Determine where exactly these args need to be inserted.
 fn add_user_defined_link_args(cmd: &mut dyn Linker, sess: &Session) {
-    cmd.args(&sess.opts.cg.link_args);
+    cmd.verbatim_args(&sess.opts.cg.link_args);
 }
 
 /// Add arbitrary "late link" args defined by the target spec.
@@ -1867,15 +1935,15 @@ fn add_late_link_args(
         });
     if any_dynamic_crate {
         if let Some(args) = sess.target.late_link_args_dynamic.get(&flavor) {
-            cmd.args(args.iter().map(Deref::deref));
+            cmd.verbatim_args(args.iter().map(Deref::deref));
         }
     } else {
         if let Some(args) = sess.target.late_link_args_static.get(&flavor) {
-            cmd.args(args.iter().map(Deref::deref));
+            cmd.verbatim_args(args.iter().map(Deref::deref));
         }
     }
     if let Some(args) = sess.target.late_link_args.get(&flavor) {
-        cmd.args(args.iter().map(Deref::deref));
+        cmd.verbatim_args(args.iter().map(Deref::deref));
     }
 }
 
@@ -1883,7 +1951,7 @@ fn add_late_link_args(
 /// FIXME: Determine where exactly these args need to be inserted.
 fn add_post_link_args(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor) {
     if let Some(args) = sess.target.post_link_args.get(&flavor) {
-        cmd.args(args.iter().map(Deref::deref));
+        cmd.verbatim_args(args.iter().map(Deref::deref));
     }
 }
 
@@ -2013,7 +2081,7 @@ fn add_library_search_dirs(cmd: &mut dyn Linker, sess: &Session, self_contained:
 /// Add options making relocation sections in the produced ELF files read-only
 /// and suppressing lazy binding.
 fn add_relro_args(cmd: &mut dyn Linker, sess: &Session) {
-    match sess.opts.unstable_opts.relro_level.unwrap_or(sess.target.relro_level) {
+    match sess.opts.cg.relro_level.unwrap_or(sess.target.relro_level) {
         RelroLevel::Full => cmd.full_relro(),
         RelroLevel::Partial => cmd.partial_relro(),
         RelroLevel::Off => cmd.no_relro(),
@@ -2028,6 +2096,10 @@ fn add_rpath_args(
     codegen_results: &CodegenResults,
     out_filename: &Path,
 ) {
+    if !sess.target.has_rpath {
+        return;
+    }
+
     // FIXME (#2397): At some point we want to rpath our guesses as to
     // where extern libraries might live, based on the
     // add_lib_search_paths
@@ -2043,14 +2115,13 @@ fn add_rpath_args(
                     .map(|(path, _)| &**path)
             })
             .collect::<Vec<_>>();
-        let mut rpath_config = RPathConfig {
+        let rpath_config = RPathConfig {
             libs: &*libs,
             out_filename: out_filename.to_path_buf(),
-            has_rpath: sess.target.has_rpath,
             is_like_osx: sess.target.is_like_osx,
             linker_is_gnu: sess.target.linker_flavor.is_gnu(),
         };
-        cmd.args(&rpath::get_rpath_flags(&mut rpath_config));
+        cmd.cc_args(&rpath::get_rpath_flags(&rpath_config));
     }
 }
 
@@ -2062,10 +2133,10 @@ fn add_rpath_args(
 /// to the linking process as a whole.
 /// Order-independent options may still override each other in order-dependent fashion,
 /// e.g `--foo=yes --foo=no` may be equivalent to `--foo=no`.
-fn linker_with_args<'a>(
+fn linker_with_args(
     path: &Path,
     flavor: LinkerFlavor,
-    sess: &'a Session,
+    sess: &Session,
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     crate_type: CrateType,
     tmpdir: &Path,
@@ -2309,7 +2380,7 @@ fn add_order_independent_options(
         } else {
             ""
         };
-        cmd.arg(format!("--dynamic-linker={prefix}ld.so.1"));
+        cmd.link_arg(format!("--dynamic-linker={prefix}ld.so.1"));
     }
 
     if sess.target.eh_frame_header {
@@ -2324,27 +2395,29 @@ fn add_order_independent_options(
     }
 
     if sess.target.os == "emscripten" {
-        cmd.arg("-s");
-        cmd.arg(if sess.panic_strategy() == PanicStrategy::Abort {
+        cmd.cc_arg("-s").cc_arg(if sess.panic_strategy() == PanicStrategy::Abort {
             "DISABLE_EXCEPTION_CATCHING=1"
         } else {
             "DISABLE_EXCEPTION_CATCHING=0"
         });
     }
 
-    if flavor == LinkerFlavor::Ptx {
-        // Provide the linker with fallback to internal `target-cpu`.
-        cmd.arg("--fallback-arch");
-        cmd.arg(&codegen_results.crate_info.target_cpu);
+    if flavor == LinkerFlavor::Llbc {
+        cmd.link_args(&[
+            "--target",
+            sess.target.llvm_target.as_ref(),
+            "--target-cpu",
+            &codegen_results.crate_info.target_cpu,
+        ]);
+    } else if flavor == LinkerFlavor::Ptx {
+        cmd.link_args(&["--fallback-arch", &codegen_results.crate_info.target_cpu]);
     } else if flavor == LinkerFlavor::Bpf {
-        cmd.arg("--cpu");
-        cmd.arg(&codegen_results.crate_info.target_cpu);
+        cmd.link_args(&["--cpu", &codegen_results.crate_info.target_cpu]);
         if let Some(feat) = [sess.opts.cg.target_feature.as_str(), &sess.target.options.features]
             .into_iter()
             .find(|feat| !feat.is_empty())
         {
-            cmd.arg("--cpu-features");
-            cmd.arg(feat);
+            cmd.link_args(&["--cpu-features", feat]);
         }
     }
 
@@ -2450,7 +2523,6 @@ fn add_native_libs_from_crate(
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     codegen_results: &CodegenResults,
     tmpdir: &Path,
-    search_paths: &SearchPaths,
     bundled_libs: &FxIndexSet<Symbol>,
     cnum: CrateNum,
     link_static: bool,
@@ -2513,7 +2585,7 @@ fn add_native_libs_from_crate(
                             cmd.link_staticlib_by_path(&path, whole_archive);
                         }
                     } else {
-                        cmd.link_staticlib_by_name(name, verbatim, whole_archive, search_paths);
+                        cmd.link_staticlib_by_name(name, verbatim, whole_archive);
                     }
                 }
             }
@@ -2527,7 +2599,7 @@ fn add_native_libs_from_crate(
                 // link kind is unspecified.
                 if !link_output_kind.can_link_dylib() && !sess.target.crt_static_allows_dylibs {
                     if link_static {
-                        cmd.link_staticlib_by_name(name, verbatim, false, search_paths);
+                        cmd.link_staticlib_by_name(name, verbatim, false);
                     }
                 } else {
                     if link_dynamic {
@@ -2546,7 +2618,11 @@ fn add_native_libs_from_crate(
             NativeLibKind::WasmImportModule => {}
             NativeLibKind::LinkArg => {
                 if link_static {
-                    cmd.linker_arg(OsStr::new(name), verbatim);
+                    if verbatim {
+                        cmd.verbatim_arg(name);
+                    } else {
+                        cmd.link_arg(name);
+                    }
                 }
             }
         }
@@ -2574,7 +2650,6 @@ fn add_local_native_libraries(
         }
     }
 
-    let search_paths = SearchPaths::default();
     // All static and dynamic native library dependencies are linked to the local crate.
     let link_static = true;
     let link_dynamic = true;
@@ -2584,7 +2659,6 @@ fn add_local_native_libraries(
         archive_builder_builder,
         codegen_results,
         tmpdir,
-        &search_paths,
         &Default::default(),
         LOCAL_CRATE,
         link_static,
@@ -2593,9 +2667,9 @@ fn add_local_native_libraries(
     );
 }
 
-fn add_upstream_rust_crates<'a>(
+fn add_upstream_rust_crates(
     cmd: &mut dyn Linker,
-    sess: &'a Session,
+    sess: &Session,
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     codegen_results: &CodegenResults,
     crate_type: CrateType,
@@ -2616,7 +2690,6 @@ fn add_upstream_rust_crates<'a>(
         .find(|(ty, _)| *ty == crate_type)
         .expect("failed to find crate type in dependency format list");
 
-    let search_paths = SearchPaths::default();
     for &cnum in &codegen_results.crate_info.used_crates {
         // We may not pass all crates through to the linker. Some crates may appear statically in
         // an existing dylib, meaning we'll pick up all the symbols from the dylib.
@@ -2673,7 +2746,6 @@ fn add_upstream_rust_crates<'a>(
             archive_builder_builder,
             codegen_results,
             tmpdir,
-            &search_paths,
             &bundled_libs,
             cnum,
             link_static,
@@ -2691,7 +2763,6 @@ fn add_upstream_native_libraries(
     tmpdir: &Path,
     link_output_kind: LinkOutputKind,
 ) {
-    let search_paths = SearchPaths::default();
     for &cnum in &codegen_results.crate_info.used_crates {
         // Static libraries are not linked here, they are linked in `add_upstream_rust_crates`.
         // FIXME: Merge this function to `add_upstream_rust_crates` so that all native libraries
@@ -2713,7 +2784,6 @@ fn add_upstream_native_libraries(
             archive_builder_builder,
             codegen_results,
             tmpdir,
-            &search_paths,
             &Default::default(),
             cnum,
             link_static,
@@ -2732,7 +2802,7 @@ fn add_upstream_native_libraries(
 // file generated by the MSVC linker. See https://github.com/rust-lang/rust/issues/112586.
 //
 // The returned path will always have `fix_windows_verbatim_for_gcc()` applied to it.
-fn rehome_sysroot_lib_dir<'a>(sess: &'a Session, lib_dir: &Path) -> PathBuf {
+fn rehome_sysroot_lib_dir(sess: &Session, lib_dir: &Path) -> PathBuf {
     let sysroot_lib_path = sess.target_filesearch(PathKind::All).get_lib_path();
     let canonical_sysroot_lib_path =
         { try_canonicalize(&sysroot_lib_path).unwrap_or_else(|_| sysroot_lib_path.clone()) };
@@ -2744,6 +2814,15 @@ fn rehome_sysroot_lib_dir<'a>(sess: &'a Session, lib_dir: &Path) -> PathBuf {
         sysroot_lib_path
     } else {
         fix_windows_verbatim_for_gcc(lib_dir)
+    }
+}
+
+fn rehome_lib_path(sess: &Session, path: &Path) -> PathBuf {
+    if let Some(dir) = path.parent() {
+        let file_name = path.file_name().expect("library path has no file name component");
+        rehome_sysroot_lib_dir(sess, dir).join(file_name)
+    } else {
+        fix_windows_verbatim_for_gcc(path)
     }
 }
 
@@ -2765,9 +2844,9 @@ fn rehome_sysroot_lib_dir<'a>(sess: &'a Session, lib_dir: &Path) -> PathBuf {
 // Note, however, that if we're not doing LTO we can just pass the rlib
 // blindly to the linker (fast) because it's fine if it's not actually
 // included as we're at the end of the dependency chain.
-fn add_static_crate<'a>(
+fn add_static_crate(
     cmd: &mut dyn Linker,
-    sess: &'a Session,
+    sess: &Session,
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     codegen_results: &CodegenResults,
     tmpdir: &Path,
@@ -2777,15 +2856,8 @@ fn add_static_crate<'a>(
     let src = &codegen_results.crate_info.used_crate_source[&cnum];
     let cratepath = &src.rlib.as_ref().unwrap().0;
 
-    let mut link_upstream = |path: &Path| {
-        let rlib_path = if let Some(dir) = path.parent() {
-            let file_name = path.file_name().expect("rlib path has no file name path component");
-            rehome_sysroot_lib_dir(sess, dir).join(file_name)
-        } else {
-            fix_windows_verbatim_for_gcc(path)
-        };
-        cmd.link_staticlib_by_path(&rlib_path, false);
-    };
+    let mut link_upstream =
+        |path: &Path| cmd.link_staticlib_by_path(&rehome_lib_path(sess, path), false);
 
     if !are_upstream_rust_objects_already_included(sess)
         || ignored_for_lto(sess, &codegen_results.crate_info, cnum)
@@ -2849,27 +2921,7 @@ fn add_static_crate<'a>(
 
 // Same thing as above, but for dynamic crates instead of static crates.
 fn add_dynamic_crate(cmd: &mut dyn Linker, sess: &Session, cratepath: &Path) {
-    // Just need to tell the linker about where the library lives and
-    // what its name is
-    let parent = cratepath.parent();
-    // When producing a dll, the MSVC linker may not actually emit a
-    // `foo.lib` file if the dll doesn't actually export any symbols, so we
-    // check to see if the file is there and just omit linking to it if it's
-    // not present.
-    if sess.target.is_like_msvc && !cratepath.with_extension("dll.lib").exists() {
-        return;
-    }
-    if let Some(dir) = parent {
-        cmd.include_path(&rehome_sysroot_lib_dir(sess, dir));
-    }
-    // "<dir>/name.dll -> name.dll" on windows-msvc
-    // "<dir>/name.dll -> name" on windows-gnu
-    // "<dir>/libname.<ext> -> name" elsewhere
-    let stem = if sess.target.is_like_msvc { cratepath.file_name() } else { cratepath.file_stem() };
-    let stem = stem.unwrap().to_str().unwrap();
-    // Convert library file-stem into a cc -l argument.
-    let prefix = if stem.starts_with("lib") && !sess.target.is_like_windows { 3 } else { 0 };
-    cmd.link_dylib_by_name(&stem[prefix..], false, true);
+    cmd.link_dylib_by_path(&rehome_lib_path(sess, cratepath), true);
 }
 
 fn relevant_lib(sess: &Session, lib: &NativeLib) -> bool {
@@ -2896,7 +2948,7 @@ fn add_apple_sdk(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor) {
     let os = &sess.target.os;
     let llvm_target = &sess.target.llvm_target;
     if sess.target.vendor != "apple"
-        || !matches!(os.as_ref(), "ios" | "tvos" | "watchos" | "macos")
+        || !matches!(os.as_ref(), "ios" | "tvos" | "watchos" | "visionos" | "macos")
         || !matches!(flavor, LinkerFlavor::Darwin(..))
     {
         return;
@@ -2921,6 +2973,8 @@ fn add_apple_sdk(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor) {
         ("arm64_32", "watchos") => "watchos",
         ("aarch64", "watchos") if llvm_target.ends_with("-simulator") => "watchsimulator",
         ("aarch64", "watchos") => "watchos",
+        ("aarch64", "visionos") if llvm_target.ends_with("-simulator") => "xrsimulator",
+        ("aarch64", "visionos") => "xros",
         ("arm", "watchos") => "watchos",
         (_, "macos") => "macosx",
         _ => {
@@ -2938,12 +2992,29 @@ fn add_apple_sdk(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor) {
 
     match flavor {
         LinkerFlavor::Darwin(Cc::Yes, _) => {
-            cmd.args(&["-isysroot", &sdk_root, "-Wl,-syslibroot", &sdk_root]);
+            // Use `-isysroot` instead of `--sysroot`, as only the former
+            // makes Clang treat it as a platform SDK.
+            //
+            // This is admittedly a bit strange, as on most targets
+            // `-isysroot` only applies to include header files, but on Apple
+            // targets this also applies to libraries and frameworks.
+            cmd.cc_args(&["-isysroot", &sdk_root]);
         }
         LinkerFlavor::Darwin(Cc::No, _) => {
-            cmd.args(&["-syslibroot", &sdk_root]);
+            cmd.link_args(&["-syslibroot", &sdk_root]);
         }
         _ => unreachable!(),
+    }
+
+    if llvm_target.contains("macabi") {
+        // Mac Catalyst uses the macOS SDK, but to link to iOS-specific
+        // frameworks, we must have the support library stubs in the library
+        // search path.
+
+        // The flags are called `-L` and `-F` both in Clang, ld64 and ldd.
+        let sdk_root = Path::new(&sdk_root);
+        cmd.include_path(&sdk_root.join("System/iOSSupport/usr/lib"));
+        cmd.framework_path(&sdk_root.join("System/iOSSupport/System/Library/Frameworks"));
     }
 }
 
@@ -2977,6 +3048,11 @@ fn get_apple_sdk_root(sdk_name: &str) -> Result<String, errors::AppleSdkRootErro
                     || sdkroot.contains("MacOSX.platform") => {}
             "watchsimulator"
                 if sdkroot.contains("WatchOS.platform") || sdkroot.contains("MacOSX.platform") => {}
+            "xros"
+                if sdkroot.contains("XRSimulator.platform")
+                    || sdkroot.contains("MacOSX.platform") => {}
+            "xrsimulator"
+                if sdkroot.contains("XROS.platform") || sdkroot.contains("MacOSX.platform") => {}
             // Ignore `SDKROOT` if it's not a valid path.
             _ if !p.is_absolute() || p == Path::new("/") || !p.exists() => {}
             _ => return Ok(sdkroot),
@@ -3049,18 +3125,32 @@ fn add_lld_args(
 
     let self_contained_linker = self_contained_cli || self_contained_target;
     if self_contained_linker && !sess.opts.cg.link_self_contained.is_linker_disabled() {
+        let mut linker_path_exists = false;
         for path in sess.get_tools_search_paths(false) {
-            cmd.arg({
+            let linker_path = path.join("gcc-ld");
+            linker_path_exists |= linker_path.exists();
+            cmd.cc_arg({
                 let mut arg = OsString::from("-B");
-                arg.push(path.join("gcc-ld"));
+                arg.push(linker_path);
                 arg
             });
+        }
+        if !linker_path_exists {
+            // As a sanity check, we emit an error if none of these paths exist: we want
+            // self-contained linking and have no linker.
+            sess.dcx().emit_fatal(errors::SelfContainedLinkerMissing);
         }
     }
 
     // 2. Implement the "linker flavor" part of this feature by asking `cc` to use some kind of
     // `lld` as the linker.
-    cmd.arg("-fuse-ld=lld");
+    //
+    // Note that wasm targets skip this step since the only option there anyway
+    // is to use LLD but the `wasm32-wasip2` target relies on a wrapper around
+    // this, `wasm-component-ld`, which is overridden if this option is passed.
+    if !sess.target.is_like_wasm {
+        cmd.cc_arg("-fuse-ld=lld");
+    }
 
     if !flavor.is_gnu() {
         // Tell clang to use a non-default LLD flavor.
@@ -3083,7 +3173,7 @@ fn add_lld_args(
         // targeting a different linker flavor on macOS, and that's also always
         // the case when targeting WASM.
         if sess.target.linker_flavor != sess.host.linker_flavor {
-            cmd.arg(format!("--target={}", sess.target.llvm_target));
+            cmd.cc_arg(format!("--target={}", sess.target.llvm_target));
         }
     }
 }

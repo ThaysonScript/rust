@@ -176,14 +176,12 @@ impl NavigationTarget {
 
 impl TryToNav for FileSymbol {
     fn try_to_nav(&self, db: &RootDatabase) -> Option<UpmappingResult<NavigationTarget>> {
-        let root = db.parse_or_expand(self.loc.hir_file_id);
-        self.loc.ptr.to_node(&root);
         Some(
-            orig_range_with_focus(
+            orig_range_with_focus_r(
                 db,
                 self.loc.hir_file_id,
-                &self.loc.ptr.to_node(&root),
-                Some(self.loc.name_ptr.to_node(&root)),
+                self.loc.ptr.text_range(),
+                Some(self.loc.name_ptr.text_range()),
             )
             .map(|(FileRange { file_id, range: full_range }, focus_range)| {
                 NavigationTarget {
@@ -222,7 +220,7 @@ impl TryToNav for Definition {
     fn try_to_nav(&self, db: &RootDatabase) -> Option<UpmappingResult<NavigationTarget>> {
         match self {
             Definition::Local(it) => Some(it.to_nav(db)),
-            Definition::Label(it) => Some(it.to_nav(db)),
+            Definition::Label(it) => it.try_to_nav(db),
             Definition::Module(it) => Some(it.to_nav(db)),
             Definition::Macro(it) => it.try_to_nav(db),
             Definition::Field(it) => it.try_to_nav(db),
@@ -237,9 +235,11 @@ impl TryToNav for Definition {
             Definition::TraitAlias(it) => it.try_to_nav(db),
             Definition::TypeAlias(it) => it.try_to_nav(db),
             Definition::ExternCrateDecl(it) => Some(it.try_to_nav(db)?),
-            Definition::BuiltinType(_) | Definition::TupleField(_) => None,
-            Definition::ToolModule(_) => None,
-            Definition::BuiltinAttr(_) => None,
+            Definition::BuiltinLifetime(_)
+            | Definition::BuiltinType(_)
+            | Definition::TupleField(_)
+            | Definition::ToolModule(_)
+            | Definition::BuiltinAttr(_) => None,
             // FIXME: The focus range should be set to the helper declaration
             Definition::DeriveHelper(it) => it.derive().try_to_nav(db),
         }
@@ -562,12 +562,12 @@ impl ToNav for hir::Local {
     }
 }
 
-impl ToNav for hir::Label {
-    fn to_nav(&self, db: &RootDatabase) -> UpmappingResult<NavigationTarget> {
-        let InFile { file_id, value } = self.source(db);
+impl TryToNav for hir::Label {
+    fn try_to_nav(&self, db: &RootDatabase) -> Option<UpmappingResult<NavigationTarget>> {
+        let InFile { file_id, value } = self.source(db)?;
         let name = self.name(db).to_smol_str();
 
-        orig_range_with_focus(db, file_id, value.syntax(), value.lifetime()).map(
+        Some(orig_range_with_focus(db, file_id, value.syntax(), value.lifetime()).map(
             |(FileRange { file_id, range: full_range }, focus_range)| NavigationTarget {
                 file_id,
                 name: name.clone(),
@@ -579,7 +579,7 @@ impl ToNav for hir::Label {
                 description: None,
                 docs: None,
             },
-        )
+        ))
     }
 }
 
@@ -722,7 +722,21 @@ fn orig_range_with_focus(
     value: &SyntaxNode,
     name: Option<impl AstNode>,
 ) -> UpmappingResult<(FileRange, Option<TextRange>)> {
-    let Some(name) = name else { return orig_range(db, hir_file, value) };
+    orig_range_with_focus_r(
+        db,
+        hir_file,
+        value.text_range(),
+        name.map(|it| it.syntax().text_range()),
+    )
+}
+
+fn orig_range_with_focus_r(
+    db: &RootDatabase,
+    hir_file: HirFileId,
+    value: TextRange,
+    name: Option<TextRange>,
+) -> UpmappingResult<(FileRange, Option<TextRange>)> {
+    let Some(name) = name else { return orig_range_r(db, hir_file, value) };
 
     let call_kind =
         || db.lookup_intern_macro_call(hir_file.macro_file().unwrap().macro_call_id).kind;
@@ -733,9 +747,9 @@ fn orig_range_with_focus(
             .definition_range(db)
     };
 
-    let value_range = InFile::new(hir_file, value).original_file_range_opt(db);
+    let value_range = InFile::new(hir_file, value).original_node_file_range_opt(db);
     let ((call_site_range, call_site_focus), def_site) =
-        match InFile::new(hir_file, name.syntax()).original_file_range_opt(db) {
+        match InFile::new(hir_file, name).original_node_file_range_opt(db) {
             // call site name
             Some((focus_range, ctxt)) if ctxt.is_root() => {
                 // Try to upmap the node as well, if it ends up in the def site, go back to the call site
@@ -802,7 +816,7 @@ fn orig_range_with_focus(
                 }
             }
             // lost name? can't happen for single tokens
-            None => return orig_range(db, hir_file, value),
+            None => return orig_range_r(db, hir_file, value),
         };
 
     UpmappingResult {
@@ -840,7 +854,18 @@ fn orig_range(
     value: &SyntaxNode,
 ) -> UpmappingResult<(FileRange, Option<TextRange>)> {
     UpmappingResult {
-        call_site: (InFile::new(hir_file, value).original_file_range(db), None),
+        call_site: (InFile::new(hir_file, value).original_file_range_rooted(db), None),
+        def_site: None,
+    }
+}
+
+fn orig_range_r(
+    db: &RootDatabase,
+    hir_file: HirFileId,
+    value: TextRange,
+) -> UpmappingResult<(FileRange, Option<TextRange>)> {
+    UpmappingResult {
+        call_site: (InFile::new(hir_file, value).original_node_file_range(db).0, None),
         def_site: None,
     }
 }
@@ -900,5 +925,27 @@ struct Foo;
 
         let navs = analysis.symbol_search(Query::new("foo".to_owned()), !0).unwrap();
         assert_eq!(navs.len(), 2)
+    }
+
+    #[test]
+    fn test_ensure_hidden_symbols_are_not_returned() {
+        let (analysis, _) = fixture::file(
+            r#"
+fn foo() {}
+struct Foo;
+static __FOO_CALLSITE: () = ();
+"#,
+        );
+
+        // It doesn't show the hidden symbol
+        let navs = analysis.symbol_search(Query::new("foo".to_owned()), !0).unwrap();
+        assert_eq!(navs.len(), 2);
+        let navs = analysis.symbol_search(Query::new("_foo".to_owned()), !0).unwrap();
+        assert_eq!(navs.len(), 0);
+
+        // Unless we explicitly search for a `__` prefix
+        let query = Query::new("__foo".to_owned());
+        let navs = analysis.symbol_search(query, !0).unwrap();
+        assert_eq!(navs.len(), 1);
     }
 }

@@ -1,6 +1,6 @@
 //@ run-pass
 
-#![warn(indirect_structural_match)]
+#![allow(non_local_definitions)]
 
 // This test is checking our logic for structural match checking by enumerating
 // the different kinds of const expressions. This test is collecting cases where

@@ -1,3 +1,6 @@
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![allow(rustc::default_hash_types)]
 #![feature(allow_internal_unstable)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
@@ -5,8 +8,7 @@
 #![feature(proc_macro_diagnostic)]
 #![feature(proc_macro_span)]
 #![feature(proc_macro_tracked_env)]
-#![allow(rustc::default_hash_types)]
-#![allow(internal_features)]
+// tidy-alphabetical-end
 
 use synstructure::decl_derive;
 
@@ -108,7 +110,9 @@ decl_derive!(
         // struct attributes
         diag,
         help,
+        help_once,
         note,
+        note_once,
         warning,
         // field attributes
         skip_arg,
@@ -118,14 +122,16 @@ decl_derive!(
         suggestion,
         suggestion_short,
         suggestion_hidden,
-        suggestion_verbose)] => diagnostics::session_diagnostic_derive
+        suggestion_verbose)] => diagnostics::diagnostic_derive
 );
 decl_derive!(
     [LintDiagnostic, attributes(
         // struct attributes
         diag,
         help,
+        help_once,
         note,
+        note_once,
         warning,
         // field attributes
         skip_arg,
@@ -142,8 +148,11 @@ decl_derive!(
         // struct/variant attributes
         label,
         help,
+        help_once,
         note,
+        note_once,
         warning,
+        subdiagnostic,
         suggestion,
         suggestion_short,
         suggestion_hidden,
@@ -156,5 +165,5 @@ decl_derive!(
         skip_arg,
         primary_span,
         suggestion_part,
-        applicability)] => diagnostics::session_subdiagnostic_derive
+        applicability)] => diagnostics::subdiagnostic_derive
 );

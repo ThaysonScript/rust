@@ -10,7 +10,7 @@ use rustc_middle::{
     ty::{
         self,
         layout::{IntegerExt, LayoutOf, PrimitiveExt, TyAndLayout},
-        AdtDef, CoroutineArgs, Ty, VariantDef,
+        AdtDef, CoroutineArgs, CoroutineArgsExt, Ty, VariantDef,
     },
 };
 use rustc_span::Symbol;
@@ -122,8 +122,7 @@ fn tag_base_type<'ll, 'tcx>(
             // Niche tags are always normalized to unsized integers of the correct size.
             match tag.primitive() {
                 Primitive::Int(t, _) => t,
-                Primitive::F32 => Integer::I32,
-                Primitive::F64 => Integer::I64,
+                Primitive::Float(f) => Integer::from_size(f.size()).unwrap(),
                 // FIXME(erikdesjardins): handle non-default addrspace ptr sizes
                 Primitive::Pointer(_) => {
                     // If the niche is the NULL value of a reference, then `discr_enum_ty` will be

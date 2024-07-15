@@ -38,6 +38,7 @@ impl<'tcx> LateLintPass<'tcx> for ZeroDiv {
             // do something like 0.0/(2.0 - 2.0), but it would be nice to warn on that case too.
             && let Some(lhs_value) = constant_simple(cx, cx.typeck_results(), left)
             && let Some(rhs_value) = constant_simple(cx, cx.typeck_results(), right)
+            // FIXME(f16_f128): add these types when eq is available on all platforms
             && (Constant::F32(0.0) == lhs_value || Constant::F64(0.0) == lhs_value)
             && (Constant::F32(0.0) == rhs_value || Constant::F64(0.0) == rhs_value)
         {
@@ -53,7 +54,7 @@ impl<'tcx> LateLintPass<'tcx> for ZeroDiv {
                 expr.span,
                 "constant division of `0.0` with `0.0` will always result in NaN",
                 None,
-                &format!("consider using `{float_type}::NAN` if you would like a constant representing NaN",),
+                format!("consider using `{float_type}::NAN` if you would like a constant representing NaN",),
             );
         }
     }

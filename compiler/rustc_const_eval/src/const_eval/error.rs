@@ -1,18 +1,17 @@
 use std::mem;
 
-use rustc_errors::{
-    DiagnosticArgName, DiagnosticArgValue, DiagnosticMessage, IntoDiagnostic, IntoDiagnosticArg,
-};
-use rustc_hir::CRATE_HIR_ID;
+use rustc_errors::{DiagArgName, DiagArgValue, DiagMessage, Diagnostic, IntoDiagArg};
+use rustc_middle::mir::interpret::{Provenance, ReportedErrorInfo};
 use rustc_middle::mir::AssertKind;
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::{layout::LayoutError, ConstInt};
-use rustc_span::{Span, Symbol, DUMMY_SP};
+use rustc_span::{Span, Symbol};
 
-use super::{CompileTimeInterpreter, InterpCx};
+use super::CompileTimeMachine;
 use crate::errors::{self, FrameNote, ReportErrorExt};
-use crate::interpret::{ErrorHandled, InterpError, InterpErrorInfo, MachineStopType};
+use crate::interpret::{err_inval, err_machine_stop};
+use crate::interpret::{ErrorHandled, Frame, InterpError, InterpErrorInfo, MachineStopType};
 
 /// The CTFE machine has some custom error kinds.
 #[derive(Clone, Debug)]
@@ -25,7 +24,7 @@ pub enum ConstEvalErrKind {
 }
 
 impl MachineStopType for ConstEvalErrKind {
-    fn diagnostic_message(&self) -> DiagnosticMessage {
+    fn diagnostic_message(&self) -> DiagMessage {
         use crate::fluent_generated::*;
         use ConstEvalErrKind::*;
         match self {
@@ -36,16 +35,16 @@ impl MachineStopType for ConstEvalErrKind {
             AssertFailure(x) => x.diagnostic_message(),
         }
     }
-    fn add_args(self: Box<Self>, adder: &mut dyn FnMut(DiagnosticArgName, DiagnosticArgValue)) {
+    fn add_args(self: Box<Self>, adder: &mut dyn FnMut(DiagArgName, DiagArgValue)) {
         use ConstEvalErrKind::*;
         match *self {
             RecursiveStatic | ConstAccessesMutGlobal | ModifiedGlobal => {}
             AssertFailure(kind) => kind.add_args(adder),
             Panic { msg, line, col, file } => {
-                adder("msg".into(), msg.into_diagnostic_arg());
-                adder("file".into(), file.into_diagnostic_arg());
-                adder("line".into(), line.into_diagnostic_arg());
-                adder("col".into(), col.into_diagnostic_arg());
+                adder("msg".into(), msg.into_diag_arg());
+                adder("file".into(), file.into_diag_arg());
+                adder("line".into(), line.into_diag_arg());
+                adder("col".into(), col.into_diag_arg());
             }
         }
     }
@@ -58,17 +57,11 @@ impl<'tcx> Into<InterpErrorInfo<'tcx>> for ConstEvalErrKind {
     }
 }
 
-pub fn get_span_and_frames<'tcx, 'mir>(
+pub fn get_span_and_frames<'tcx>(
     tcx: TyCtxtAt<'tcx>,
-    machine: &CompileTimeInterpreter<'mir, 'tcx>,
-) -> (Span, Vec<errors::FrameNote>)
-where
-    'tcx: 'mir,
-{
-    let mut stacktrace =
-        InterpCx::<CompileTimeInterpreter<'mir, 'tcx>>::generate_stacktrace_from_stack(
-            &machine.stack,
-        );
+    stack: &[Frame<'tcx, impl Provenance, impl Sized>],
+) -> (Span, Vec<errors::FrameNote>) {
+    let mut stacktrace = Frame::generate_stacktrace_from_stack(stack);
     // Filter out `requires_caller_location` frames.
     stacktrace.retain(|frame| !frame.instance.def.requires_caller_location(*tcx));
     let span = stacktrace.first().map(|f| f.span).unwrap_or(tcx.span);
@@ -125,30 +118,30 @@ where
 pub(super) fn report<'tcx, C, F, E>(
     tcx: TyCtxt<'tcx>,
     error: InterpError<'tcx>,
-    span: Option<Span>,
+    span: Span,
     get_span_and_frames: C,
     mk: F,
 ) -> ErrorHandled
 where
     C: FnOnce() -> (Span, Vec<FrameNote>),
     F: FnOnce(Span, Vec<FrameNote>) -> E,
-    E: IntoDiagnostic<'tcx>,
+    E: Diagnostic<'tcx>,
 {
     // Special handling for certain errors
     match error {
         // Don't emit a new diagnostic for these errors, they are already reported elsewhere or
         // should remain silent.
         err_inval!(Layout(LayoutError::Unknown(_))) | err_inval!(TooGeneric) => {
-            ErrorHandled::TooGeneric(span.unwrap_or(DUMMY_SP))
+            ErrorHandled::TooGeneric(span)
         }
-        err_inval!(AlreadyReported(guar)) => ErrorHandled::Reported(guar, span.unwrap_or(DUMMY_SP)),
+        err_inval!(AlreadyReported(guar)) => ErrorHandled::Reported(guar, span),
         err_inval!(Layout(LayoutError::ReferencesError(guar))) => {
-            ErrorHandled::Reported(guar.into(), span.unwrap_or(DUMMY_SP))
+            ErrorHandled::Reported(ReportedErrorInfo::tainted_by_errors(guar), span)
         }
         // Report remaining errors.
         _ => {
             let (our_span, frames) = get_span_and_frames();
-            let span = span.unwrap_or(our_span);
+            let span = span.substitute_dummy(our_span);
             let err = mk(span, frames);
             let mut err = tcx.dcx().create_err(err);
 
@@ -162,24 +155,17 @@ where
     }
 }
 
-/// Emit a lint from a const-eval situation.
+/// Emit a lint from a const-eval situation, with a backtrace.
 // Even if this is unused, please don't remove it -- chances are we will need to emit a lint during const-eval again in the future!
-pub(super) fn lint<'tcx, 'mir, L>(
+pub(super) fn lint<'tcx, L>(
     tcx: TyCtxtAt<'tcx>,
-    machine: &CompileTimeInterpreter<'mir, 'tcx>,
+    machine: &CompileTimeMachine<'tcx>,
     lint: &'static rustc_session::lint::Lint,
     decorator: impl FnOnce(Vec<errors::FrameNote>) -> L,
 ) where
-    L: for<'a> rustc_errors::DecorateLint<'a, ()>,
+    L: for<'a> rustc_errors::LintDiagnostic<'a, ()>,
 {
-    let (span, frames) = get_span_and_frames(tcx, machine);
+    let (span, frames) = get_span_and_frames(tcx, &machine.stack);
 
-    tcx.emit_node_span_lint(
-        lint,
-        // We use the root frame for this so the crate that defines the const defines whether the
-        // lint is emitted.
-        machine.stack.first().and_then(|frame| frame.lint_root()).unwrap_or(CRATE_HIR_ID),
-        span,
-        decorator(frames),
-    );
+    tcx.emit_node_span_lint(lint, machine.best_lint_scope(*tcx), span, decorator(frames));
 }

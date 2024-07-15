@@ -1,9 +1,10 @@
-use crate::convert::{TryFrom, TryInto};
 use crate::num::NonZero;
+#[cfg(debug_assertions)]
+use crate::ub_checks::assert_unsafe_precondition;
 use crate::{cmp, fmt, hash, mem, num};
 
 /// A type storing a `usize` which is a power of two, and thus
-/// represents a possible alignment in the rust abstract machine.
+/// represents a possible alignment in the Rust abstract machine.
 ///
 /// Note that particularly large alignments, while representable in this type,
 /// are likely not to be supported by actual allocators and linkers.
@@ -77,9 +78,10 @@ impl Alignment {
     #[inline]
     pub const unsafe fn new_unchecked(align: usize) -> Self {
         #[cfg(debug_assertions)]
-        crate::panic::debug_assert_nounwind!(
-            align.is_power_of_two(),
-            "Alignment::new_unchecked requires a power of two"
+        assert_unsafe_precondition!(
+            check_language_ub,
+            "Alignment::new_unchecked requires a power of two",
+            (align: usize = align) => align.is_power_of_two()
         );
 
         // SAFETY: By precondition, this must be a power of two, and
@@ -234,15 +236,9 @@ impl Default for Alignment {
 }
 
 #[cfg(target_pointer_width = "16")]
-type AlignmentEnum = AlignmentEnum16;
-#[cfg(target_pointer_width = "32")]
-type AlignmentEnum = AlignmentEnum32;
-#[cfg(target_pointer_width = "64")]
-type AlignmentEnum = AlignmentEnum64;
-
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u16)]
-enum AlignmentEnum16 {
+enum AlignmentEnum {
     _Align1Shl0 = 1 << 0,
     _Align1Shl1 = 1 << 1,
     _Align1Shl2 = 1 << 2,
@@ -261,9 +257,10 @@ enum AlignmentEnum16 {
     _Align1Shl15 = 1 << 15,
 }
 
+#[cfg(target_pointer_width = "32")]
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
-enum AlignmentEnum32 {
+enum AlignmentEnum {
     _Align1Shl0 = 1 << 0,
     _Align1Shl1 = 1 << 1,
     _Align1Shl2 = 1 << 2,
@@ -298,9 +295,10 @@ enum AlignmentEnum32 {
     _Align1Shl31 = 1 << 31,
 }
 
+#[cfg(target_pointer_width = "64")]
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u64)]
-enum AlignmentEnum64 {
+enum AlignmentEnum {
     _Align1Shl0 = 1 << 0,
     _Align1Shl1 = 1 << 1,
     _Align1Shl2 = 1 << 2,

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::fluent_generated as fluent;
-use rustc_errors::{DiagCtxt, DiagnosticBuilder, EmissionGuarantee, IntoDiagnostic, Level};
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level};
 use rustc_macros::{Diagnostic, LintDiagnostic};
 use rustc_span::{Span, Symbol};
 
@@ -20,19 +20,6 @@ pub struct RecursionLimit {
 }
 
 #[derive(Diagnostic)]
-#[diag(monomorphize_type_length_limit)]
-#[help(monomorphize_consider_type_length_limit)]
-pub struct TypeLengthLimit {
-    #[primary_span]
-    pub span: Span,
-    pub shrunk: String,
-    #[note(monomorphize_written_to_path)]
-    pub was_written: Option<()>,
-    pub path: PathBuf,
-    pub type_length: usize,
-}
-
-#[derive(Diagnostic)]
 #[diag(monomorphize_no_optimized_mir)]
 pub struct NoOptimizedMir {
     #[note]
@@ -46,11 +33,10 @@ pub struct UnusedGenericParamsHint {
     pub param_names: Vec<String>,
 }
 
-impl<G: EmissionGuarantee> IntoDiagnostic<'_, G> for UnusedGenericParamsHint {
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for UnusedGenericParamsHint {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &'_ DiagCtxt, level: Level) -> DiagnosticBuilder<'_, G> {
-        let mut diag =
-            DiagnosticBuilder::new(dcx, level, fluent::monomorphize_unused_generic_params);
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+        let mut diag = Diag::new(dcx, level, fluent::monomorphize_unused_generic_params);
         diag.span(self.span);
         for (span, name) in self.param_spans.into_iter().zip(self.param_names) {
             // FIXME: I can figure out how to do a label with a fluent string with a fixed message,

@@ -3,10 +3,9 @@
 //! Specifically, it implements a concept of `MacroFile` -- a file whose syntax
 //! tree originates not from the text of some `FileId`, but from some macro
 //! expansion.
-
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
-pub mod ast_id_map;
 pub mod attrs;
 pub mod builtin_attr_macro;
 pub mod builtin_derive_macro;
@@ -17,22 +16,27 @@ pub mod declarative;
 pub mod eager;
 pub mod files;
 pub mod hygiene;
+pub mod inert_attr_macro;
 pub mod mod_path;
 pub mod name;
 pub mod proc_macro;
 pub mod quote;
 pub mod span_map;
 
+mod cfg_process;
 mod fixup;
-
 use attrs::collect_attrs;
+use rustc_hash::FxHashMap;
 use triomphe::Arc;
 
 use std::{fmt, hash::Hash};
 
-use base_db::{salsa::impl_intern_value_trivial, CrateId, Edition, FileId};
+use base_db::{salsa::InternValueTrivial, CrateId, FileId};
 use either::Either;
-use span::{FileRange, HirFileIdRepr, Span, SyntaxContextId};
+use span::{
+    Edition, ErasedFileAstId, FileAstId, FileRange, HirFileIdRepr, Span, SpanAnchor,
+    SyntaxContextData, SyntaxContextId,
+};
 use syntax::{
     ast::{self, AstNode},
     SyntaxNode, SyntaxToken, TextRange, TextSize,
@@ -43,20 +47,16 @@ use crate::{
     builtin_attr_macro::BuiltinAttrExpander,
     builtin_derive_macro::BuiltinDeriveExpander,
     builtin_fn_macro::{BuiltinFnLikeExpander, EagerExpander},
-    db::{ExpandDatabase, TokenExpander},
-    hygiene::SyntaxContextData,
+    db::ExpandDatabase,
     mod_path::ModPath,
     proc_macro::{CustomProcMacroExpander, ProcMacroKind},
     span_map::{ExpansionSpanMap, SpanMap},
 };
 
-pub use crate::ast_id_map::{AstId, ErasedAstId, ErasedFileAstId};
-pub use crate::files::{InFile, InMacroFile, InRealFile};
+pub use crate::files::{AstId, ErasedAstId, InFile, InMacroFile, InRealFile};
 
-pub use mbe::ValueResult;
+pub use mbe::{DeclarativeMacro, ValueResult};
 pub use span::{HirFileId, MacroCallId, MacroFileId};
-
-pub type DeclarativeMacro = ::mbe::DeclarativeMacro<tt::Span>;
 
 pub mod tt {
     pub use span::Span;
@@ -133,13 +133,13 @@ pub enum ExpandError {
     MacroDefinition,
     Mbe(mbe::ExpandError),
     RecursionOverflow,
-    Other(Box<Box<str>>),
-    ProcMacroPanic(Box<Box<str>>),
+    Other(Arc<Box<str>>),
+    ProcMacroPanic(Arc<Box<str>>),
 }
 
 impl ExpandError {
     pub fn other(msg: impl Into<Box<str>>) -> Self {
-        ExpandError::Other(Box::new(msg.into()))
+        ExpandError::Other(Arc::new(msg.into()))
     }
 }
 
@@ -170,15 +170,10 @@ impl fmt::Display for ExpandError {
 pub struct MacroCallLoc {
     pub def: MacroDefId,
     pub krate: CrateId,
-    /// Some if this is a macro call for an eager macro. Note that this is `None`
-    /// for the eager input macro file.
-    // FIXME: This is being interned, subtrees can vary quickly differ just slightly causing
-    // leakage problems here
-    eager: Option<Arc<EagerCallInfo>>,
     pub kind: MacroCallKind,
-    pub call_site: Span,
+    pub ctxt: SyntaxContextId,
 }
-impl_intern_value_trivial!(MacroCallLoc);
+impl InternValueTrivial for MacroCallLoc {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MacroDefId {
@@ -187,17 +182,16 @@ pub struct MacroDefId {
     pub kind: MacroDefKind,
     pub local_inner: bool,
     pub allow_internal_unsafe: bool,
-    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MacroDefKind {
     Declarative(AstId<ast::Macro>),
-    BuiltIn(BuiltinFnLikeExpander, AstId<ast::Macro>),
-    BuiltInAttr(BuiltinAttrExpander, AstId<ast::Macro>),
-    BuiltInDerive(BuiltinDeriveExpander, AstId<ast::Macro>),
-    BuiltInEager(EagerExpander, AstId<ast::Macro>),
-    ProcMacro(CustomProcMacroExpander, ProcMacroKind, AstId<ast::Fn>),
+    BuiltIn(AstId<ast::Macro>, BuiltinFnLikeExpander),
+    BuiltInAttr(AstId<ast::Macro>, BuiltinAttrExpander),
+    BuiltInDerive(AstId<ast::Macro>, BuiltinDeriveExpander),
+    BuiltInEager(AstId<ast::Macro>, EagerExpander),
+    ProcMacro(AstId<ast::Fn>, CustomProcMacroExpander, ProcMacroKind),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -207,6 +201,8 @@ pub struct EagerCallInfo {
     /// Call id of the eager macro's input file (this is the macro file for its fully expanded input).
     arg_id: MacroCallId,
     error: Option<ExpandError>,
+    /// The call site span of the eager macro
+    span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -214,6 +210,11 @@ pub enum MacroCallKind {
     FnLike {
         ast_id: AstId<ast::MacroCall>,
         expand_to: ExpandTo,
+        /// Some if this is a macro call for an eager macro. Note that this is `None`
+        /// for the eager input macro file.
+        // FIXME: This is being interned, subtrees can vary quickly differing just slightly causing
+        // leakage problems here
+        eager: Option<Arc<EagerCallInfo>>,
     },
     Derive {
         ast_id: AstId<ast::Adt>,
@@ -224,6 +225,9 @@ pub enum MacroCallKind {
         derive_attr_index: AttrId,
         /// Index of the derive macro in the derive attribute
         derive_index: u32,
+        /// The "parent" macro call.
+        /// We will resolve the same token tree for all derive macros in the same derive attribute.
+        derive_macro_id: MacroCallId,
     },
     Attr {
         ast_id: AstId<ast::Item>,
@@ -249,9 +253,6 @@ pub trait HirFileIdExt {
     /// If this is a macro call, returns the syntax node of the very first macro call this file resides in.
     fn original_call_node(self, db: &dyn ExpandDatabase) -> Option<InRealFile<SyntaxNode>>;
 
-    /// Return expansion information if it is a macro-expansion file
-    fn expansion_info(self, db: &dyn ExpandDatabase) -> Option<ExpansionInfo>;
-
     fn as_builtin_derive_attr_node(&self, db: &dyn ExpandDatabase) -> Option<InFile<ast::Attr>>;
 }
 
@@ -275,7 +276,7 @@ impl HirFileIdExt for HirFileId {
                 HirFileIdRepr::MacroFile(file) => {
                     let loc = db.lookup_intern_macro_call(file.macro_call_id);
                     if loc.def.is_include() {
-                        if let Some(eager) = &loc.eager {
+                        if let MacroCallKind::FnLike { eager: Some(eager), .. } = &loc.kind {
                             if let Ok(it) = builtin_fn_macro::include_input_to_file_id(
                                 db,
                                 file.macro_call_id,
@@ -305,11 +306,6 @@ impl HirFileIdExt for HirFileId {
         }
     }
 
-    /// Return expansion information if it is a macro-expansion file
-    fn expansion_info(self, db: &dyn ExpandDatabase) -> Option<ExpansionInfo> {
-        Some(ExpansionInfo::new(db, self.macro_file()?))
-    }
-
     fn as_builtin_derive_attr_node(&self, db: &dyn ExpandDatabase) -> Option<InFile<ast::Attr>> {
         let macro_file = self.macro_file()?;
         let loc: MacroCallLoc = db.lookup_intern_macro_call(macro_file.macro_call_id);
@@ -322,6 +318,9 @@ impl HirFileIdExt for HirFileId {
 }
 
 pub trait MacroFileIdExt {
+    fn is_env_or_option_env(&self, db: &dyn ExpandDatabase) -> bool;
+    fn is_include_like_macro(&self, db: &dyn ExpandDatabase) -> bool;
+    fn eager_arg(&self, db: &dyn ExpandDatabase) -> Option<MacroCallId>;
     fn expansion_level(self, db: &dyn ExpandDatabase) -> u32;
     /// If this is a macro call, returns the syntax node of the call.
     fn call_node(self, db: &dyn ExpandDatabase) -> InFile<SyntaxNode>;
@@ -373,7 +372,7 @@ impl MacroFileIdExt for MacroFileId {
     fn is_custom_derive(&self, db: &dyn ExpandDatabase) -> bool {
         matches!(
             db.lookup_intern_macro_call(self.macro_call_id).def.kind,
-            MacroDefKind::ProcMacro(_, ProcMacroKind::CustomDerive, _)
+            MacroDefKind::ProcMacro(_, _, ProcMacroKind::CustomDerive)
         )
     }
 
@@ -388,43 +387,61 @@ impl MacroFileIdExt for MacroFileId {
         db.lookup_intern_macro_call(self.macro_call_id).def.is_include()
     }
 
+    fn is_include_like_macro(&self, db: &dyn ExpandDatabase) -> bool {
+        db.lookup_intern_macro_call(self.macro_call_id).def.is_include_like()
+    }
+
+    fn is_env_or_option_env(&self, db: &dyn ExpandDatabase) -> bool {
+        db.lookup_intern_macro_call(self.macro_call_id).def.is_env_or_option_env()
+    }
+
     fn is_eager(&self, db: &dyn ExpandDatabase) -> bool {
-        let loc: MacroCallLoc = db.lookup_intern_macro_call(self.macro_call_id);
+        let loc = db.lookup_intern_macro_call(self.macro_call_id);
         matches!(loc.def.kind, MacroDefKind::BuiltInEager(..))
     }
 
+    fn eager_arg(&self, db: &dyn ExpandDatabase) -> Option<MacroCallId> {
+        let loc = db.lookup_intern_macro_call(self.macro_call_id);
+        match &loc.kind {
+            MacroCallKind::FnLike { eager, .. } => eager.as_ref().map(|it| it.arg_id),
+            _ => None,
+        }
+    }
+
     fn is_attr_macro(&self, db: &dyn ExpandDatabase) -> bool {
-        let loc: MacroCallLoc = db.lookup_intern_macro_call(self.macro_call_id);
-        matches!(loc.kind, MacroCallKind::Attr { .. })
+        matches!(
+            db.lookup_intern_macro_call(self.macro_call_id).def.kind,
+            MacroDefKind::BuiltInAttr(..) | MacroDefKind::ProcMacro(_, _, ProcMacroKind::Attr)
+        )
     }
 
     fn is_derive_attr_pseudo_expansion(&self, db: &dyn ExpandDatabase) -> bool {
-        let loc: MacroCallLoc = db.lookup_intern_macro_call(self.macro_call_id);
+        let loc = db.lookup_intern_macro_call(self.macro_call_id);
         loc.def.is_attribute_derive()
     }
 }
 
 impl MacroDefId {
-    pub fn as_lazy_macro(
+    pub fn make_call(
         self,
         db: &dyn ExpandDatabase,
         krate: CrateId,
         kind: MacroCallKind,
-        call_site: Span,
+        ctxt: SyntaxContextId,
     ) -> MacroCallId {
-        MacroCallLoc { def: self, krate, eager: None, kind, call_site }.intern(db)
+        MacroCallLoc { def: self, krate, kind, ctxt }.intern(db)
     }
 
     pub fn definition_range(&self, db: &dyn ExpandDatabase) -> InFile<TextRange> {
         match self.kind {
             MacroDefKind::Declarative(id)
-            | MacroDefKind::BuiltIn(_, id)
-            | MacroDefKind::BuiltInAttr(_, id)
-            | MacroDefKind::BuiltInDerive(_, id)
-            | MacroDefKind::BuiltInEager(_, id) => {
+            | MacroDefKind::BuiltIn(id, _)
+            | MacroDefKind::BuiltInAttr(id, _)
+            | MacroDefKind::BuiltInDerive(id, _)
+            | MacroDefKind::BuiltInEager(id, _) => {
                 id.with_value(db.ast_id_map(id.file_id).get(id.value).text_range())
             }
-            MacroDefKind::ProcMacro(_, _, id) => {
+            MacroDefKind::ProcMacro(id, _, _) => {
                 id.with_value(db.ast_id_map(id.file_id).get(id.value).text_range())
             }
         }
@@ -432,12 +449,12 @@ impl MacroDefId {
 
     pub fn ast_id(&self) -> Either<AstId<ast::Macro>, AstId<ast::Fn>> {
         match self.kind {
-            MacroDefKind::ProcMacro(.., id) => Either::Right(id),
+            MacroDefKind::ProcMacro(id, ..) => Either::Right(id),
             MacroDefKind::Declarative(id)
-            | MacroDefKind::BuiltIn(_, id)
-            | MacroDefKind::BuiltInAttr(_, id)
-            | MacroDefKind::BuiltInDerive(_, id)
-            | MacroDefKind::BuiltInEager(_, id) => Either::Left(id),
+            | MacroDefKind::BuiltIn(id, _)
+            | MacroDefKind::BuiltInAttr(id, _)
+            | MacroDefKind::BuiltInDerive(id, _)
+            | MacroDefKind::BuiltInEager(id, _) => Either::Left(id),
         }
     }
 
@@ -448,7 +465,7 @@ impl MacroDefId {
     pub fn is_attribute(&self) -> bool {
         matches!(
             self.kind,
-            MacroDefKind::BuiltInAttr(..) | MacroDefKind::ProcMacro(_, ProcMacroKind::Attr, _)
+            MacroDefKind::BuiltInAttr(..) | MacroDefKind::ProcMacro(_, _, ProcMacroKind::Attr)
         )
     }
 
@@ -456,7 +473,7 @@ impl MacroDefId {
         matches!(
             self.kind,
             MacroDefKind::BuiltInDerive(..)
-                | MacroDefKind::ProcMacro(_, ProcMacroKind::CustomDerive, _)
+                | MacroDefKind::ProcMacro(_, _, ProcMacroKind::CustomDerive)
         )
     }
 
@@ -464,18 +481,26 @@ impl MacroDefId {
         matches!(
             self.kind,
             MacroDefKind::BuiltIn(..)
-                | MacroDefKind::ProcMacro(_, ProcMacroKind::FuncLike, _)
+                | MacroDefKind::ProcMacro(_, _, ProcMacroKind::Bang)
                 | MacroDefKind::BuiltInEager(..)
                 | MacroDefKind::Declarative(..)
         )
     }
 
     pub fn is_attribute_derive(&self) -> bool {
-        matches!(self.kind, MacroDefKind::BuiltInAttr(expander, ..) if expander.is_derive())
+        matches!(self.kind, MacroDefKind::BuiltInAttr(_, expander) if expander.is_derive())
     }
 
     pub fn is_include(&self) -> bool {
-        matches!(self.kind, MacroDefKind::BuiltInEager(expander, ..) if expander.is_include())
+        matches!(self.kind, MacroDefKind::BuiltInEager(_, expander) if expander.is_include())
+    }
+
+    pub fn is_include_like(&self) -> bool {
+        matches!(self.kind, MacroDefKind::BuiltInEager(_, expander) if expander.is_include_like())
+    }
+
+    pub fn is_env_or_option_env(&self) -> bool {
+        matches!(self.kind, MacroDefKind::BuiltInEager(_, expander) if expander.is_env_or_option_env())
     }
 }
 
@@ -516,6 +541,18 @@ impl MacroCallLoc {
         }
     }
 
+    pub fn to_node_item(&self, db: &dyn ExpandDatabase) -> InFile<ast::Item> {
+        match self.kind {
+            MacroCallKind::FnLike { ast_id, .. } => {
+                InFile::new(ast_id.file_id, ast_id.map(FileAstId::upcast).to_node(db))
+            }
+            MacroCallKind::Derive { ast_id, .. } => {
+                InFile::new(ast_id.file_id, ast_id.map(FileAstId::upcast).to_node(db))
+            }
+            MacroCallKind::Attr { ast_id, .. } => InFile::new(ast_id.file_id, ast_id.to_node(db)),
+        }
+    }
+
     fn expand_to(&self) -> ExpandTo {
         match self.kind {
             MacroCallKind::FnLike { expand_to, .. } => expand_to,
@@ -534,7 +571,7 @@ impl MacroCallLoc {
         macro_call_id: MacroCallId,
     ) -> Option<FileId> {
         if self.def.is_include() {
-            if let Some(eager) = &self.eager {
+            if let MacroCallKind::FnLike { eager: Some(eager), .. } = &self.kind {
                 if let Ok(it) =
                     builtin_fn_macro::include_input_to_file_id(db, macro_call_id, &eager.arg)
                 {
@@ -658,18 +695,14 @@ impl MacroCallKind {
 /// ExpansionInfo mainly describes how to map text range between src and expanded macro
 // FIXME: can be expensive to create, we should check the use sites and maybe replace them with
 // simpler function calls if the map is only used once
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpansionInfo {
-    pub expanded: InMacroFile<SyntaxNode>,
+    expanded: InMacroFile<SyntaxNode>,
     /// The argument TokenTree or item for attributes
     arg: InFile<Option<SyntaxNode>>,
-    /// The `macro_rules!` or attribute input.
-    attr_input_or_mac_def: Option<InFile<ast::TokenTree>>,
-
-    macro_def: TokenExpander,
-    macro_arg: Arc<tt::Subtree>,
-    pub exp_map: Arc<ExpansionSpanMap>,
+    exp_map: Arc<ExpansionSpanMap>,
     arg_map: SpanMap,
+    loc: MacroCallLoc,
 }
 
 impl ExpansionInfo {
@@ -677,15 +710,40 @@ impl ExpansionInfo {
         self.expanded.clone()
     }
 
-    pub fn call_node(&self) -> Option<InFile<SyntaxNode>> {
-        Some(self.arg.with_value(self.arg.value.as_ref()?.parent()?))
+    pub fn arg(&self) -> InFile<Option<&SyntaxNode>> {
+        self.arg.as_ref().map(|it| it.as_ref())
     }
 
     pub fn call_file(&self) -> HirFileId {
         self.arg.file_id
     }
 
+    pub fn is_attr(&self) -> bool {
+        matches!(
+            self.loc.def.kind,
+            MacroDefKind::BuiltInAttr(..) | MacroDefKind::ProcMacro(_, _, ProcMacroKind::Attr)
+        )
+    }
+
     /// Maps the passed in file range down into a macro expansion if it is the input to a macro call.
+    ///
+    /// Note this does a linear search through the entire backing vector of the spanmap.
+    pub fn map_range_down_exact(
+        &self,
+        span: Span,
+    ) -> Option<InMacroFile<impl Iterator<Item = SyntaxToken> + '_>> {
+        let tokens = self
+            .exp_map
+            .ranges_with_span_exact(span)
+            .flat_map(move |range| self.expanded.value.covering_element(range).into_token());
+
+        Some(InMacroFile::new(self.expanded.file_id, tokens))
+    }
+
+    /// Maps the passed in file range down into a macro expansion if it is the input to a macro call.
+    /// Unlike [`map_range_down_exact`], this will consider spans that contain the given span.
+    ///
+    /// Note this does a linear search through the entire backing vector of the spanmap.
     pub fn map_range_down(
         &self,
         span: Span,
@@ -742,7 +800,7 @@ impl ExpansionInfo {
                 InFile::new(
                     self.arg.file_id,
                     arg_map
-                        .ranges_with_span(span)
+                        .ranges_with_span_exact(span)
                         .filter(|range| range.intersect(arg_range).is_some())
                         .collect(),
                 )
@@ -751,52 +809,47 @@ impl ExpansionInfo {
     }
 
     pub fn new(db: &dyn ExpandDatabase, macro_file: MacroFileId) -> ExpansionInfo {
-        let loc: MacroCallLoc = db.lookup_intern_macro_call(macro_file.macro_call_id);
+        let _p = tracing::info_span!("ExpansionInfo::new").entered();
+        let loc = db.lookup_intern_macro_call(macro_file.macro_call_id);
 
         let arg_tt = loc.kind.arg(db);
         let arg_map = db.span_map(arg_tt.file_id);
 
-        let macro_def = db.macro_expander(loc.def);
         let (parse, exp_map) = db.parse_macro_expansion(macro_file).value;
         let expanded = InMacroFile { file_id: macro_file, value: parse.syntax_node() };
 
-        let (macro_arg, _) = db.macro_arg(macro_file.macro_call_id).value;
-
-        let def = loc.def.ast_id().left().and_then(|id| {
-            let def_tt = match id.to_node(db) {
-                ast::Macro::MacroRules(mac) => mac.token_tree()?,
-                ast::Macro::MacroDef(_) if matches!(macro_def, TokenExpander::BuiltInAttr(_)) => {
-                    return None
-                }
-                ast::Macro::MacroDef(mac) => mac.body()?,
-            };
-            Some(InFile::new(id.file_id, def_tt))
-        });
-        let attr_input_or_mac_def = def.or_else(|| match loc.kind {
-            MacroCallKind::Attr { ast_id, invoc_attr_index, .. } => {
-                // FIXME: handle `cfg_attr`
-                let tt = collect_attrs(&ast_id.to_node(db))
-                    .nth(invoc_attr_index.ast_index())
-                    .and_then(|x| Either::left(x.1))?
-                    .token_tree()?;
-                Some(InFile::new(ast_id.file_id, tt))
-            }
-            _ => None,
-        });
-
-        ExpansionInfo {
-            expanded,
-            arg: arg_tt,
-            attr_input_or_mac_def,
-            macro_arg,
-            macro_def,
-            exp_map,
-            arg_map,
-        }
+        ExpansionInfo { expanded, loc, arg: arg_tt, exp_map, arg_map }
     }
 }
 
+/// Maps up the text range out of the expansion hierarchy back into the original file its from only
+/// considering the root spans contained.
+/// Unlike [`map_node_range_up`], this will not return `None` if any anchors or syntax contexts differ.
+pub fn map_node_range_up_rooted(
+    db: &dyn ExpandDatabase,
+    exp_map: &ExpansionSpanMap,
+    range: TextRange,
+) -> Option<FileRange> {
+    let mut spans = exp_map.spans_for_range(range).filter(|span| span.ctx.is_root());
+    let Span { range, anchor, ctx: _ } = spans.next()?;
+    let mut start = range.start();
+    let mut end = range.end();
+
+    for span in spans {
+        if span.anchor != anchor {
+            return None;
+        }
+        start = start.min(span.range.start());
+        end = end.max(span.range.end());
+    }
+    let anchor_offset =
+        db.ast_id_map(anchor.file_id.into()).get_erased(anchor.ast_id).text_range().start();
+    Some(FileRange { file_id: anchor.file_id, range: TextRange::new(start, end) + anchor_offset })
+}
+
 /// Maps up the text range out of the expansion hierarchy back into the original file its from.
+///
+/// this will return `None` if any anchors or syntax contexts differ.
 pub fn map_node_range_up(
     db: &dyn ExpandDatabase,
     exp_map: &ExpansionSpanMap,
@@ -820,6 +873,29 @@ pub fn map_node_range_up(
         FileRange { file_id: anchor.file_id, range: TextRange::new(start, end) + anchor_offset },
         ctx,
     ))
+}
+
+/// Maps up the text range out of the expansion hierarchy back into the original file its from.
+/// This version will aggregate the ranges of all spans with the same anchor and syntax context.
+pub fn map_node_range_up_aggregated(
+    db: &dyn ExpandDatabase,
+    exp_map: &ExpansionSpanMap,
+    range: TextRange,
+) -> FxHashMap<(SpanAnchor, SyntaxContextId), TextRange> {
+    let mut map = FxHashMap::default();
+    for span in exp_map.spans_for_range(range) {
+        let range = map.entry((span.anchor, span.ctx)).or_insert_with(|| span.range);
+        *range = TextRange::new(
+            range.start().min(span.range.start()),
+            range.end().max(span.range.end()),
+        );
+    }
+    for ((anchor, _), range) in &mut map {
+        let anchor_offset =
+            db.ast_id_map(anchor.file_id.into()).get_erased(anchor.ast_id).text_range().start();
+        *range += anchor_offset;
+    }
+    map
 }
 
 /// Looks up the span at the given offset.

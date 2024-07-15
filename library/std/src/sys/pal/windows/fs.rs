@@ -1,7 +1,10 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+use core::ptr::addr_of;
+
 use crate::os::windows::prelude::*;
 
 use crate::borrow::Cow;
-use crate::ffi::{c_void, OsString};
+use crate::ffi::{c_void, OsStr, OsString};
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, Error, IoSlice, IoSliceMut, SeekFrom};
 use crate::mem::{self, MaybeUninit};
@@ -16,7 +19,8 @@ use crate::sys::{c, cvt, Align8};
 use crate::sys_common::{AsInner, FromInner, IntoInner};
 use crate::thread;
 
-use super::{api, to_u16s, IoResult};
+use super::api::{self, WinError};
+use super::{to_u16s, IoResult};
 use crate::sys::path::maybe_verbatim;
 
 pub struct File {
@@ -25,12 +29,12 @@ pub struct File {
 
 #[derive(Clone)]
 pub struct FileAttr {
-    attributes: c::DWORD,
+    attributes: u32,
     creation_time: c::FILETIME,
     last_access_time: c::FILETIME,
     last_write_time: c::FILETIME,
     file_size: u64,
-    reparse_tag: c::DWORD,
+    reparse_tag: u32,
     volume_serial_number: Option<u32>,
     number_of_links: Option<u32>,
     file_index: Option<u64>,
@@ -38,8 +42,8 @@ pub struct FileAttr {
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FileType {
-    attributes: c::DWORD,
-    reparse_tag: c::DWORD,
+    attributes: u32,
+    reparse_tag: u32,
 }
 
 pub struct ReadDir {
@@ -72,16 +76,16 @@ pub struct OpenOptions {
     create_new: bool,
     // system-specific
     custom_flags: u32,
-    access_mode: Option<c::DWORD>,
-    attributes: c::DWORD,
-    share_mode: c::DWORD,
-    security_qos_flags: c::DWORD,
-    security_attributes: c::LPSECURITY_ATTRIBUTES,
+    access_mode: Option<u32>,
+    attributes: u32,
+    share_mode: u32,
+    security_qos_flags: u32,
+    security_attributes: *mut c::SECURITY_ATTRIBUTES,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FilePermissions {
-    attrs: c::DWORD,
+    attrs: u32,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -128,10 +132,11 @@ impl Iterator for ReadDir {
             let mut wfd = mem::zeroed();
             loop {
                 if c::FindNextFileW(self.handle.0, &mut wfd) == 0 {
-                    if api::get_last_error().code == c::ERROR_NO_MORE_FILES {
-                        return None;
-                    } else {
-                        return Some(Err(Error::last_os_error()));
+                    match api::get_last_error() {
+                        WinError::NO_MORE_FILES => return None,
+                        WinError { code } => {
+                            return Some(Err(Error::from_raw_os_error(code as i32)));
+                        }
                     }
                 }
                 if let Some(e) = DirEntry::new(&self.root, &wfd) {
@@ -237,13 +242,11 @@ impl OpenOptions {
         // receive is `SECURITY_ANONYMOUS = 0x0`, which we can't check for later on.
         self.security_qos_flags = flags | c::SECURITY_SQOS_PRESENT;
     }
-    pub fn security_attributes(&mut self, attrs: c::LPSECURITY_ATTRIBUTES) {
+    pub fn security_attributes(&mut self, attrs: *mut c::SECURITY_ATTRIBUTES) {
         self.security_attributes = attrs;
     }
 
-    fn get_access_mode(&self) -> io::Result<c::DWORD> {
-        const ERROR_INVALID_PARAMETER: i32 = 87;
-
+    fn get_access_mode(&self) -> io::Result<u32> {
         match (self.read, self.write, self.append, self.access_mode) {
             (.., Some(mode)) => Ok(mode),
             (true, false, false, None) => Ok(c::GENERIC_READ),
@@ -253,23 +256,23 @@ impl OpenOptions {
             (true, _, true, None) => {
                 Ok(c::GENERIC_READ | (c::FILE_GENERIC_WRITE & !c::FILE_WRITE_DATA))
             }
-            (false, false, false, None) => Err(Error::from_raw_os_error(ERROR_INVALID_PARAMETER)),
+            (false, false, false, None) => {
+                Err(Error::from_raw_os_error(c::ERROR_INVALID_PARAMETER as i32))
+            }
         }
     }
 
-    fn get_creation_mode(&self) -> io::Result<c::DWORD> {
-        const ERROR_INVALID_PARAMETER: i32 = 87;
-
+    fn get_creation_mode(&self) -> io::Result<u32> {
         match (self.write, self.append) {
             (true, false) => {}
             (false, false) => {
                 if self.truncate || self.create || self.create_new {
-                    return Err(Error::from_raw_os_error(ERROR_INVALID_PARAMETER));
+                    return Err(Error::from_raw_os_error(c::ERROR_INVALID_PARAMETER as i32));
                 }
             }
             (_, true) => {
                 if self.truncate && !self.create_new {
-                    return Err(Error::from_raw_os_error(ERROR_INVALID_PARAMETER));
+                    return Err(Error::from_raw_os_error(c::ERROR_INVALID_PARAMETER as i32));
                 }
             }
         }
@@ -285,7 +288,7 @@ impl OpenOptions {
         })
     }
 
-    fn get_flags_and_attributes(&self) -> c::DWORD {
+    fn get_flags_and_attributes(&self) -> u32 {
         self.custom_flags
             | self.attributes
             | self.security_qos_flags
@@ -313,7 +316,7 @@ impl File {
             // Manual truncation. See #115745.
             if opts.truncate
                 && creation == c::OPEN_ALWAYS
-                && unsafe { c::GetLastError() } == c::ERROR_ALREADY_EXISTS
+                && api::get_last_error() == WinError::ALREADY_EXISTS
             {
                 unsafe {
                     // This originally used `FileAllocationInfo` instead of
@@ -395,21 +398,21 @@ impl File {
                 self.handle.as_raw_handle(),
                 c::FileBasicInfo,
                 core::ptr::addr_of_mut!(info) as *mut c_void,
-                size as c::DWORD,
+                size as u32,
             ))?;
             let mut attr = FileAttr {
                 attributes: info.FileAttributes,
                 creation_time: c::FILETIME {
-                    dwLowDateTime: info.CreationTime as c::DWORD,
-                    dwHighDateTime: (info.CreationTime >> 32) as c::DWORD,
+                    dwLowDateTime: info.CreationTime as u32,
+                    dwHighDateTime: (info.CreationTime >> 32) as u32,
                 },
                 last_access_time: c::FILETIME {
-                    dwLowDateTime: info.LastAccessTime as c::DWORD,
-                    dwHighDateTime: (info.LastAccessTime >> 32) as c::DWORD,
+                    dwLowDateTime: info.LastAccessTime as u32,
+                    dwHighDateTime: (info.LastAccessTime >> 32) as u32,
                 },
                 last_write_time: c::FILETIME {
-                    dwLowDateTime: info.LastWriteTime as c::DWORD,
-                    dwHighDateTime: (info.LastWriteTime >> 32) as c::DWORD,
+                    dwLowDateTime: info.LastWriteTime as u32,
+                    dwHighDateTime: (info.LastWriteTime >> 32) as u32,
                 },
                 file_size: 0,
                 reparse_tag: 0,
@@ -423,7 +426,7 @@ impl File {
                 self.handle.as_raw_handle(),
                 c::FileStandardInfo,
                 core::ptr::addr_of_mut!(info) as *mut c_void,
-                size as c::DWORD,
+                size as u32,
             ))?;
             attr.file_size = info.AllocationSize as u64;
             attr.number_of_links = Some(info.NumberOfLinks);
@@ -493,7 +496,7 @@ impl File {
             SeekFrom::End(n) => (c::FILE_END, n),
             SeekFrom::Current(n) => (c::FILE_CURRENT, n),
         };
-        let pos = pos as c::LARGE_INTEGER;
+        let pos = pos as i64;
         let mut newpos = 0;
         cvt(unsafe { c::SetFilePointerEx(self.handle.as_raw_handle(), pos, &mut newpos, whence) })?;
         Ok(newpos as u64)
@@ -509,7 +512,7 @@ impl File {
     fn reparse_point(
         &self,
         space: &mut Align8<[MaybeUninit<u8>]>,
-    ) -> io::Result<(c::DWORD, *mut c::REPARSE_DATA_BUFFER)> {
+    ) -> io::Result<(u32, *mut c::REPARSE_DATA_BUFFER)> {
         unsafe {
             let mut bytes = 0;
             cvt({
@@ -522,7 +525,7 @@ impl File {
                     ptr::null_mut(),
                     0,
                     space.0.as_mut_ptr().cast(),
-                    len as c::DWORD,
+                    len as u32,
                     &mut bytes,
                     ptr::null_mut(),
                 )
@@ -607,8 +610,7 @@ impl File {
                 "Cannot set file timestamp to 0",
             ));
         }
-        let is_max =
-            |t: c::FILETIME| t.dwLowDateTime == c::DWORD::MAX && t.dwHighDateTime == c::DWORD::MAX;
+        let is_max = |t: c::FILETIME| t.dwLowDateTime == u32::MAX && t.dwHighDateTime == u32::MAX;
         if times.accessed.map_or(false, is_max)
             || times.modified.map_or(false, is_max)
             || times.created.map_or(false, is_max)
@@ -639,7 +641,7 @@ impl File {
                 self.handle.as_raw_handle(),
                 c::FileBasicInfo,
                 core::ptr::addr_of_mut!(info) as *mut c_void,
-                size as c::DWORD,
+                size as u32,
             ))?;
             Ok(info)
         }
@@ -843,7 +845,7 @@ fn open_link_no_reparse(parent: &File, name: &[u16], access: u32) -> io::Result<
             // We make a special exception for `STATUS_DELETE_PENDING` because
             // otherwise this will be mapped to `ERROR_ACCESS_DENIED` which is
             // very unhelpful.
-            Err(io::Error::from_raw_os_error(c::ERROR_DELETE_PENDING as _))
+            Err(io::Error::from_raw_os_error(c::ERROR_DELETE_PENDING as i32))
         } else if status == c::STATUS_INVALID_PARAMETER
             && ATTRIBUTES.load(Ordering::Relaxed) == c::OBJ_DONT_REPARSE
         {
@@ -1018,7 +1020,7 @@ impl FileTimes {
 }
 
 impl FileType {
-    fn new(attrs: c::DWORD, reparse_tag: c::DWORD) -> FileType {
+    fn new(attrs: u32, reparse_tag: u32) -> FileType {
         FileType { attributes: attrs, reparse_tag }
     }
     pub fn is_dir(&self) -> bool {
@@ -1095,7 +1097,7 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
             //
             // See issue #120040: https://github.com/rust-lang/rust/issues/120040.
             let last_error = api::get_last_error();
-            if last_error.code == c::ERROR_FILE_NOT_FOUND {
+            if last_error == WinError::FILE_NOT_FOUND {
                 return Ok(ReadDir {
                     handle: FindNextFileHandle(find_handle),
                     root: Arc::new(root),
@@ -1415,16 +1417,16 @@ pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
 
 pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
     unsafe extern "system" fn callback(
-        _TotalFileSize: c::LARGE_INTEGER,
-        _TotalBytesTransferred: c::LARGE_INTEGER,
-        _StreamSize: c::LARGE_INTEGER,
-        StreamBytesTransferred: c::LARGE_INTEGER,
-        dwStreamNumber: c::DWORD,
-        _dwCallbackReason: c::DWORD,
+        _TotalFileSize: i64,
+        _TotalBytesTransferred: i64,
+        _StreamSize: i64,
+        StreamBytesTransferred: i64,
+        dwStreamNumber: u32,
+        _dwCallbackReason: u32,
         _hSourceFile: c::HANDLE,
         _hDestinationFile: c::HANDLE,
-        lpData: c::LPCVOID,
-    ) -> c::DWORD {
+        lpData: *const c_void,
+    ) -> u32 {
         if dwStreamNumber == 1 {
             *(lpData as *mut i64) = StreamBytesTransferred;
         }
@@ -1446,75 +1448,79 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
     Ok(size as u64)
 }
 
-#[allow(dead_code)]
-pub fn symlink_junction<P: AsRef<Path>, Q: AsRef<Path>>(
-    original: P,
-    junction: Q,
-) -> io::Result<()> {
-    symlink_junction_inner(original.as_ref(), junction.as_ref())
-}
-
-// Creating a directory junction on windows involves dealing with reparse
-// points and the DeviceIoControl function, and this code is a skeleton of
-// what can be found here:
-//
-// http://www.flexhex.com/docs/articles/hard-links.phtml
-#[allow(dead_code)]
-fn symlink_junction_inner(original: &Path, junction: &Path) -> io::Result<()> {
-    let d = DirBuilder::new();
-    d.mkdir(junction)?;
-
+pub fn junction_point(original: &Path, link: &Path) -> io::Result<()> {
+    // Create and open a new directory in one go.
     let mut opts = OpenOptions::new();
+    opts.create_new(true);
     opts.write(true);
-    opts.custom_flags(c::FILE_FLAG_OPEN_REPARSE_POINT | c::FILE_FLAG_BACKUP_SEMANTICS);
-    let f = File::open(junction, &opts)?;
-    let h = f.as_inner().as_raw_handle();
-    unsafe {
-        let mut data =
-            Align8([MaybeUninit::<u8>::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize]);
-        let data_ptr = data.0.as_mut_ptr();
-        let data_end = data_ptr.add(c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize);
-        let db = data_ptr.cast::<c::REPARSE_MOUNTPOINT_DATA_BUFFER>();
-        // Zero the header to ensure it's fully initialized, including reserved parameters.
-        *db = mem::zeroed();
-        let reparse_target_slice = {
-            let buf_start = ptr::addr_of_mut!((*db).ReparseTarget).cast::<c::WCHAR>();
-            // Compute offset in bytes and then divide so that we round down
-            // rather than hit any UB (admittedly this arithmetic should work
-            // out so that this isn't necessary)
-            let buf_len_bytes = usize::try_from(data_end.byte_offset_from(buf_start)).unwrap();
-            let buf_len_wchars = buf_len_bytes / core::mem::size_of::<c::WCHAR>();
-            core::slice::from_raw_parts_mut(buf_start, buf_len_wchars)
-        };
+    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS | c::FILE_FLAG_POSIX_SEMANTICS);
+    opts.attributes(c::FILE_ATTRIBUTE_DIRECTORY);
 
-        // FIXME: this conversion is very hacky
-        let iter = br"\??\"
-            .iter()
-            .map(|x| *x as u16)
-            .chain(original.as_os_str().encode_wide())
-            .chain(core::iter::once(0));
-        let mut i = 0;
-        for c in iter {
-            if i >= reparse_target_slice.len() {
-                return Err(crate::io::const_io_error!(
-                    crate::io::ErrorKind::InvalidFilename,
-                    "Input filename is too long"
-                ));
-            }
-            reparse_target_slice[i] = c;
-            i += 1;
+    let d = File::open(link, &opts)?;
+
+    // We need to get an absolute, NT-style path.
+    let path_bytes = original.as_os_str().as_encoded_bytes();
+    let abs_path: Vec<u16> = if path_bytes.starts_with(br"\\?\") || path_bytes.starts_with(br"\??\")
+    {
+        // It's already an absolute path, we just need to convert the prefix to `\??\`
+        let bytes = unsafe { OsStr::from_encoded_bytes_unchecked(&path_bytes[4..]) };
+        r"\??\".encode_utf16().chain(bytes.encode_wide()).collect()
+    } else {
+        // Get an absolute path and then convert the prefix to `\??\`
+        let abs_path = crate::path::absolute(original)?.into_os_string().into_encoded_bytes();
+        if abs_path.len() > 0 && abs_path[1..].starts_with(br":\") {
+            let bytes = unsafe { OsStr::from_encoded_bytes_unchecked(&abs_path) };
+            r"\??\".encode_utf16().chain(bytes.encode_wide()).collect()
+        } else if abs_path.starts_with(br"\\.\") {
+            let bytes = unsafe { OsStr::from_encoded_bytes_unchecked(&abs_path[4..]) };
+            r"\??\".encode_utf16().chain(bytes.encode_wide()).collect()
+        } else if abs_path.starts_with(br"\\") {
+            let bytes = unsafe { OsStr::from_encoded_bytes_unchecked(&abs_path[2..]) };
+            r"\??\UNC\".encode_utf16().chain(bytes.encode_wide()).collect()
+        } else {
+            return Err(io::const_io_error!(io::ErrorKind::InvalidInput, "path is not valid"));
         }
-        (*db).ReparseTag = c::IO_REPARSE_TAG_MOUNT_POINT;
-        (*db).ReparseTargetMaximumLength = (i * 2) as c::WORD;
-        (*db).ReparseTargetLength = ((i - 1) * 2) as c::WORD;
-        (*db).ReparseDataLength = (*db).ReparseTargetLength as c::DWORD + 12;
+    };
+    // Defined inline so we don't have to mess about with variable length buffer.
+    #[repr(C)]
+    pub struct MountPointBuffer {
+        ReparseTag: u32,
+        ReparseDataLength: u16,
+        Reserved: u16,
+        SubstituteNameOffset: u16,
+        SubstituteNameLength: u16,
+        PrintNameOffset: u16,
+        PrintNameLength: u16,
+        PathBuffer: [MaybeUninit<u16>; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize],
+    }
+    let data_len = 12 + (abs_path.len() * 2);
+    if data_len > u16::MAX as usize {
+        return Err(io::const_io_error!(
+            io::ErrorKind::InvalidInput,
+            "`original` path is too long"
+        ));
+    }
+    let data_len = data_len as u16;
+    let mut header = MountPointBuffer {
+        ReparseTag: c::IO_REPARSE_TAG_MOUNT_POINT,
+        ReparseDataLength: data_len,
+        Reserved: 0,
+        SubstituteNameOffset: 0,
+        SubstituteNameLength: (abs_path.len() * 2) as u16,
+        PrintNameOffset: ((abs_path.len() + 1) * 2) as u16,
+        PrintNameLength: 0,
+        PathBuffer: [MaybeUninit::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize],
+    };
+    unsafe {
+        let ptr = header.PathBuffer.as_mut_ptr();
+        ptr.copy_from(abs_path.as_ptr().cast::<MaybeUninit<u16>>(), abs_path.len());
 
         let mut ret = 0;
         cvt(c::DeviceIoControl(
-            h as *mut _,
+            d.as_raw_handle(),
             c::FSCTL_SET_REPARSE_POINT,
-            data_ptr.cast(),
-            (*db).ReparseDataLength + 8,
+            addr_of!(header).cast::<c_void>(),
+            data_len as u32 + 8,
             ptr::null_mut(),
             0,
             &mut ret,
@@ -1525,7 +1531,7 @@ fn symlink_junction_inner(original: &Path, junction: &Path) -> io::Result<()> {
 }
 
 // Try to see if a file exists but, unlike `exists`, report I/O errors.
-pub fn try_exists(path: &Path) -> io::Result<bool> {
+pub fn exists(path: &Path) -> io::Result<bool> {
     // Open the file to ensure any symlinks are followed to their target.
     let mut opts = OpenOptions::new();
     // No read, write, etc access rights are needed.

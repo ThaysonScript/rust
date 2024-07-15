@@ -1,4 +1,4 @@
-use super::abi;
+use super::hermit_abi;
 use crate::collections::HashMap;
 use crate::error::Error as StdError;
 use crate::ffi::{CStr, OsStr, OsString};
@@ -9,20 +9,20 @@ use crate::os::hermit::ffi::OsStringExt;
 use crate::path::{self, PathBuf};
 use crate::str;
 use crate::sync::Mutex;
-use crate::sys::memchr;
 use crate::sys::unsupported;
 use crate::vec;
+use core::slice::memchr;
 
 pub fn errno() -> i32 {
-    0
+    unsafe { hermit_abi::get_errno() }
 }
 
-pub fn error_string(_errno: i32) -> String {
-    "operation successful".to_string()
+pub fn error_string(errno: i32) -> String {
+    hermit_abi::error_string(errno).to_string()
 }
 
 pub fn getcwd() -> io::Result<PathBuf> {
-    unsupported()
+    Ok(PathBuf::from("/"))
 }
 
 pub fn chdir(_: &path::Path) -> io::Result<()> {
@@ -172,23 +172,19 @@ pub fn getenv(k: &OsStr) -> Option<OsString> {
     unsafe { ENV.as_ref().unwrap().lock().unwrap().get_mut(k).cloned() }
 }
 
-pub fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
-    unsafe {
-        let (k, v) = (k.to_owned(), v.to_owned());
-        ENV.as_ref().unwrap().lock().unwrap().insert(k, v);
-    }
+pub unsafe fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
+    let (k, v) = (k.to_owned(), v.to_owned());
+    ENV.as_ref().unwrap().lock().unwrap().insert(k, v);
     Ok(())
 }
 
-pub fn unsetenv(k: &OsStr) -> io::Result<()> {
-    unsafe {
-        ENV.as_ref().unwrap().lock().unwrap().remove(k);
-    }
+pub unsafe fn unsetenv(k: &OsStr) -> io::Result<()> {
+    ENV.as_ref().unwrap().lock().unwrap().remove(k);
     Ok(())
 }
 
 pub fn temp_dir() -> PathBuf {
-    panic!("no filesystem on hermit")
+    PathBuf::from("/tmp")
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -197,10 +193,10 @@ pub fn home_dir() -> Option<PathBuf> {
 
 pub fn exit(code: i32) -> ! {
     unsafe {
-        abi::exit(code);
+        hermit_abi::exit(code);
     }
 }
 
 pub fn getpid() -> u32 {
-    unsafe { abi::getpid() }
+    unsafe { hermit_abi::getpid() as u32 }
 }

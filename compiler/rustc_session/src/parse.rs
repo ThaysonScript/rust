@@ -3,20 +3,20 @@
 
 use crate::config::{Cfg, CheckCfg};
 use crate::errors::{
-    CliFeatureDiagnosticHelp, FeatureDiagnosticForIssue, FeatureDiagnosticHelp, FeatureGateError,
-    SuggestUpgradeCompiler,
+    CliFeatureDiagnosticHelp, FeatureDiagnosticForIssue, FeatureDiagnosticHelp,
+    FeatureDiagnosticSuggestion, FeatureGateError, SuggestUpgradeCompiler,
 };
 use crate::lint::{
-    builtin::UNSTABLE_SYNTAX_PRE_EXPANSION, BufferedEarlyLint, BuiltinLintDiagnostics, Lint, LintId,
+    builtin::UNSTABLE_SYNTAX_PRE_EXPANSION, BufferedEarlyLint, BuiltinLintDiag, Lint, LintId,
 };
 use crate::Session;
 use rustc_ast::node_id::NodeId;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync::{AppendOnlyVec, Lock, Lrc};
-use rustc_errors::{emitter::SilentEmitter, DiagCtxt};
+use rustc_errors::emitter::{stderr_destination, HumanEmitter, SilentEmitter};
 use rustc_errors::{
-    fallback_fluent_bundle, DiagnosticBuilder, DiagnosticMessage, EmissionGuarantee, MultiSpan,
-    StashKey,
+    fallback_fluent_bundle, ColorConfig, Diag, DiagCtxt, DiagCtxtHandle, DiagMessage,
+    EmissionGuarantee, MultiSpan, StashKey,
 };
 use rustc_feature::{find_feature_issue, GateIssue, UnstableFeatures};
 use rustc_span::edition::Edition;
@@ -85,8 +85,8 @@ pub fn feature_err(
     sess: &Session,
     feature: Symbol,
     span: impl Into<MultiSpan>,
-    explain: impl Into<DiagnosticMessage>,
-) -> DiagnosticBuilder<'_> {
+    explain: impl Into<DiagMessage>,
+) -> Diag<'_> {
     feature_err_issue(sess, feature, span, GateIssue::Language, explain)
 }
 
@@ -100,21 +100,19 @@ pub fn feature_err_issue(
     feature: Symbol,
     span: impl Into<MultiSpan>,
     issue: GateIssue,
-    explain: impl Into<DiagnosticMessage>,
-) -> DiagnosticBuilder<'_> {
+    explain: impl Into<DiagMessage>,
+) -> Diag<'_> {
     let span = span.into();
 
     // Cancel an earlier warning for this same error, if it exists.
     if let Some(span) = span.primary_span() {
-        if let Some(err) = sess.parse_sess.dcx.steal_diagnostic(span, StashKey::EarlySyntaxWarning)
-        {
+        if let Some(err) = sess.dcx().steal_non_err(span, StashKey::EarlySyntaxWarning) {
             err.cancel()
         }
     }
 
-    let mut err =
-        sess.parse_sess.dcx.create_err(FeatureGateError { span, explain: explain.into() });
-    add_feature_diagnostics_for_issue(&mut err, sess, feature, issue, false);
+    let mut err = sess.dcx().create_err(FeatureGateError { span, explain: explain.into() });
+    add_feature_diagnostics_for_issue(&mut err, sess, feature, issue, false, None);
     err
 }
 
@@ -142,8 +140,8 @@ pub fn feature_warn_issue(
     issue: GateIssue,
     explain: &'static str,
 ) {
-    let mut err = sess.parse_sess.dcx.struct_span_warn(span, explain);
-    add_feature_diagnostics_for_issue(&mut err, sess, feature, issue, false);
+    let mut err = sess.dcx().struct_span_warn(span, explain);
+    add_feature_diagnostics_for_issue(&mut err, sess, feature, issue, false, None);
 
     // Decorate this as a future-incompatibility lint as in rustc_middle::lint::lint_level
     let lint = UNSTABLE_SYNTAX_PRE_EXPANSION;
@@ -158,11 +156,11 @@ pub fn feature_warn_issue(
 
 /// Adds the diagnostics for a feature to an existing error.
 pub fn add_feature_diagnostics<G: EmissionGuarantee>(
-    err: &mut DiagnosticBuilder<'_, G>,
+    err: &mut Diag<'_, G>,
     sess: &Session,
     feature: Symbol,
 ) {
-    add_feature_diagnostics_for_issue(err, sess, feature, GateIssue::Language, false);
+    add_feature_diagnostics_for_issue(err, sess, feature, GateIssue::Language, false, None);
 }
 
 /// Adds the diagnostics for a feature to an existing error.
@@ -170,36 +168,40 @@ pub fn add_feature_diagnostics<G: EmissionGuarantee>(
 /// This variant allows you to control whether it is a library or language feature.
 /// Almost always, you want to use this for a language feature. If so, prefer
 /// `add_feature_diagnostics`.
+#[allow(rustc::diagnostic_outside_of_impl)] // FIXME
 pub fn add_feature_diagnostics_for_issue<G: EmissionGuarantee>(
-    err: &mut DiagnosticBuilder<'_, G>,
+    err: &mut Diag<'_, G>,
     sess: &Session,
     feature: Symbol,
     issue: GateIssue,
     feature_from_cli: bool,
+    inject_span: Option<Span>,
 ) {
     if let Some(n) = find_feature_issue(feature, issue) {
-        err.subdiagnostic(sess.dcx(), FeatureDiagnosticForIssue { n });
+        err.subdiagnostic(FeatureDiagnosticForIssue { n });
     }
 
     // #23973: do not suggest `#![feature(...)]` if we are in beta/stable
-    if sess.parse_sess.unstable_features.is_nightly_build() {
+    if sess.psess.unstable_features.is_nightly_build() {
         if feature_from_cli {
-            err.subdiagnostic(sess.dcx(), CliFeatureDiagnosticHelp { feature });
+            err.subdiagnostic(CliFeatureDiagnosticHelp { feature });
+        } else if let Some(span) = inject_span {
+            err.subdiagnostic(FeatureDiagnosticSuggestion { feature, span });
         } else {
-            err.subdiagnostic(sess.dcx(), FeatureDiagnosticHelp { feature });
+            err.subdiagnostic(FeatureDiagnosticHelp { feature });
         }
 
         if sess.opts.unstable_opts.ui_testing {
-            err.subdiagnostic(sess.dcx(), SuggestUpgradeCompiler::ui_testing());
+            err.subdiagnostic(SuggestUpgradeCompiler::ui_testing());
         } else if let Some(suggestion) = SuggestUpgradeCompiler::new() {
-            err.subdiagnostic(sess.dcx(), suggestion);
+            err.subdiagnostic(suggestion);
         }
     }
 }
 
 /// Info about a parsing session.
 pub struct ParseSess {
-    pub dcx: DiagCtxt,
+    dcx: DiagCtxt,
     pub unstable_features: UnstableFeatures,
     pub config: Cfg,
     pub check_config: CheckCfg,
@@ -234,10 +236,14 @@ pub struct ParseSess {
 
 impl ParseSess {
     /// Used for testing.
-    pub fn new(locale_resources: Vec<&'static str>, file_path_mapping: FilePathMapping) -> Self {
+    pub fn new(locale_resources: Vec<&'static str>) -> Self {
         let fallback_bundle = fallback_fluent_bundle(locale_resources, false);
-        let sm = Lrc::new(SourceMap::new(file_path_mapping));
-        let dcx = DiagCtxt::with_tty_emitter(Some(sm.clone()), fallback_bundle);
+        let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
+        let emitter = Box::new(
+            HumanEmitter::new(stderr_destination(ColorConfig::Auto), fallback_bundle)
+                .sm(Some(sm.clone())),
+        );
+        let dcx = DiagCtxt::new(emitter);
         ParseSess::with_dcx(dcx, sm)
     }
 
@@ -263,12 +269,25 @@ impl ParseSess {
         }
     }
 
-    pub fn with_silent_emitter(fatal_note: String) -> Self {
-        let fallback_bundle = fallback_fluent_bundle(Vec::new(), false);
+    pub fn with_silent_emitter(
+        locale_resources: Vec<&'static str>,
+        fatal_note: String,
+        emit_fatal_diagnostic: bool,
+    ) -> Self {
+        let fallback_bundle = fallback_fluent_bundle(locale_resources, false);
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
-        let fatal_dcx = DiagCtxt::with_tty_emitter(None, fallback_bundle).disable_warnings();
-        let dcx = DiagCtxt::with_emitter(Box::new(SilentEmitter { fatal_dcx, fatal_note }))
-            .disable_warnings();
+        let emitter = Box::new(HumanEmitter::new(
+            stderr_destination(ColorConfig::Auto),
+            fallback_bundle.clone(),
+        ));
+        let fatal_dcx = DiagCtxt::new(emitter);
+        let dcx = DiagCtxt::new(Box::new(SilentEmitter {
+            fallback_bundle,
+            fatal_dcx,
+            fatal_note: Some(fatal_note),
+            emit_fatal_diagnostic,
+        }))
+        .disable_warnings();
         ParseSess::with_dcx(dcx, sm)
     }
 
@@ -286,32 +305,12 @@ impl ParseSess {
         lint: &'static Lint,
         span: impl Into<MultiSpan>,
         node_id: NodeId,
-        msg: impl Into<DiagnosticMessage>,
+        diagnostic: BuiltinLintDiag,
     ) {
         self.buffered_lints.with_lock(|buffered_lints| {
             buffered_lints.push(BufferedEarlyLint {
                 span: span.into(),
                 node_id,
-                msg: msg.into(),
-                lint_id: LintId::of(lint),
-                diagnostic: BuiltinLintDiagnostics::Normal,
-            });
-        });
-    }
-
-    pub fn buffer_lint_with_diagnostic(
-        &self,
-        lint: &'static Lint,
-        span: impl Into<MultiSpan>,
-        node_id: NodeId,
-        msg: impl Into<DiagnosticMessage>,
-        diagnostic: BuiltinLintDiagnostics,
-    ) {
-        self.buffered_lints.with_lock(|buffered_lints| {
-            buffered_lints.push(BufferedEarlyLint {
-                span: span.into(),
-                node_id,
-                msg: msg.into(),
                 lint_id: LintId::of(lint),
                 diagnostic,
             });
@@ -326,5 +325,9 @@ impl ParseSess {
         // This is equivalent to `.iter().copied().enumerate()`, but that isn't possible for
         // AppendOnlyVec, so we resort to this scheme.
         self.proc_macro_quoted_spans.iter_enumerated()
+    }
+
+    pub fn dcx(&self) -> DiagCtxtHandle<'_> {
+        self.dcx.handle()
     }
 }

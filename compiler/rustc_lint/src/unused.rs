@@ -10,16 +10,19 @@ use rustc_ast as ast;
 use rustc_ast::util::{classify, parser};
 use rustc_ast::{ExprKind, StmtKind};
 use rustc_errors::{pluralize, MultiSpan};
-use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
+use rustc_hir::{self as hir, LangItem};
 use rustc_infer::traits::util::elaborate;
 use rustc_middle::ty::adjustment;
 use rustc_middle::ty::{self, Ty};
+use rustc_session::{declare_lint, declare_lint_pass, impl_lint_pass};
 use rustc_span::symbol::Symbol;
 use rustc_span::symbol::{kw, sym};
 use rustc_span::{BytePos, Span};
 use std::iter;
+use std::ops::ControlFlow;
+use tracing::instrument;
 
 declare_lint! {
     /// The `unused_must_use` lint detects unused result of a type flagged as
@@ -175,6 +178,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                 | hir::BinOpKind::Shr => Some("bitwise operation"),
             },
             hir::ExprKind::AddrOf(..) => Some("borrow"),
+            hir::ExprKind::OffsetOf(..) => Some("`offset_of` call"),
             hir::ExprKind::Unary(..) => Some("unary operation"),
             _ => None,
         };
@@ -285,7 +289,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                     is_ty_must_use(cx, boxed_ty, expr, span)
                         .map(|inner| MustUsePath::Boxed(Box::new(inner)))
                 }
-                ty::Adt(def, args) if cx.tcx.lang_items().pin_type() == Some(def.did()) => {
+                ty::Adt(def, args) if cx.tcx.is_lang_item(def.did(), LangItem::Pin) => {
                     let pinned_ty = args.type_at(0);
                     is_ty_must_use(cx, pinned_ty, expr, span)
                         .map(|inner| MustUsePath::Pinned(Box::new(inner)))
@@ -294,7 +298,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                 ty::Alias(ty::Opaque | ty::Projection, ty::AliasTy { def_id: def, .. }) => {
                     elaborate(
                         cx.tcx,
-                        cx.tcx.explicit_item_bounds(def).instantiate_identity_iter_copied(),
+                        cx.tcx.explicit_item_super_predicates(def).iter_identity_copied(),
                     )
                     // We only care about self bounds for the impl-trait
                     .filter_only_self()
@@ -381,7 +385,8 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
             }
         }
 
-        // Returns whether further errors should be suppressed because either a lint has been emitted or the type should be ignored.
+        // Returns whether further errors should be suppressed because either a lint has been
+        // emitted or the type should be ignored.
         fn check_must_use_def(
             cx: &LateContext<'_>,
             def_id: DefId,
@@ -671,7 +676,35 @@ trait UnusedDelimLint {
             return true;
         }
 
-        // Check if LHS needs parens to prevent false-positives in cases like `fn x() -> u8 { ({ 0 } + 1) }`.
+        // Check if LHS needs parens to prevent false-positives in cases like
+        // `fn x() -> u8 { ({ 0 } + 1) }`.
+        //
+        // FIXME: https://github.com/rust-lang/rust/issues/119426
+        // The syntax tree in this code is from after macro expansion, so the
+        // current implementation has both false negatives and false positives
+        // related to expressions containing macros.
+        //
+        //     macro_rules! m1 {
+        //         () => {
+        //             1
+        //         };
+        //     }
+        //
+        //     fn f1() -> u8 {
+        //         // Lint says parens are not needed, but they are.
+        //         (m1! {} + 1)
+        //     }
+        //
+        //     macro_rules! m2 {
+        //         () => {
+        //             loop { break 1; }
+        //         };
+        //     }
+        //
+        //     fn f2() -> u8 {
+        //         // Lint says parens are needed, but they are not.
+        //         (m2!() + 1)
+        //     }
         {
             let mut innermost = inner;
             loop {
@@ -689,7 +722,8 @@ trait UnusedDelimLint {
             }
         }
 
-        // Check if RHS needs parens to prevent false-positives in cases like `if (() == return) {}`.
+        // Check if RHS needs parens to prevent false-positives in cases like `if (() == return)
+        // {}`.
         if !followed_by_block {
             return false;
         }
@@ -753,21 +787,18 @@ trait UnusedDelimLint {
         // fn f(){(print!(á
         // ```
         use rustc_ast::visit::{walk_expr, Visitor};
-        struct ErrExprVisitor {
-            has_error: bool,
-        }
+        struct ErrExprVisitor;
         impl<'ast> Visitor<'ast> for ErrExprVisitor {
-            fn visit_expr(&mut self, expr: &'ast ast::Expr) {
-                if let ExprKind::Err = expr.kind {
-                    self.has_error = true;
-                    return;
+            type Result = ControlFlow<()>;
+            fn visit_expr(&mut self, expr: &'ast ast::Expr) -> ControlFlow<()> {
+                if let ExprKind::Err(_) = expr.kind {
+                    ControlFlow::Break(())
+                } else {
+                    walk_expr(self, expr)
                 }
-                walk_expr(self, expr)
             }
         }
-        let mut visitor = ErrExprVisitor { has_error: false };
-        visitor.visit_expr(value);
-        if visitor.has_error {
+        if ErrExprVisitor.visit_expr(value).is_break() {
             return;
         }
         let spans = match value.kind {
@@ -865,7 +896,9 @@ trait UnusedDelimLint {
                 (iter, UnusedDelimsCtx::ForIterExpr, true, None, Some(body.span.lo()), true)
             }
 
-            Match(ref head, _) if Self::LINT_EXPR_IN_PATTERN_MATCHING_CTX => {
+            Match(ref head, _, ast::MatchKind::Prefix)
+                if Self::LINT_EXPR_IN_PATTERN_MATCHING_CTX =>
+            {
                 let left = e.span.lo() + rustc_span::BytePos(5);
                 (head, UnusedDelimsCtx::MatchScrutineeExpr, true, Some(left), None, true)
             }
@@ -916,7 +949,7 @@ trait UnusedDelimLint {
 
     fn check_stmt(&mut self, cx: &EarlyContext<'_>, s: &ast::Stmt) {
         match s.kind {
-            StmtKind::Local(ref local) if Self::LINT_EXPR_IN_PATTERN_MATCHING_CTX => {
+            StmtKind::Let(ref local) if Self::LINT_EXPR_IN_PATTERN_MATCHING_CTX => {
                 if let Some((init, els)) = local.kind.init_else_opt() {
                     let ctx = match els {
                         None => UnusedDelimsCtx::AssignedValue,
@@ -1054,7 +1087,7 @@ impl UnusedParens {
         avoid_mut: bool,
         keep_space: (bool, bool),
     ) {
-        use ast::{BindingAnnotation, PatKind};
+        use ast::{BindingMode, PatKind};
 
         if let PatKind::Paren(inner) = &value.kind {
             match inner.kind {
@@ -1066,16 +1099,20 @@ impl UnusedParens {
                 // Avoid `p0 | .. | pn` if we should.
                 PatKind::Or(..) if avoid_or => return,
                 // Avoid `mut x` and `mut x @ p` if we should:
-                PatKind::Ident(BindingAnnotation::MUT, ..) if avoid_mut => {
+                PatKind::Ident(BindingMode::MUT, ..) if avoid_mut => {
                     return;
                 }
                 // Otherwise proceed with linting.
                 _ => {}
             }
-            let spans = inner
-                .span
-                .find_ancestor_inside(value.span)
-                .map(|inner| (value.span.with_hi(inner.lo()), value.span.with_lo(inner.hi())));
+            let spans = if !value.span.from_expansion() {
+                inner
+                    .span
+                    .find_ancestor_inside(value.span)
+                    .map(|inner| (value.span.with_hi(inner.lo()), value.span.with_lo(inner.hi())))
+            } else {
+                None
+            };
             self.emit_unused_delims(cx, value.span, spans, "pattern", keep_space, false);
         }
     }
@@ -1133,7 +1170,7 @@ impl EarlyLintPass for UnusedParens {
                 }
                 return;
             }
-            ExprKind::Match(ref _expr, ref arm) => {
+            ExprKind::Match(ref _expr, ref arm, _) => {
                 for a in arm {
                     if let Some(body) = &a.body {
                         self.check_unused_delims_expr(
@@ -1183,7 +1220,7 @@ impl EarlyLintPass for UnusedParens {
                 self.check_unused_parens_pat(cx, &f.pat, false, false, keep_space);
             },
             // Avoid linting on `i @ (p0 | .. | pn)` and `box (p0 | .. | pn)`, #64106.
-            Ident(.., Some(p)) | Box(p) => self.check_unused_parens_pat(cx, p, true, false, keep_space),
+            Ident(.., Some(p)) | Box(p) | Deref(p) => self.check_unused_parens_pat(cx, p, true, false, keep_space),
             // Avoid linting on `&(mut x)` as `&mut x` has a different meaning, #55342.
             // Also avoid linting on `& mut? (p0 | .. | pn)`, #64106.
             Ref(p, m) => self.check_unused_parens_pat(cx, p, true, *m == Mutability::Not, keep_space),
@@ -1191,7 +1228,7 @@ impl EarlyLintPass for UnusedParens {
     }
 
     fn check_stmt(&mut self, cx: &EarlyContext<'_>, s: &ast::Stmt) {
-        if let StmtKind::Local(ref local) = s.kind {
+        if let StmtKind::Let(ref local) = s.kind {
             self.check_unused_parens_pat(cx, &local.pat, true, false, (true, false));
         }
 
@@ -1231,11 +1268,13 @@ impl EarlyLintPass for UnusedParens {
                         if self.with_self_ty_parens && b.generic_params.len() > 0 => {}
                     ast::TyKind::ImplTrait(_, bounds) if bounds.len() > 1 => {}
                     _ => {
-                        let spans = r
-                            .span
-                            .find_ancestor_inside(ty.span)
-                            .map(|r| (ty.span.with_hi(r.lo()), ty.span.with_lo(r.hi())));
-
+                        let spans = if !ty.span.from_expansion() {
+                            r.span
+                                .find_ancestor_inside(ty.span)
+                                .map(|r| (ty.span.with_hi(r.lo()), ty.span.with_lo(r.hi())))
+                        } else {
+                            None
+                        };
                         self.emit_unused_delims(cx, ty.span, spans, "type", (false, false), false);
                     }
                 }
@@ -1491,7 +1530,7 @@ declare_lint_pass!(UnusedImportBraces => [UNUSED_IMPORT_BRACES]);
 
 impl UnusedImportBraces {
     fn check_use_tree(&self, cx: &EarlyContext<'_>, use_tree: &ast::UseTree, item: &ast::Item) {
-        if let ast::UseTreeKind::Nested(ref items) = use_tree.kind {
+        if let ast::UseTreeKind::Nested { ref items, .. } = use_tree.kind {
             // Recursively check nested UseTrees
             for (tree, _) in items {
                 self.check_use_tree(cx, tree, item);
@@ -1512,7 +1551,7 @@ impl UnusedImportBraces {
                     rename.unwrap_or(orig_ident).name
                 }
                 ast::UseTreeKind::Glob => Symbol::intern("*"),
-                ast::UseTreeKind::Nested(_) => return,
+                ast::UseTreeKind::Nested { .. } => return,
             };
 
             cx.emit_span_lint(

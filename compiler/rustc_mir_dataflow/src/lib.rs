@@ -1,14 +1,10 @@
+// tidy-alphabetical-start
 #![feature(associated_type_defaults)]
 #![feature(box_patterns)]
 #![feature(exact_size_is_empty)]
 #![feature(let_chains)]
-#![cfg_attr(bootstrap, feature(min_specialization))]
 #![feature(try_blocks)]
-
-#[macro_use]
-extern crate tracing;
-#[macro_use]
-extern crate rustc_middle;
+// tidy-alphabetical-end
 
 use rustc_middle::ty;
 

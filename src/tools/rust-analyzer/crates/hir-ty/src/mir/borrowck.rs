@@ -19,8 +19,8 @@ use crate::{
 };
 
 use super::{
-    BasicBlockId, BorrowKind, LocalId, MirBody, MirLowerError, MirSpan, Place, ProjectionElem,
-    Rvalue, StatementKind, TerminatorKind,
+    BasicBlockId, BorrowKind, LocalId, MirBody, MirLowerError, MirSpan, MutBorrowKind, Place,
+    ProjectionElem, Rvalue, StatementKind, TerminatorKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +91,7 @@ pub fn borrowck_query(
     db: &dyn HirDatabase,
     def: DefWithBodyId,
 ) -> Result<Arc<[BorrowckResult]>, MirLowerError> {
-    let _p = tracing::span!(tracing::Level::INFO, "borrowck_query").entered();
+    let _p = tracing::info_span!("borrowck_query").entered();
     let mut res = vec![];
     all_mir_bodies(db, def, |body| {
         res.push(BorrowckResult {
@@ -540,7 +540,13 @@ fn mutability_of_locals(
                         }
                         Rvalue::ShallowInitBox(_, _) | Rvalue::ShallowInitBoxWithAlloc(_) => (),
                     }
-                    if let Rvalue::Ref(BorrowKind::Mut { .. }, p) = value {
+                    if let Rvalue::Ref(
+                        BorrowKind::Mut {
+                            kind: MutBorrowKind::Default | MutBorrowKind::TwoPhasedBorrow,
+                        },
+                        p,
+                    ) = value
+                    {
                         if place_case(db, body, p) != ProjectionCase::Indirect {
                             push_mut_span(p.local, statement.span, &mut result);
                         }

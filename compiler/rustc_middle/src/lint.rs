@@ -2,8 +2,9 @@ use std::cmp;
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sorted_map::SortedMap;
-use rustc_errors::{DiagnosticBuilder, DiagnosticMessage, MultiSpan};
+use rustc_errors::{Diag, MultiSpan};
 use rustc_hir::{HirId, ItemLocalId};
+use rustc_macros::HashStable;
 use rustc_session::lint::{
     builtin::{self, FORBIDDEN_LINT_GROUPS},
     FutureIncompatibilityReason, Level, Lint, LintId,
@@ -11,6 +12,7 @@ use rustc_session::lint::{
 use rustc_session::Session;
 use rustc_span::hygiene::{ExpnKind, MacroKind};
 use rustc_span::{symbol, DesugaringKind, Span, Symbol, DUMMY_SP};
+use tracing::instrument;
 
 use crate::ty::TyCtxt;
 
@@ -204,7 +206,7 @@ pub fn explain_lint_level_source(
     lint: &'static Lint,
     level: Level,
     src: LintLevelSource,
-    err: &mut DiagnosticBuilder<'_, ()>,
+    err: &mut Diag<'_, ()>,
 ) {
     let name = lint.name_lower();
     if let Level::Allow = level {
@@ -260,8 +262,7 @@ pub fn explain_lint_level_source(
 ///
 /// ## `decorate`
 ///
-/// It is not intended to call `emit`/`cancel` on the `DiagnosticBuilder` passed
-/// in the `decorate` callback.
+/// It is not intended to call `emit`/`cancel` on the `Diag` passed in the `decorate` callback.
 #[track_caller]
 pub fn lint_level(
     sess: &Session,
@@ -269,8 +270,7 @@ pub fn lint_level(
     level: Level,
     src: LintLevelSource,
     span: Option<MultiSpan>,
-    msg: impl Into<DiagnosticMessage>,
-    decorate: impl for<'a, 'b> FnOnce(&'b mut DiagnosticBuilder<'a, ()>),
+    decorate: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>),
 ) {
     // Avoid codegen bloat from monomorphization by immediately doing dyn dispatch of `decorate` to
     // the "real" work.
@@ -281,8 +281,7 @@ pub fn lint_level(
         level: Level,
         src: LintLevelSource,
         span: Option<MultiSpan>,
-        msg: impl Into<DiagnosticMessage>,
-        decorate: Box<dyn '_ + for<'a, 'b> FnOnce(&'b mut DiagnosticBuilder<'a, ()>)>,
+        decorate: Box<dyn '_ + for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>)>,
     ) {
         // Check for future incompatibility lints and issue a stronger warning.
         let future_incompatible = lint.future_incompatible;
@@ -314,7 +313,7 @@ pub fn lint_level(
                 //
                 // We can also not mark the lint expectation as fulfilled here right away, as it
                 // can still be cancelled in the decorate function. All of this means that we simply
-                // create a `DiagnosticBuilder` and continue as we would for warnings.
+                // create a `Diag` and continue as we would for warnings.
                 rustc_errors::Level::Expect(expect_id)
             }
             Level::ForceWarn(Some(expect_id)) => rustc_errors::Level::ForceWarning(Some(expect_id)),
@@ -322,7 +321,7 @@ pub fn lint_level(
             Level::Warn => rustc_errors::Level::Warning,
             Level::Deny | Level::Forbid => rustc_errors::Level::Error,
         };
-        let mut err = DiagnosticBuilder::new(sess.dcx(), err_level, "");
+        let mut err = Diag::new(sess.dcx(), err_level, "");
         if let Some(span) = span {
             err.span(span);
         }
@@ -349,10 +348,6 @@ pub fn lint_level(
                 return;
             }
         }
-
-        // Delay evaluating and setting the primary message until after we've
-        // suppressed the lint due to macros.
-        err.primary_message(msg);
 
         err.is_lint(lint.name_lower(), has_future_breakage);
 
@@ -399,12 +394,26 @@ pub fn lint_level(
             }
         }
 
-        // Finally, run `decorate`.
-        decorate(&mut err);
+        // Finally, run `decorate`. `decorate` can call `trimmed_path_str` (directly or indirectly),
+        // so we need to make sure when we do call `decorate` that the diagnostic is eventually
+        // emitted or we'll get a `must_produce_diag` ICE.
+        //
+        // When is a diagnostic *eventually* emitted? Well, that is determined by 2 factors:
+        // 1. If the corresponding `rustc_errors::Level` is beyond warning, i.e. `ForceWarning(_)`
+        //    or `Error`, then the diagnostic will be emitted regardless of CLI options.
+        // 2. If the corresponding `rustc_errors::Level` is warning, then that can be affected by
+        //    `-A warnings` or `--cap-lints=xxx` on the command line. In which case, the diagnostic
+        //    will be emitted if `can_emit_warnings` is true.
+        let skip = err_level == rustc_errors::Level::Warning && !sess.dcx().can_emit_warnings();
+
+        if !skip {
+            decorate(&mut err);
+        }
+
         explain_lint_level_source(lint, level, src, &mut err);
         err.emit()
     }
-    lint_level_impl(sess, lint, level, src, span, msg, Box::new(decorate))
+    lint_level_impl(sess, lint, level, src, span, Box::new(decorate))
 }
 
 /// Returns whether `span` originates in a foreign crate's external macro.

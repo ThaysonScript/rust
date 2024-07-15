@@ -30,7 +30,7 @@ pub(crate) fn render_fn(
     local_name: Option<hir::Name>,
     func: hir::Function,
 ) -> Builder {
-    let _p = tracing::span!(tracing::Level::INFO, "render_fn").entered();
+    let _p = tracing::info_span!("render_fn").entered();
     render(ctx, local_name, func, FuncKind::Function(path_ctx))
 }
 
@@ -41,7 +41,7 @@ pub(crate) fn render_method(
     local_name: Option<hir::Name>,
     func: hir::Function,
 ) -> Builder {
-    let _p = tracing::span!(tracing::Level::INFO, "render_method").entered();
+    let _p = tracing::info_span!("render_method").entered();
     render(ctx, local_name, func, FuncKind::Method(dot_access, receiver))
 }
 
@@ -68,11 +68,11 @@ fn render(
     };
     let has_self_param = func.self_param(db).is_some();
     let mut item = CompletionItem::new(
-        if has_self_param {
-            CompletionItemKind::Method
+        CompletionItemKind::SymbolKind(if has_self_param {
+            SymbolKind::Method
         } else {
-            CompletionItemKind::SymbolKind(SymbolKind::Function)
-        },
+            SymbolKind::Function
+        }),
         ctx.source_range(),
         call.clone(),
     );

@@ -1,10 +1,16 @@
-//@ check-pass
+//@ known-bug: #110395
+//@ failure-status: 101
+//@ normalize-stderr-test: ".*note: .*\n\n" -> ""
+//@ normalize-stderr-test: "thread 'rustc' panicked.*:\n.*\n" -> ""
+//@ rustc-env:RUST_BACKTRACE=0
+// FIXME(effects) check-pass
+//@ compile-flags: -Znext-solver
 
 #![crate_type = "lib"]
 #![feature(no_core, lang_items, unboxed_closures, auto_traits, intrinsics, rustc_attrs, staged_api)]
-#![feature(fundamental)]
+#![feature(fundamental, marker_trait_attr)]
 #![feature(const_trait_impl, effects, const_mut_refs)]
-#![allow(internal_features)]
+#![allow(internal_features, incomplete_features)]
 #![no_std]
 #![no_core]
 #![stable(feature = "minicore", since = "1.0.0")]
@@ -509,21 +515,56 @@ trait StructuralPartialEq {}
 
 const fn drop<T: ~const Destruct>(_: T) {}
 
-extern "rust-intrinsic" {
-    #[rustc_const_stable(feature = "const_eval_select", since = "1.0.0")]
-    fn const_eval_select<ARG: Tuple, F, G, RET>(
-        arg: ARG,
-        called_in_const: F,
-        called_at_rt: G,
-    ) -> RET
-    where
-        F: const FnOnce<ARG, Output = RET>,
-        G: FnOnce<ARG, Output = RET>;
+#[rustc_const_stable(feature = "const_eval_select", since = "1.0.0")]
+#[rustc_intrinsic_must_be_overridden]
+#[rustc_intrinsic]
+const fn const_eval_select<ARG: Tuple, F, G, RET>(
+    arg: ARG,
+    called_in_const: F,
+    called_at_rt: G,
+) -> RET
+where
+    F: const FnOnce<ARG, Output = RET>,
+    G: FnOnce<ARG, Output = RET>,
+{
+    loop {}
 }
 
 fn test_const_eval_select() {
     const fn const_fn() {}
     fn rt_fn() {}
 
-    unsafe { const_eval_select((), const_fn, rt_fn); }
+    const_eval_select((), const_fn, rt_fn);
+}
+
+mod effects {
+    use super::Sized;
+
+    #[lang = "EffectsNoRuntime"]
+    pub struct NoRuntime;
+    #[lang = "EffectsMaybe"]
+    pub struct Maybe;
+    #[lang = "EffectsRuntime"]
+    pub struct Runtime;
+
+    #[lang = "EffectsCompat"]
+    pub trait Compat<#[rustc_runtime] const RUNTIME: bool> {}
+
+    impl Compat<false> for NoRuntime {}
+    impl Compat<true> for Runtime {}
+    impl<#[rustc_runtime] const RUNTIME: bool> Compat<RUNTIME> for Maybe {}
+
+    #[lang = "EffectsTyCompat"]
+    #[marker]
+    pub trait TyCompat<T: ?Sized> {}
+
+    impl<T: ?Sized> TyCompat<T> for T {}
+    impl<T: ?Sized> TyCompat<T> for Maybe {}
+    impl<T: ?Sized> TyCompat<Maybe> for T {}
+
+    #[lang = "EffectsIntersection"]
+    pub trait Intersection {
+        #[lang = "EffectsIntersectionOutput"]
+        type Output: ?Sized;
+    }
 }

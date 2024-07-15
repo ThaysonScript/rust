@@ -1,3 +1,5 @@
+//! The [`OsStr`] and [`OsString`] types and associated utilities.
+
 #[cfg(test)]
 mod tests;
 
@@ -155,7 +157,7 @@ impl OsString {
     /// # Safety
     ///
     /// As the encoding is unspecified, callers must pass in bytes that originated as a mixture of
-    /// validated UTF-8 and bytes from [`OsStr::as_encoded_bytes`] from within the same rust version
+    /// validated UTF-8 and bytes from [`OsStr::as_encoded_bytes`] from within the same Rust version
     /// built for the same target platform.  For example, reconstructing an `OsString` from bytes sent
     /// over the network or stored in a file will likely violate these safety rules.
     ///
@@ -182,7 +184,7 @@ impl OsString {
     #[inline]
     #[stable(feature = "os_str_bytes", since = "1.74.0")]
     pub unsafe fn from_encoded_bytes_unchecked(bytes: Vec<u8>) -> Self {
-        OsString { inner: Buf::from_encoded_bytes_unchecked(bytes) }
+        OsString { inner: unsafe { Buf::from_encoded_bytes_unchecked(bytes) } }
     }
 
     /// Converts to an [`OsStr`] slice.
@@ -211,7 +213,7 @@ impl OsString {
     /// ASCII.
     ///
     /// Note: As the encoding is unspecified, any sub-slice of bytes that is not valid UTF-8 should
-    /// be treated as opaque and only comparable within the same rust version built for the same
+    /// be treated as opaque and only comparable within the same Rust version built for the same
     /// target platform.  For example, sending the bytes over the network or storing it in a file
     /// will likely result in incompatible data.  See [`OsString`] for more encoding details
     /// and [`std::ffi`] for platform-specific, specified conversions.
@@ -530,6 +532,41 @@ impl OsString {
         let rw = Box::into_raw(self.inner.into_box()) as *mut OsStr;
         unsafe { Box::from_raw(rw) }
     }
+
+    /// Consumes and leaks the `OsString`, returning a mutable reference to the contents,
+    /// `&'a mut OsStr`.
+    ///
+    /// The caller has free choice over the returned lifetime, including 'static.
+    /// Indeed, this function is ideally used for data that lives for the remainder of
+    /// the program’s life, as dropping the returned reference will cause a memory leak.
+    ///
+    /// It does not reallocate or shrink the `OsString`, so the leaked allocation may include
+    /// unused capacity that is not part of the returned slice. If you want to discard excess
+    /// capacity, call [`into_boxed_os_str`], and then [`Box::leak`] instead.
+    /// However, keep in mind that trimming the capacity may result in a reallocation and copy.
+    ///
+    /// [`into_boxed_os_str`]: Self::into_boxed_os_str
+    #[unstable(feature = "os_string_pathbuf_leak", issue = "125965")]
+    #[inline]
+    pub fn leak<'a>(self) -> &'a mut OsStr {
+        OsStr::from_inner_mut(self.inner.leak())
+    }
+
+    /// Provides plumbing to core `Vec::truncate`.
+    /// More well behaving alternative to allowing outer types
+    /// full mutable access to the core `Vec`.
+    #[inline]
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.inner.truncate(len);
+    }
+
+    /// Provides plumbing to core `Vec::extend_from_slice`.
+    /// More well behaving alternative to allowing outer types
+    /// full mutable access to the core `Vec`.
+    #[inline]
+    pub(crate) fn extend_from_slice(&mut self, other: &[u8]) {
+        self.inner.extend_from_slice(other);
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -604,6 +641,10 @@ impl Clone for OsString {
         OsString { inner: self.inner.clone() }
     }
 
+    /// Clones the contents of `source` into `self`.
+    ///
+    /// This method is preferred over simply assigning `source.clone()` to `self`,
+    /// as it avoids reallocation if possible.
     #[inline]
     fn clone_from(&mut self, source: &Self) {
         self.inner.clone_from(&source.inner)
@@ -745,7 +786,7 @@ impl OsStr {
     /// # Safety
     ///
     /// As the encoding is unspecified, callers must pass in bytes that originated as a mixture of
-    /// validated UTF-8 and bytes from [`OsStr::as_encoded_bytes`] from within the same rust version
+    /// validated UTF-8 and bytes from [`OsStr::as_encoded_bytes`] from within the same Rust version
     /// built for the same target platform.  For example, reconstructing an `OsStr` from bytes sent
     /// over the network or stored in a file will likely violate these safety rules.
     ///
@@ -772,7 +813,7 @@ impl OsStr {
     #[inline]
     #[stable(feature = "os_str_bytes", since = "1.74.0")]
     pub unsafe fn from_encoded_bytes_unchecked(bytes: &[u8]) -> &Self {
-        Self::from_inner(Slice::from_encoded_bytes_unchecked(bytes))
+        Self::from_inner(unsafe { Slice::from_encoded_bytes_unchecked(bytes) })
     }
 
     #[inline]
@@ -953,7 +994,7 @@ impl OsStr {
     /// ASCII.
     ///
     /// Note: As the encoding is unspecified, any sub-slice of bytes that is not valid UTF-8 should
-    /// be treated as opaque and only comparable within the same rust version built for the same
+    /// be treated as opaque and only comparable within the same Rust version built for the same
     /// target platform.  For example, sending the slice over the network or storing it in a file
     /// will likely result in incompatible byte slices.  See [`OsString`] for more encoding details
     /// and [`std::ffi`] for platform-specific, specified conversions.
@@ -1146,6 +1187,32 @@ impl OsStr {
     #[stable(feature = "osstring_ascii", since = "1.53.0")]
     pub fn eq_ignore_ascii_case<S: AsRef<OsStr>>(&self, other: S) -> bool {
         self.inner.eq_ignore_ascii_case(&other.as_ref().inner)
+    }
+
+    /// Returns an object that implements [`Display`] for safely printing an
+    /// [`OsStr`] that may contain non-Unicode data. This may perform lossy
+    /// conversion, depending on the platform.  If you would like an
+    /// implementation which escapes the [`OsStr`] please use [`Debug`]
+    /// instead.
+    ///
+    /// [`Display`]: fmt::Display
+    /// [`Debug`]: fmt::Debug
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(os_str_display)]
+    /// use std::ffi::OsStr;
+    ///
+    /// let s = OsStr::new("Hello, world!");
+    /// println!("{}", s.display());
+    /// ```
+    #[unstable(feature = "os_str_display", issue = "120048")]
+    #[must_use = "this does not display the `OsStr`; \
+                  it returns an object that can be displayed"]
+    #[inline]
+    pub fn display(&self) -> Display<'_> {
+        Display { os_str: self }
     }
 }
 
@@ -1441,9 +1508,42 @@ impl fmt::Debug for OsStr {
     }
 }
 
-impl OsStr {
-    pub(crate) fn display(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.inner, formatter)
+/// Helper struct for safely printing an [`OsStr`] with [`format!`] and `{}`.
+///
+/// An [`OsStr`] might contain non-Unicode data. This `struct` implements the
+/// [`Display`] trait in a way that mitigates that. It is created by the
+/// [`display`](OsStr::display) method on [`OsStr`]. This may perform lossy
+/// conversion, depending on the platform. If you would like an implementation
+/// which escapes the [`OsStr`] please use [`Debug`] instead.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(os_str_display)]
+/// use std::ffi::OsStr;
+///
+/// let s = OsStr::new("Hello, world!");
+/// println!("{}", s.display());
+/// ```
+///
+/// [`Display`]: fmt::Display
+/// [`format!`]: crate::format
+#[unstable(feature = "os_str_display", issue = "120048")]
+pub struct Display<'a> {
+    os_str: &'a OsStr,
+}
+
+#[unstable(feature = "os_str_display", issue = "120048")]
+impl fmt::Debug for Display<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.os_str, f)
+    }
+}
+
+#[unstable(feature = "os_str_display", issue = "120048")]
+impl fmt::Display for Display<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.os_str.inner, f)
     }
 }
 

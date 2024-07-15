@@ -42,75 +42,83 @@
 // gdb-command:print *u64_ref
 // gdb-check:$12 = 64
 
+// gdb-command:print *f16_ref
+// gdb-check:$13 = 1.5
+
 // gdb-command:print *f32_ref
-// gdb-check:$13 = 2.5
+// gdb-check:$14 = 2.5
 
 // gdb-command:print *f64_ref
-// gdb-check:$14 = 3.5
+// gdb-check:$15 = 3.5
 
 
 // === LLDB TESTS ==================================================================================
 
 // lldb-command:run
-// lldb-command:print *bool_ref
-// lldbg-check:[...]$0 = true
+// lldb-command:v *bool_ref
+// lldbg-check:[...] true
 // lldbr-check:(bool) *bool_ref = true
 
-// lldb-command:print *int_ref
-// lldbg-check:[...]$1 = -1
+// lldb-command:v *int_ref
+// lldbg-check:[...] -1
 // lldbr-check:(isize) *int_ref = -1
 
 // NOTE: only rust-enabled lldb supports 32bit chars
 // lldbr-command:print *char_ref
 // lldbr-check:(char) *char_ref = 'a'
 
-// lldb-command:print *i8_ref
-// lldbg-check:[...]$2 = 'D'
+// lldb-command:v *i8_ref
+// lldbg-check:[...] 'D'
 // lldbr-check:(i8) *i8_ref = 68
 
-// lldb-command:print *i16_ref
-// lldbg-check:[...]$3 = -16
+// lldb-command:v *i16_ref
+// lldbg-check:[...] -16
 // lldbr-check:(i16) *i16_ref = -16
 
-// lldb-command:print *i32_ref
-// lldbg-check:[...]$4 = -32
+// lldb-command:v *i32_ref
+// lldbg-check:[...] -32
 // lldbr-check:(i32) *i32_ref = -32
 
-// lldb-command:print *i64_ref
-// lldbg-check:[...]$5 = -64
+// lldb-command:v *i64_ref
+// lldbg-check:[...] -64
 // lldbr-check:(i64) *i64_ref = -64
 
-// lldb-command:print *uint_ref
-// lldbg-check:[...]$6 = 1
+// lldb-command:v *uint_ref
+// lldbg-check:[...] 1
 // lldbr-check:(usize) *uint_ref = 1
 
-// lldb-command:print *u8_ref
-// lldbg-check:[...]$7 = 'd'
+// lldb-command:v *u8_ref
+// lldbg-check:[...] 'd'
 // lldbr-check:(u8) *u8_ref = 100
 
-// lldb-command:print *u16_ref
-// lldbg-check:[...]$8 = 16
+// lldb-command:v *u16_ref
+// lldbg-check:[...] 16
 // lldbr-check:(u16) *u16_ref = 16
 
-// lldb-command:print *u32_ref
-// lldbg-check:[...]$9 = 32
+// lldb-command:v *u32_ref
+// lldbg-check:[...] 32
 // lldbr-check:(u32) *u32_ref = 32
 
-// lldb-command:print *u64_ref
-// lldbg-check:[...]$10 = 64
+// lldb-command:v *u64_ref
+// lldbg-check:[...] 64
 // lldbr-check:(u64) *u64_ref = 64
 
-// lldb-command:print *f32_ref
-// lldbg-check:[...]$11 = 2.5
+// lldb-command:v *f16_ref
+// lldbg-check:[...] 1.5
+// lldbr-check:(f16) *f16_ref = 1.5
+
+// lldb-command:v *f32_ref
+// lldbg-check:[...] 2.5
 // lldbr-check:(f32) *f32_ref = 2.5
 
-// lldb-command:print *f64_ref
-// lldbg-check:[...]$12 = 3.5
+// lldb-command:v *f64_ref
+// lldbg-check:[...] 3.5
 // lldbr-check:(f64) *f64_ref = 3.5
 
 #![allow(unused_variables)]
 #![feature(omit_gdb_pretty_printer_section)]
 #![omit_gdb_pretty_printer_section]
+#![feature(f16)]
 
 fn main() {
     let bool_val: bool = true;
@@ -148,6 +156,9 @@ fn main() {
 
     let u64_val: u64 = 64;
     let u64_ref: &u64 = &u64_val;
+
+    let f16_val: f16 = 1.5;
+    let f16_ref: &f16 = &f16_val;
 
     let f32_val: f32 = 2.5;
     let f32_ref: &f32 = &f32_val;

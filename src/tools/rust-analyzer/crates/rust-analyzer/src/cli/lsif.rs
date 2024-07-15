@@ -4,14 +4,10 @@ use std::env;
 use std::time::Instant;
 
 use ide::{
-    Analysis, FileId, FileRange, MonikerKind, PackageInformation, RootDatabase, StaticIndex,
-    StaticIndexedFile, TokenId, TokenStaticData,
+    Analysis, AnalysisHost, FileId, FileRange, MonikerKind, PackageInformation, RootDatabase,
+    StaticIndex, StaticIndexedFile, TokenId, TokenStaticData,
 };
-use ide_db::{
-    base_db::salsa::{self, ParallelDatabase},
-    line_index::WideEncoding,
-    LineIndexDatabase,
-};
+use ide_db::{line_index::WideEncoding, LineIndexDatabase};
 use load_cargo::{load_workspace, LoadCargoConfig, ProcMacroServerChoice};
 use lsp_types::lsif;
 use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, RustLibSource};
@@ -24,14 +20,6 @@ use crate::{
     lsp::to_proto,
     version::version,
 };
-
-/// Need to wrap Snapshot to provide `Clone` impl for `map_with`
-struct Snap<DB>(DB);
-impl<DB: ParallelDatabase> Clone for Snap<salsa::Snapshot<DB>> {
-    fn clone(&self) -> Snap<salsa::Snapshot<DB>> {
-        Snap(self.0.snapshot())
-    }
-}
 
 struct LsifManager<'a> {
     count: i32,
@@ -295,13 +283,14 @@ impl flags::Lsif {
             with_proc_macro_server: ProcMacroServerChoice::Sysroot,
             prefill_caches: false,
         };
-        let path = AbsPathBuf::assert(env::current_dir()?.join(self.path));
+        let path = AbsPathBuf::assert_utf8(env::current_dir()?.join(self.path));
         let manifest = ProjectManifest::discover_single(&path)?;
 
         let workspace = ProjectWorkspace::load(manifest, &cargo_config, no_progress)?;
 
-        let (host, vfs, _proc_macro) =
+        let (db, vfs, _proc_macro) =
             load_workspace(workspace, &cargo_config.extra_env, &load_cargo_config)?;
+        let host = AnalysisHost::with_database(db);
         let db = host.raw_database();
         let analysis = host.analysis();
 

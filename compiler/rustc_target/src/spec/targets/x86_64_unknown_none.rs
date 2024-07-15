@@ -29,6 +29,12 @@ pub fn target() -> Target {
     };
     Target {
         llvm_target: "x86_64-unknown-none-elf".into(),
+        metadata: crate::spec::TargetMetadata {
+            description: Some("Freestanding/bare-metal x86_64 softfloat".into()),
+            tier: Some(2),
+            host_tools: Some(false),
+            std: Some(false),
+        },
         pointer_width: 64,
         data_layout:
             "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into(),

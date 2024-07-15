@@ -1,10 +1,12 @@
 //! Least upper bound. See [`lattice`].
 
-use super::combine::{CombineFields, ObligationEmittingRelation};
+use super::combine::{CombineFields, PredicateEmittingRelation};
 use super::lattice::{self, LatticeDir};
+use super::StructurallyRelateAliases;
 use crate::infer::{DefineOpaqueTypes, InferCtxt, SubregionOrigin};
-use crate::traits::{ObligationCause, PredicateObligations};
+use crate::traits::ObligationCause;
 
+use rustc_middle::traits::solve::Goal;
 use rustc_middle::ty::relate::{Relate, RelateResult, TypeRelation};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::Span;
@@ -12,19 +14,15 @@ use rustc_span::Span;
 /// "Least upper bound" (common supertype)
 pub struct Lub<'combine, 'infcx, 'tcx> {
     fields: &'combine mut CombineFields<'infcx, 'tcx>,
-    a_is_expected: bool,
 }
 
 impl<'combine, 'infcx, 'tcx> Lub<'combine, 'infcx, 'tcx> {
-    pub fn new(
-        fields: &'combine mut CombineFields<'infcx, 'tcx>,
-        a_is_expected: bool,
-    ) -> Lub<'combine, 'infcx, 'tcx> {
-        Lub { fields, a_is_expected }
+    pub fn new(fields: &'combine mut CombineFields<'infcx, 'tcx>) -> Lub<'combine, 'infcx, 'tcx> {
+        Lub { fields }
     }
 }
 
-impl<'tcx> TypeRelation<'tcx> for Lub<'_, '_, 'tcx> {
+impl<'tcx> TypeRelation<TyCtxt<'tcx>> for Lub<'_, '_, 'tcx> {
     fn tag(&self) -> &'static str {
         "Lub"
     }
@@ -33,23 +31,19 @@ impl<'tcx> TypeRelation<'tcx> for Lub<'_, '_, 'tcx> {
         self.fields.tcx()
     }
 
-    fn a_is_expected(&self) -> bool {
-        self.a_is_expected
-    }
-
-    fn relate_with_variance<T: Relate<'tcx>>(
+    fn relate_with_variance<T: Relate<TyCtxt<'tcx>>>(
         &mut self,
         variance: ty::Variance,
-        _info: ty::VarianceDiagInfo<'tcx>,
+        _info: ty::VarianceDiagInfo<TyCtxt<'tcx>>,
         a: T,
         b: T,
     ) -> RelateResult<'tcx, T> {
         match variance {
-            ty::Invariant => self.fields.equate(self.a_is_expected).relate(a, b),
+            ty::Invariant => self.fields.equate(StructurallyRelateAliases::No).relate(a, b),
             ty::Covariant => self.relate(a, b),
             // FIXME(#41044) -- not correct, need test
             ty::Bivariant => Ok(a),
-            ty::Contravariant => self.fields.glb(self.a_is_expected).relate(a, b),
+            ty::Contravariant => self.fields.glb().relate(a, b),
         }
     }
 
@@ -88,7 +82,7 @@ impl<'tcx> TypeRelation<'tcx> for Lub<'_, '_, 'tcx> {
         b: ty::Binder<'tcx, T>,
     ) -> RelateResult<'tcx, ty::Binder<'tcx, T>>
     where
-        T: Relate<'tcx>,
+        T: Relate<TyCtxt<'tcx>>,
     {
         // LUB of a binder and itself is just itself
         if a == b {
@@ -100,12 +94,7 @@ impl<'tcx> TypeRelation<'tcx> for Lub<'_, '_, 'tcx> {
             // When higher-ranked types are involved, computing the LUB is
             // very challenging, switch to invariance. This is obviously
             // overly conservative but works ok in practice.
-            self.relate_with_variance(
-                ty::Variance::Invariant,
-                ty::VarianceDiagInfo::default(),
-                a,
-                b,
-            )?;
+            self.relate_with_variance(ty::Invariant, ty::VarianceDiagInfo::default(), a, b)?;
             Ok(a)
         } else {
             Ok(ty::Binder::dummy(self.relate(a.skip_binder(), b.skip_binder())?))
@@ -123,7 +112,7 @@ impl<'combine, 'infcx, 'tcx> LatticeDir<'infcx, 'tcx> for Lub<'combine, 'infcx, 
     }
 
     fn relate_bound(&mut self, v: Ty<'tcx>, a: Ty<'tcx>, b: Ty<'tcx>) -> RelateResult<'tcx, ()> {
-        let mut sub = self.fields.sub(self.a_is_expected);
+        let mut sub = self.fields.sub();
         sub.relate(a, v)?;
         sub.relate(b, v)?;
         Ok(())
@@ -134,25 +123,39 @@ impl<'combine, 'infcx, 'tcx> LatticeDir<'infcx, 'tcx> for Lub<'combine, 'infcx, 
     }
 }
 
-impl<'tcx> ObligationEmittingRelation<'tcx> for Lub<'_, '_, 'tcx> {
+impl<'tcx> PredicateEmittingRelation<InferCtxt<'tcx>> for Lub<'_, '_, 'tcx> {
     fn span(&self) -> Span {
         self.fields.trace.span()
+    }
+
+    fn structurally_relate_aliases(&self) -> StructurallyRelateAliases {
+        StructurallyRelateAliases::No
     }
 
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         self.fields.param_env
     }
 
-    fn register_predicates(&mut self, obligations: impl IntoIterator<Item: ty::ToPredicate<'tcx>>) {
+    fn register_predicates(
+        &mut self,
+        obligations: impl IntoIterator<Item: ty::Upcast<TyCtxt<'tcx>, ty::Predicate<'tcx>>>,
+    ) {
         self.fields.register_predicates(obligations);
     }
 
-    fn register_obligations(&mut self, obligations: PredicateObligations<'tcx>) {
+    fn register_goals(
+        &mut self,
+        obligations: impl IntoIterator<Item = Goal<'tcx, ty::Predicate<'tcx>>>,
+    ) {
         self.fields.register_obligations(obligations)
     }
 
-    fn alias_relate_direction(&self) -> ty::AliasRelationDirection {
-        // FIXME(deferred_projection_equality): This isn't right, I think?
-        ty::AliasRelationDirection::Equate
+    fn register_alias_relate_predicate(&mut self, a: Ty<'tcx>, b: Ty<'tcx>) {
+        self.register_predicates([ty::Binder::dummy(ty::PredicateKind::AliasRelate(
+            a.into(),
+            b.into(),
+            // FIXME(deferred_projection_equality): This isn't right, I think?
+            ty::AliasRelationDirection::Equate,
+        ))]);
     }
 }

@@ -8,9 +8,9 @@ use rustc_arena::DroplessArena;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::query::Providers;
+use rustc_middle::span_bug;
 use rustc_middle::ty::{self, CrateVariancesMap, GenericArgsRef, Ty, TyCtxt};
 use rustc_middle::ty::{TypeSuperVisitable, TypeVisitable};
-use std::ops::ControlFlow;
 
 /// Defines the `TermsContext` basically houses an arena where we can
 /// allocate terms.
@@ -22,8 +22,7 @@ mod constraints;
 /// Code to solve constraints and write out the results.
 mod solve;
 
-/// Code to write unit tests of variance.
-pub mod test;
+pub(crate) mod dump;
 
 /// Code for transforming variances.
 mod xform;
@@ -41,7 +40,7 @@ fn crate_variances(tcx: TyCtxt<'_>, (): ()) -> CrateVariancesMap<'_> {
 
 fn variances_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[ty::Variance] {
     // Skip items with no generics - there's nothing to infer in them.
-    if tcx.generics_of(item_def_id).count() == 0 {
+    if tcx.generics_of(item_def_id).is_empty() {
         return &[];
     }
 
@@ -89,15 +88,14 @@ fn variance_of_opaque(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[ty::Varianc
 
     impl<'tcx> OpaqueTypeLifetimeCollector<'tcx> {
         #[instrument(level = "trace", skip(self), ret)]
-        fn visit_opaque(&mut self, def_id: DefId, args: GenericArgsRef<'tcx>) -> ControlFlow<!> {
+        fn visit_opaque(&mut self, def_id: DefId, args: GenericArgsRef<'tcx>) {
             if def_id != self.root_def_id && self.tcx.is_descendant_of(def_id, self.root_def_id) {
                 let child_variances = self.tcx.variances_of(def_id);
                 for (a, v) in args.iter().zip_eq(child_variances) {
                     if *v != ty::Bivariant {
-                        a.visit_with(self)?;
+                        a.visit_with(self);
                     }
                 }
-                ControlFlow::Continue(())
             } else {
                 args.visit_with(self)
             }
@@ -106,20 +104,19 @@ fn variance_of_opaque(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[ty::Varianc
 
     impl<'tcx> ty::TypeVisitor<TyCtxt<'tcx>> for OpaqueTypeLifetimeCollector<'tcx> {
         #[instrument(level = "trace", skip(self), ret)]
-        fn visit_region(&mut self, r: ty::Region<'tcx>) -> ControlFlow<Self::BreakTy> {
+        fn visit_region(&mut self, r: ty::Region<'tcx>) {
             if let ty::RegionKind::ReEarlyParam(ebr) = r.kind() {
                 self.variances[ebr.index as usize] = ty::Invariant;
             }
-            ControlFlow::Continue(())
         }
 
         #[instrument(level = "trace", skip(self), ret)]
-        fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
+        fn visit_ty(&mut self, t: Ty<'tcx>) {
             match t.kind() {
                 ty::Alias(_, ty::AliasTy { def_id, args, .. })
                     if matches!(self.tcx.def_kind(*def_id), DefKind::OpaqueTy) =>
                 {
-                    self.visit_opaque(*def_id, args)
+                    self.visit_opaque(*def_id, args);
                 }
                 _ => t.super_visit_with(self),
             }
@@ -128,15 +125,7 @@ fn variance_of_opaque(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[ty::Varianc
 
     // By default, RPIT are invariant wrt type and const generics, but they are bivariant wrt
     // lifetime generics.
-    let variances = std::iter::repeat(ty::Invariant).take(generics.count());
-
-    let mut variances: Vec<_> = match tcx.opaque_type_origin(item_def_id) {
-        rustc_hir::OpaqueTyOrigin::FnReturn(_) | rustc_hir::OpaqueTyOrigin::AsyncFn(_) => {
-            variances.collect()
-        }
-        // But TAIT are invariant for all generics
-        rustc_hir::OpaqueTyOrigin::TyAlias { .. } => return tcx.arena.alloc_from_iter(variances),
-    };
+    let mut variances = vec![ty::Invariant; generics.count()];
 
     // Mark all lifetimes from parent generics as unused (Bivariant).
     // This will be overridden later if required.
@@ -144,7 +133,7 @@ fn variance_of_opaque(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[ty::Varianc
         let mut generics = generics;
         while let Some(def_id) = generics.parent {
             generics = tcx.generics_of(def_id);
-            for param in &generics.params {
+            for param in &generics.own_params {
                 match param.kind {
                     ty::GenericParamDefKind::Lifetime => {
                         variances[param.index as usize] = ty::Bivariant;
@@ -177,7 +166,7 @@ fn variance_of_opaque(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[ty::Varianc
                 }
             }
             ty::ClauseKind::Projection(ty::ProjectionPredicate {
-                projection_ty: ty::AliasTy { args, .. },
+                projection_term: ty::AliasTerm { args, .. },
                 term,
             }) => {
                 for arg in &args[1..] {

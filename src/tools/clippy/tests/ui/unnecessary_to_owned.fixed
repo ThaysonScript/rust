@@ -157,6 +157,25 @@ fn main() {
     require_path(&std::path::PathBuf::from("x"));
     require_str(&String::from("x"));
     require_slice(&[String::from("x")]);
+
+    let slice = [0u8; 1024];
+    let _ref_str: &str = core::str::from_utf8(&slice).expect("not UTF-8");
+    let _ref_str: &str = core::str::from_utf8(b"foo").unwrap();
+    let _ref_str: &str = core::str::from_utf8(b"foo".as_slice()).unwrap();
+    // Expression is of type `&String`, can't suggest `str::from_utf8` here
+    let _ref_string = &String::from_utf8(b"foo".to_vec()).unwrap();
+    macro_rules! arg_from_macro {
+        () => {
+            b"foo".to_vec()
+        };
+    }
+    macro_rules! string_from_utf8_from_macro {
+        () => {
+            &String::from_utf8(b"foo".to_vec()).unwrap()
+        };
+    }
+    let _ref_str: &str = &String::from_utf8(arg_from_macro!()).unwrap();
+    let _ref_str: &str = string_from_utf8_from_macro!();
 }
 
 fn require_c_str(_: &CStr) {}
@@ -529,4 +548,40 @@ mod issue_11952 {
     fn bar() {
         IntoFuture::into_future(foo([], &0));
     }
+}
+
+fn borrow_checks() {
+    use std::borrow::Borrow;
+    use std::collections::HashSet;
+
+    fn inner(a: &[&str]) {
+        let mut s = HashSet::from([vec!["a"]]);
+        s.remove(a); //~ ERROR: unnecessary use of `to_vec`
+    }
+
+    let mut s = HashSet::from(["a".to_string()]);
+    s.remove("b"); //~ ERROR: unnecessary use of `to_owned`
+    s.remove("b"); //~ ERROR: unnecessary use of `to_string`
+    // Should not warn.
+    s.remove("b");
+
+    let mut s = HashSet::from([vec!["a"]]);
+    s.remove(["b"].as_slice()); //~ ERROR: unnecessary use of `to_vec`
+    s.remove((&["b"]).as_slice()); //~ ERROR: unnecessary use of `to_vec`
+
+    // Should not warn.
+    s.remove(&["b"].to_vec().clone());
+    s.remove(["a"].as_slice());
+
+    trait SetExt {
+        fn foo<Q: Borrow<str>>(&self, _: &String);
+    }
+
+    impl<K> SetExt for HashSet<K> {
+        fn foo<Q: Borrow<str>>(&self, _: &String) {}
+    }
+
+    // Should not lint!
+    HashSet::<i32>::new().foo::<&str>(&"".to_owned());
+    HashSet::<String>::new().get(&1.to_string());
 }

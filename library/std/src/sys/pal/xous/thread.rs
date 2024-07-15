@@ -81,7 +81,7 @@ impl Thread {
             // Destroy TLS, which will free the TLS page and call the destructor for
             // any thread local storage (if any).
             unsafe {
-                crate::sys::thread_local_key::destroy_tls();
+                crate::sys::thread_local::key::destroy_tls();
             }
 
             // Deallocate the stack memory, along with the guard pages. Afterwards,
@@ -135,14 +135,4 @@ impl Thread {
 pub fn available_parallelism() -> io::Result<NonZero<usize>> {
     // We're unicore right now.
     Ok(unsafe { NonZero::new_unchecked(1) })
-}
-
-pub mod guard {
-    pub type Guard = !;
-    pub unsafe fn current() -> Option<Guard> {
-        None
-    }
-    pub unsafe fn init() -> Option<Guard> {
-        None
-    }
 }

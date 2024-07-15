@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_hir_and_then;
-use clippy_utils::source::snippet;
+use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::{is_lint_allowed, path_to_local, search_same, SpanlessEq, SpanlessHash};
 use core::cmp::Ordering;
 use core::{iter, slice};
@@ -9,9 +9,9 @@ use rustc_errors::Applicability;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{Arm, Expr, ExprKind, HirId, HirIdMap, HirIdMapEntry, HirIdSet, Pat, PatKind, RangeEnd};
 use rustc_lint::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
-use rustc_lint::LateContext;
+use rustc_lint::{LateContext, LintContext};
 use rustc_middle::ty;
-use rustc_span::{ErrorGuaranteed, Symbol};
+use rustc_span::{ErrorGuaranteed, Span, Symbol};
 
 use super::MATCH_SAME_ARMS;
 
@@ -64,54 +64,68 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
         let min_index = usize::min(lindex, rindex);
         let max_index = usize::max(lindex, rindex);
 
-        let mut local_map: HirIdMap<HirId> = HirIdMap::default();
-        let eq_fallback = |a: &Expr<'_>, b: &Expr<'_>| {
-            if let Some(a_id) = path_to_local(a)
-                && let Some(b_id) = path_to_local(b)
-                && let entry = match local_map.entry(a_id) {
-                    HirIdMapEntry::Vacant(entry) => entry,
-                    // check if using the same bindings as before
-                    HirIdMapEntry::Occupied(entry) => return *entry.get() == b_id,
-                }
+        let check_eq_with_pat = |expr_a: &Expr<'_>, expr_b: &Expr<'_>| {
+            let mut local_map: HirIdMap<HirId> = HirIdMap::default();
+            let eq_fallback = |a: &Expr<'_>, b: &Expr<'_>| {
+                if let Some(a_id) = path_to_local(a)
+                    && let Some(b_id) = path_to_local(b)
+                    && let entry = match local_map.entry(a_id) {
+                        HirIdMapEntry::Vacant(entry) => entry,
+                        // check if using the same bindings as before
+                        HirIdMapEntry::Occupied(entry) => return *entry.get() == b_id,
+                    }
                 // the names technically don't have to match; this makes the lint more conservative
                 && cx.tcx.hir().name(a_id) == cx.tcx.hir().name(b_id)
-                && cx.typeck_results().expr_ty(a) == cx.typeck_results().expr_ty(b)
-                && pat_contains_local(lhs.pat, a_id)
-                && pat_contains_local(rhs.pat, b_id)
-            {
-                entry.insert(b_id);
-                true
-            } else {
-                false
-            }
-        };
-        // Arms with a guard are ignored, those can’t always be merged together
-        // If both arms overlap with an arm in between then these can't be merged either.
-        !(backwards_blocking_idxs[max_index] > min_index && forwards_blocking_idxs[min_index] < max_index)
-                && lhs.guard.is_none()
-                && rhs.guard.is_none()
-                && SpanlessEq::new(cx)
-                    .expr_fallback(eq_fallback)
-                    .eq_expr(lhs.body, rhs.body)
+                    && cx.typeck_results().expr_ty(a) == cx.typeck_results().expr_ty(b)
+                    && pat_contains_local(lhs.pat, a_id)
+                    && pat_contains_local(rhs.pat, b_id)
+                {
+                    entry.insert(b_id);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            SpanlessEq::new(cx)
+                .expr_fallback(eq_fallback)
+                .eq_expr(expr_a, expr_b)
                 // these checks could be removed to allow unused bindings
                 && bindings_eq(lhs.pat, local_map.keys().copied().collect())
                 && bindings_eq(rhs.pat, local_map.values().copied().collect())
+        };
+
+        let check_same_guard = || match (&lhs.guard, &rhs.guard) {
+            (None, None) => true,
+            (Some(lhs_guard), Some(rhs_guard)) => check_eq_with_pat(lhs_guard, rhs_guard),
+            _ => false,
+        };
+
+        let check_same_body = || check_eq_with_pat(lhs.body, rhs.body);
+
+        // Arms with different guard are ignored, those can’t always be merged together
+        // If both arms overlap with an arm in between then these can't be merged either.
+        !(backwards_blocking_idxs[max_index] > min_index && forwards_blocking_idxs[min_index] < max_index)
+            && check_same_guard()
+            && check_same_body()
     };
 
+    let mut appl = Applicability::MaybeIncorrect;
     let indexed_arms: Vec<(usize, &Arm<'_>)> = arms.iter().enumerate().collect();
     for (&(i, arm1), &(j, arm2)) in search_same(&indexed_arms, hash, eq) {
         if matches!(arm2.pat.kind, PatKind::Wild) {
             if !cx.tcx.features().non_exhaustive_omitted_patterns_lint
                 || is_lint_allowed(cx, NON_EXHAUSTIVE_OMITTED_PATTERNS, arm2.hir_id)
             {
+                let arm_span = adjusted_arm_span(cx, arm1.span);
                 span_lint_hir_and_then(
                     cx,
                     MATCH_SAME_ARMS,
                     arm1.hir_id,
-                    arm1.span,
+                    arm_span,
                     "this match arm has an identical body to the `_` wildcard arm",
                     |diag| {
-                        diag.span_suggestion(arm1.span, "try removing the arm", "", Applicability::MaybeIncorrect)
+                        diag.span_suggestion(arm_span, "try removing the arm", "", appl)
                             .help("or try changing either arm body")
                             .span_note(arm2.span, "`_` wildcard arm here");
                     },
@@ -132,21 +146,34 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                 keep_arm.span,
                 "this match arm has an identical body to another arm",
                 |diag| {
-                    let move_pat_snip = snippet(cx, move_arm.pat.span, "<pat2>");
-                    let keep_pat_snip = snippet(cx, keep_arm.pat.span, "<pat1>");
+                    let move_pat_snip = snippet_with_applicability(cx, move_arm.pat.span, "<pat2>", &mut appl);
+                    let keep_pat_snip = snippet_with_applicability(cx, keep_arm.pat.span, "<pat1>", &mut appl);
 
                     diag.span_suggestion(
                         keep_arm.pat.span,
-                        "try merging the arm patterns",
+                        "or try merging the arm patterns",
                         format!("{keep_pat_snip} | {move_pat_snip}"),
-                        Applicability::MaybeIncorrect,
+                        appl,
                     )
-                    .help("or try changing either arm body")
-                    .span_note(move_arm.span, "other arm here");
+                    .span_suggestion(
+                        adjusted_arm_span(cx, move_arm.span),
+                        "and remove this obsolete arm",
+                        "",
+                        appl,
+                    )
+                    .help("try changing either arm body");
                 },
             );
         }
     }
+}
+
+/// Extend arm's span to include the comma and whitespaces after it.
+fn adjusted_arm_span(cx: &LateContext<'_>, span: Span) -> Span {
+    let source_map = cx.sess().source_map();
+    source_map
+        .span_extend_while(span, |c| c == ',' || c.is_ascii_whitespace())
+        .unwrap_or(span)
 }
 
 #[derive(Clone, Copy)]
@@ -231,7 +258,7 @@ impl<'a> NormalizedPat<'a> {
     fn from_pat(cx: &LateContext<'_>, arena: &'a DroplessArena, pat: &'a Pat<'_>) -> Self {
         match pat.kind {
             PatKind::Wild | PatKind::Binding(.., None) => Self::Wild,
-            PatKind::Binding(.., Some(pat)) | PatKind::Box(pat) | PatKind::Ref(pat, _) => {
+            PatKind::Binding(.., Some(pat)) | PatKind::Box(pat) | PatKind::Deref(pat) | PatKind::Ref(pat, _) => {
                 Self::from_pat(cx, arena, pat)
             },
             PatKind::Never => Self::Never,

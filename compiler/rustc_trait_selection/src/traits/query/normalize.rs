@@ -2,23 +2,22 @@
 //! which folds deeply, invoking the underlying
 //! `normalize_canonicalized_projection_ty` query when it encounters projections.
 
+use crate::error_reporting::traits::OverflowCause;
+use crate::error_reporting::traits::TypeErrCtxtOverflowExt;
 use crate::infer::at::At;
 use crate::infer::canonical::OriginalQueryValues;
 use crate::infer::{InferCtxt, InferOk};
-use crate::traits::error_reporting::OverflowCause;
-use crate::traits::error_reporting::TypeErrCtxtExt;
 use crate::traits::normalize::needs_normalization;
-use crate::traits::{BoundVarReplacer, PlaceholderReplacer};
+use crate::traits::Normalized;
+use crate::traits::{BoundVarReplacer, PlaceholderReplacer, ScrubbedTraitError};
 use crate::traits::{ObligationCause, PredicateObligation, Reveal};
 use rustc_data_structures::sso::SsoHashMap;
 use rustc_data_structures::stack::ensure_sufficient_stack;
-use rustc_infer::traits::Normalized;
+use rustc_macros::extension;
 use rustc_middle::ty::fold::{FallibleTypeFolder, TypeFoldable, TypeSuperFoldable};
 use rustc_middle::ty::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitor};
 use rustc_span::DUMMY_SP;
-
-use std::ops::ControlFlow;
 
 use super::NoSolution;
 
@@ -77,7 +76,9 @@ impl<'cx, 'tcx> At<'cx, 'tcx> {
         };
 
         if self.infcx.next_trait_solver() {
-            match crate::solve::deeply_normalize_with_skipped_universes(self, value, universes) {
+            match crate::solve::deeply_normalize_with_skipped_universes::<_, ScrubbedTraitError<'tcx>>(
+                self, value, universes,
+            ) {
                 Ok(value) => return Ok(Normalized { value, obligations: vec![] }),
                 Err(_errors) => {
                     return Err(NoSolution);
@@ -123,28 +124,23 @@ struct MaxEscapingBoundVarVisitor {
 }
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for MaxEscapingBoundVarVisitor {
-    fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(
-        &mut self,
-        t: &ty::Binder<'tcx, T>,
-    ) -> ControlFlow<Self::BreakTy> {
+    fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(&mut self, t: &ty::Binder<'tcx, T>) {
         self.outer_index.shift_in(1);
-        let result = t.super_visit_with(self);
+        t.super_visit_with(self);
         self.outer_index.shift_out(1);
-        result
     }
 
     #[inline]
-    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
+    fn visit_ty(&mut self, t: Ty<'tcx>) {
         if t.outer_exclusive_binder() > self.outer_index {
             self.escaping = self
                 .escaping
                 .max(t.outer_exclusive_binder().as_usize() - self.outer_index.as_usize());
         }
-        ControlFlow::Continue(())
     }
 
     #[inline]
-    fn visit_region(&mut self, r: ty::Region<'tcx>) -> ControlFlow<Self::BreakTy> {
+    fn visit_region(&mut self, r: ty::Region<'tcx>) {
         match *r {
             ty::ReBound(debruijn, _) if debruijn > self.outer_index => {
                 self.escaping =
@@ -152,16 +148,14 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for MaxEscapingBoundVarVisitor {
             }
             _ => {}
         }
-        ControlFlow::Continue(())
     }
 
-    fn visit_const(&mut self, ct: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
+    fn visit_const(&mut self, ct: ty::Const<'tcx>) {
         if ct.outer_exclusive_binder() > self.outer_index {
             self.escaping = self
                 .escaping
                 .max(ct.outer_exclusive_binder().as_usize() - self.outer_index.as_usize());
         }
-        ControlFlow::Continue(())
     }
 }
 
@@ -178,7 +172,7 @@ struct QueryNormalizer<'cx, 'tcx> {
 impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> {
     type Error = NoSolution;
 
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.infcx.tcx
     }
 
@@ -223,27 +217,27 @@ impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> 
 
                     Reveal::All => {
                         let args = data.args.try_fold_with(self)?;
-                        let recursion_limit = self.interner().recursion_limit();
+                        let recursion_limit = self.cx().recursion_limit();
 
                         if !recursion_limit.value_within_limit(self.anon_depth) {
                             let guar = self
                                 .infcx
                                 .err_ctxt()
                                 .build_overflow_error(
-                                    OverflowCause::DeeplyNormalize(data),
+                                    OverflowCause::DeeplyNormalize(data.into()),
                                     self.cause.span,
                                     true,
                                 )
                                 .delay_as_bug();
-                            return Ok(Ty::new_error(self.interner(), guar));
+                            return Ok(Ty::new_error(self.cx(), guar));
                         }
 
-                        let generic_ty = self.interner().type_of(data.def_id);
-                        let mut concrete_ty = generic_ty.instantiate(self.interner(), args);
+                        let generic_ty = self.cx().type_of(data.def_id);
+                        let mut concrete_ty = generic_ty.instantiate(self.cx(), args);
                         self.anon_depth += 1;
                         if concrete_ty == ty {
                             concrete_ty = Ty::new_error_with_message(
-                                self.interner(),
+                                self.cx(),
                                 DUMMY_SP,
                                 "recursive opaque type",
                             );

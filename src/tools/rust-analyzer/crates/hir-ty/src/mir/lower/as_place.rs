@@ -1,5 +1,7 @@
 //! MIR lowering for places
 
+use crate::mir::MutBorrowKind;
+
 use super::*;
 use hir_def::FunctionId;
 use hir_expand::name;
@@ -288,7 +290,7 @@ impl MirLowerCtx<'_> {
             Some((_, _, mutability)) => mutability,
             None => Mutability::Not,
         };
-        let result_ref = TyKind::Ref(mutability, static_lifetime(), result_ty).intern(Interner);
+        let result_ref = TyKind::Ref(mutability, error_lifetime(), result_ty).intern(Interner);
         let mut result: Place = self.temp(result_ref, current, span)?.into();
         let index_fn_op = Operand::const_zst(
             TyKind::FnDef(
@@ -328,11 +330,11 @@ impl MirLowerCtx<'_> {
                 Mutability::Mut,
                 LangItem::DerefMut,
                 name![deref_mut],
-                BorrowKind::Mut { allow_two_phase_borrow: false },
+                BorrowKind::Mut { kind: MutBorrowKind::Default },
             )
         };
-        let ty_ref = TyKind::Ref(chalk_mut, static_lifetime(), source_ty.clone()).intern(Interner);
-        let target_ty_ref = TyKind::Ref(chalk_mut, static_lifetime(), target_ty).intern(Interner);
+        let ty_ref = TyKind::Ref(chalk_mut, error_lifetime(), source_ty.clone()).intern(Interner);
+        let target_ty_ref = TyKind::Ref(chalk_mut, error_lifetime(), target_ty).intern(Interner);
         let ref_place: Place = self.temp(ty_ref, current, span)?.into();
         self.push_assignment(current, ref_place, Rvalue::Ref(borrow_kind, place), span);
         let deref_trait = self

@@ -78,7 +78,7 @@ use std::num::NonZero;
 
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_errors::ErrorGuaranteed;
-use rustc_errors::{pluralize, struct_span_code_err, DiagnosticBuilder};
+use rustc_errors::{pluralize, struct_span_code_err, Diag};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::Visitor;
 use rustc_index::bit_set::BitSet;
@@ -90,18 +90,20 @@ use rustc_middle::query::Providers;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::ty::{GenericArgs, GenericArgsRef};
+use rustc_middle::{bug, span_bug};
 use rustc_session::parse::feature_err;
-use rustc_span::symbol::{kw, Ident};
-use rustc_span::{self, def_id::CRATE_DEF_ID, BytePos, Span, Symbol, DUMMY_SP};
+use rustc_span::symbol::{kw, sym, Ident};
+use rustc_span::{def_id::CRATE_DEF_ID, BytePos, Span, Symbol, DUMMY_SP};
 use rustc_target::abi::VariantIdx;
 use rustc_target::spec::abi::Abi;
-use rustc_trait_selection::traits::error_reporting::suggestions::ReturnsVisitor;
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt as _;
+use rustc_trait_selection::error_reporting::traits::suggestions::{
+    ReturnsVisitor, TypeErrCtxtExt as _,
+};
+use rustc_trait_selection::error_reporting::traits::TypeErrCtxtExt as _;
 use rustc_trait_selection::traits::ObligationCtxt;
 
 use crate::errors;
 use crate::require_c_abi_if_c_variadic;
-use crate::util::common::indenter;
 
 use self::compare_impl_item::collect_return_position_impl_trait_in_trait_tys;
 use self::region::region_scope_tree;
@@ -110,6 +112,7 @@ pub fn provide(providers: &mut Providers) {
     wfcheck::provide(providers);
     *providers = Providers {
         adt_destructor,
+        adt_async_destructor,
         region_scope_tree,
         collect_return_position_impl_trait_in_trait_tys,
         compare_impl_const: compare_impl_item::compare_impl_const_raw,
@@ -122,6 +125,10 @@ fn adt_destructor(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::Destructor>
     tcx.calculate_dtor(def_id.to_def_id(), dropck::check_drop_impl)
 }
 
+fn adt_async_destructor(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::AsyncDestructor> {
+    tcx.calculate_async_dtor(def_id.to_def_id(), dropck::check_drop_impl)
+}
+
 /// Given a `DefId` for an opaque type in return position, find its parent item's return
 /// expressions.
 fn get_owner_return_paths(
@@ -130,7 +137,7 @@ fn get_owner_return_paths(
 ) -> Option<(LocalDefId, ReturnsVisitor<'_>)> {
     let hir_id = tcx.local_def_id_to_hir_id(def_id);
     let parent_id = tcx.hir().get_parent_item(hir_id).def_id;
-    tcx.opt_hir_node_by_def_id(parent_id).and_then(|node| node.body_id()).map(|body_id| {
+    tcx.hir_node_by_def_id(parent_id).body_id().map(|body_id| {
         let body = tcx.hir().body(body_id);
         let mut visitor = ReturnsVisitor::default();
         visitor.visit_body(body);
@@ -142,7 +149,7 @@ fn get_owner_return_paths(
 /// as they must always be defined by the compiler.
 // FIXME: Move this to a more appropriate place.
 pub fn forbid_intrinsic_abi(tcx: TyCtxt<'_>, sp: Span, abi: Abi) {
-    if let Abi::RustIntrinsic | Abi::PlatformIntrinsic = abi {
+    if let Abi::RustIntrinsic = abi {
         tcx.dcx().span_err(sp, "intrinsic must be in `extern \"rust-intrinsic\" { ... }` block");
     }
 }
@@ -204,11 +211,18 @@ fn missing_items_err(
         .collect::<Vec<_>>()
         .join("`, `");
 
-    // `Span` before impl block closing brace.
-    let hi = full_impl_span.hi() - BytePos(1);
-    // Point at the place right before the closing brace of the relevant `impl` to suggest
-    // adding the associated item at the end of its body.
-    let sugg_sp = full_impl_span.with_lo(hi).with_hi(hi);
+    let sugg_sp = if let Ok(snippet) = tcx.sess.source_map().span_to_snippet(full_impl_span)
+        && snippet.ends_with("}")
+    {
+        // `Span` before impl block closing brace.
+        let hi = full_impl_span.hi() - BytePos(1);
+        // Point at the place right before the closing brace of the relevant `impl` to suggest
+        // adding the associated item at the end of its body.
+        full_impl_span.with_lo(hi).with_hi(hi)
+    } else {
+        full_impl_span.shrink_to_hi()
+    };
+
     // Obtain the level of indentation ending in `sugg_sp`.
     let padding =
         tcx.sess.source_map().indentation_before(sugg_sp).unwrap_or_else(|| String::new());
@@ -291,12 +305,16 @@ fn default_body_is_unstable(
         reason: reason_str,
     });
 
+    let inject_span = item_did
+        .as_local()
+        .and_then(|id| tcx.crate_level_attribute_injection_span(tcx.local_def_id_to_hir_id(id)));
     rustc_session::parse::add_feature_diagnostics_for_issue(
         &mut err,
         &tcx.sess,
         feature,
         rustc_feature::GateIssue::Library(issue),
         false,
+        inject_span,
     );
 
     err.emit();
@@ -338,9 +356,10 @@ fn bounds_from_generic_predicates<'tcx>(
                 let mut projections_str = vec![];
                 for projection in &projections {
                     let p = projection.skip_binder();
-                    let alias_ty = p.projection_ty;
-                    if bound == tcx.parent(alias_ty.def_id) && alias_ty.self_ty() == ty {
-                        let name = tcx.item_name(alias_ty.def_id);
+                    if bound == tcx.parent(p.projection_term.def_id)
+                        && p.projection_term.self_ty() == ty
+                    {
+                        let name = tcx.item_name(p.projection_term.def_id);
                         projections_str.push(format!("{} = {}", name, p.term));
                     }
                 }
@@ -427,9 +446,11 @@ fn fn_sig_suggestion<'tcx>(
 
     let asyncness = if tcx.asyncness(assoc.def_id).is_async() {
         output = if let ty::Alias(_, alias_ty) = *output.kind() {
-            tcx.explicit_item_bounds(alias_ty.def_id)
+            tcx.explicit_item_super_predicates(alias_ty.def_id)
                 .iter_instantiated_copied(tcx, alias_ty.args)
-                .find_map(|(bound, _)| bound.as_projection_clause()?.no_bound_vars()?.term.ty())
+                .find_map(|(bound, _)| {
+                    bound.as_projection_clause()?.no_bound_vars()?.term.as_type()
+                })
                 .unwrap_or_else(|| {
                     span_bug!(
                         ident.span,
@@ -449,7 +470,7 @@ fn fn_sig_suggestion<'tcx>(
 
     let output = if !output.is_unit() { format!(" -> {output}") } else { String::new() };
 
-    let unsafety = sig.unsafety.prefix_str();
+    let safety = sig.safety.prefix_str();
     let (generics, where_clauses) = bounds_from_generic_predicates(tcx, predicates);
 
     // FIXME: this is not entirely correct, as the lifetimes from borrowed params will
@@ -457,20 +478,7 @@ fn fn_sig_suggestion<'tcx>(
     // lifetimes between the `impl` and the `trait`, but this should be good enough to
     // fill in a significant portion of the missing code, and other subsequent
     // suggestions can help the user fix the code.
-    format!(
-        "{unsafety}{asyncness}fn {ident}{generics}({args}){output}{where_clauses} {{ todo!() }}"
-    )
-}
-
-pub fn ty_kind_suggestion(ty: Ty<'_>) -> Option<&'static str> {
-    Some(match ty.kind() {
-        ty::Bool => "true",
-        ty::Char => "'a'",
-        ty::Int(_) | ty::Uint(_) => "42",
-        ty::Float(_) => "3.14159",
-        ty::Error(_) | ty::Never => return None,
-        _ => "value",
-    })
+    format!("{safety}{asyncness}fn {ident}{generics}({args}){output}{where_clauses} {{ todo!() }}")
 }
 
 /// Return placeholder code for the given associated item.
@@ -507,7 +515,12 @@ fn suggestion_signature<'tcx>(
         }
         ty::AssocKind::Const => {
             let ty = tcx.type_of(assoc.def_id).instantiate_identity();
-            let val = ty_kind_suggestion(ty).unwrap_or("todo!()");
+            let val = tcx
+                .infer_ctxt()
+                .build()
+                .err_ctxt()
+                .ty_kind_suggestion(tcx.param_env(assoc.def_id), ty)
+                .unwrap_or_else(|| "value".to_string());
             format!("const {}: {} = {};", assoc.name, ty, val)
         }
     }
@@ -595,7 +608,7 @@ pub fn check_function_signature<'tcx>(
     let param_env = ty::ParamEnv::empty();
 
     let infcx = &tcx.infer_ctxt().build();
-    let ocx = ObligationCtxt::new(infcx);
+    let ocx = ObligationCtxt::new_with_diagnostics(infcx);
 
     let actual_sig = tcx.fn_sig(fn_id).instantiate_identity();
 

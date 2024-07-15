@@ -11,11 +11,11 @@
 //! even if it is stabilized or removed, *do not remove it*. Instead, move the
 //! symbol to the `accepted` or `removed` modules respectively.
 
+// tidy-alphabetical-start
 #![allow(internal_features)]
-#![feature(generic_nonzero)]
-#![feature(rustdoc_internals)]
 #![doc(rust_logo)]
-#![feature(lazy_cell)]
+#![feature(rustdoc_internals)]
+// tidy-alphabetical-end
 
 mod accepted;
 mod builtin_attrs;
@@ -31,6 +31,10 @@ use std::num::NonZero;
 #[derive(Debug, Clone)]
 pub struct Feature {
     pub name: Symbol,
+    /// For unstable features: the version the feature was added in.
+    /// For accepted features: the version the feature got stabilized in.
+    /// For removed features we are inconsistent; sometimes this is the
+    /// version it got added, sometimes the version it got removed.
     pub since: &'static str,
     issue: Option<NonZero<u32>>,
 }
@@ -124,9 +128,9 @@ pub fn find_feature_issue(feature: Symbol, issue: GateIssue) -> Option<NonZero<u
 pub use accepted::ACCEPTED_FEATURES;
 pub use builtin_attrs::AttributeDuplicates;
 pub use builtin_attrs::{
-    deprecated_attributes, find_gated_cfg, is_builtin_attr_name, is_builtin_only_local,
-    is_valid_for_get_attr, AttributeGate, AttributeTemplate, AttributeType, BuiltinAttribute,
-    GatedCfg, BUILTIN_ATTRIBUTES, BUILTIN_ATTRIBUTE_MAP,
+    deprecated_attributes, encode_cross_crate, find_gated_cfg, is_builtin_attr_name,
+    is_valid_for_get_attr, AttributeGate, AttributeSafety, AttributeTemplate, AttributeType,
+    BuiltinAttribute, GatedCfg, BUILTIN_ATTRIBUTES, BUILTIN_ATTRIBUTE_MAP,
 };
 pub use removed::REMOVED_FEATURES;
 pub use unstable::{Features, INCOMPATIBLE_FEATURES, UNSTABLE_FEATURES};

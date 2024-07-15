@@ -33,23 +33,21 @@
 #![feature(rustdoc_internals)]
 // tidy-alphabetical-end
 
+// The code produced by the `Encodable`/`Decodable` derive macros refer to
+// `rustc_span::Span{Encoder,Decoder}`. That's fine outside this crate, but doesn't work inside
+// this crate without this line making `rustc_span` available.
 extern crate self as rustc_span;
 
-#[macro_use]
-extern crate rustc_macros;
-
-#[macro_use]
-extern crate tracing;
-
 use rustc_data_structures::{outline, AtomicRef};
-use rustc_macros::HashStable_Generic;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_serialize::opaque::{FileEncoder, MemDecoder};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
+use tracing::debug;
 
 mod caching_source_map_view;
 pub mod source_map;
 pub use self::caching_source_map_view::CachingSourceMapView;
-use source_map::SourceMap;
+use source_map::{SourceMap, SourceMapInputs};
 
 pub mod edition;
 use edition::Edition;
@@ -104,35 +102,35 @@ pub struct SessionGlobals {
     metavar_spans: Lock<FxHashMap<Span, Span>>,
     hygiene_data: Lock<hygiene::HygieneData>,
 
-    /// A reference to the source map in the `Session`. It's an `Option`
-    /// because it can't be initialized until `Session` is created, which
-    /// happens after `SessionGlobals`. `set_source_map` does the
-    /// initialization.
-    ///
-    /// This field should only be used in places where the `Session` is truly
-    /// not available, such as `<Span as Debug>::fmt`.
-    source_map: Lock<Option<Lrc<SourceMap>>>,
+    /// The session's source map, if there is one. This field should only be
+    /// used in places where the `Session` is truly not available, such as
+    /// `<Span as Debug>::fmt`.
+    source_map: Option<Lrc<SourceMap>>,
 }
 
 impl SessionGlobals {
-    pub fn new(edition: Edition) -> SessionGlobals {
+    pub fn new(edition: Edition, sm_inputs: Option<SourceMapInputs>) -> SessionGlobals {
         SessionGlobals {
             symbol_interner: symbol::Interner::fresh(),
             span_interner: Lock::new(span_encoding::SpanInterner::default()),
             metavar_spans: Default::default(),
             hygiene_data: Lock::new(hygiene::HygieneData::new(edition)),
-            source_map: Lock::new(None),
+            source_map: sm_inputs.map(|inputs| Lrc::new(SourceMap::with_inputs(inputs))),
         }
     }
 }
 
-pub fn create_session_globals_then<R>(edition: Edition, f: impl FnOnce() -> R) -> R {
+pub fn create_session_globals_then<R>(
+    edition: Edition,
+    sm_inputs: Option<SourceMapInputs>,
+    f: impl FnOnce() -> R,
+) -> R {
     assert!(
         !SESSION_GLOBALS.is_set(),
         "SESSION_GLOBALS should never be overwritten! \
          Use another thread if you need another SessionGlobals"
     );
-    let session_globals = SessionGlobals::new(edition);
+    let session_globals = SessionGlobals::new(edition, sm_inputs);
     SESSION_GLOBALS.set(&session_globals, f)
 }
 
@@ -145,12 +143,13 @@ pub fn set_session_globals_then<R>(session_globals: &SessionGlobals, f: impl FnO
     SESSION_GLOBALS.set(session_globals, f)
 }
 
+/// No source map.
 pub fn create_session_if_not_set_then<R, F>(edition: Edition, f: F) -> R
 where
     F: FnOnce(&SessionGlobals) -> R,
 {
     if !SESSION_GLOBALS.is_set() {
-        let session_globals = SessionGlobals::new(edition);
+        let session_globals = SessionGlobals::new(edition, None);
         SESSION_GLOBALS.set(&session_globals, || SESSION_GLOBALS.with(f))
     } else {
         SESSION_GLOBALS.with(f)
@@ -164,8 +163,9 @@ where
     SESSION_GLOBALS.with(f)
 }
 
+/// Default edition, no source map.
 pub fn create_default_session_globals_then<R>(f: impl FnOnce() -> R) -> R {
-    create_session_globals_then(edition::DEFAULT_EDITION, f)
+    create_session_globals_then(edition::DEFAULT_EDITION, None, f)
 }
 
 // If this ever becomes non thread-local, `decode_syntax_context`
@@ -268,6 +268,18 @@ impl RealFileName {
             RealFileName::LocalPath(path)
             | RealFileName::Remapped { local_path: None, virtual_name: path }
             | RealFileName::Remapped { local_path: Some(path), virtual_name: _ } => path,
+        }
+    }
+
+    /// Return the path remmapped or not depending on the [`FileNameDisplayPreference`].
+    ///
+    /// For the purpose of this function, local and short preference are equal.
+    pub fn to_path(&self, display_pref: FileNameDisplayPreference) -> &Path {
+        match display_pref {
+            FileNameDisplayPreference::Local | FileNameDisplayPreference::Short => {
+                self.local_path_if_available()
+            }
+            FileNameDisplayPreference::Remapped => self.remapped_path_if_available(),
         }
     }
 
@@ -427,6 +439,17 @@ impl FileName {
         src.hash(&mut hasher);
         FileName::InlineAsm(hasher.finish())
     }
+
+    /// Returns the path suitable for reading from the file system on the local host,
+    /// if this information exists.
+    /// Avoid embedding this in build artifacts; see `remapped_path_if_available()` for that.
+    pub fn into_local_path(self) -> Option<PathBuf> {
+        match self {
+            FileName::Real(path) => path.into_local_path(),
+            FileName::DocTest(path, _) => Some(path),
+            _ => None,
+        }
+    }
 }
 
 /// Represents a span.
@@ -444,44 +467,21 @@ impl FileName {
 /// `SpanData` is public because `Span` uses a thread-local interner and can't be
 /// sent to other threads, but some pieces of performance infra run in a separate thread.
 /// Using `Span` is generally preferred.
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, derivative::Derivative)]
+#[derivative(PartialOrd, Ord)]
 pub struct SpanData {
     pub lo: BytePos,
     pub hi: BytePos,
     /// Information about where the macro came from, if this piece of
     /// code was created by a macro expansion.
+    #[derivative(PartialOrd = "ignore", Ord = "ignore")]
+    // `SyntaxContext` does not implement `Ord`.
+    // The other fields are enough to determine in-file order.
     pub ctxt: SyntaxContext,
+    #[derivative(PartialOrd = "ignore", Ord = "ignore")]
+    // `LocalDefId` does not implement `Ord`.
+    // The other fields are enough to determine in-file order.
     pub parent: Option<LocalDefId>,
-}
-
-// Order spans by position in the file.
-impl Ord for SpanData {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let SpanData {
-            lo: s_lo,
-            hi: s_hi,
-            ctxt: s_ctxt,
-            // `LocalDefId` does not implement `Ord`.
-            // The other fields are enough to determine in-file order.
-            parent: _,
-        } = self;
-        let SpanData {
-            lo: o_lo,
-            hi: o_hi,
-            ctxt: o_ctxt,
-            // `LocalDefId` does not implement `Ord`.
-            // The other fields are enough to determine in-file order.
-            parent: _,
-        } = other;
-
-        (s_lo, s_hi, s_ctxt).cmp(&(o_lo, o_hi, o_ctxt))
-    }
-}
-
-impl PartialOrd for SpanData {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 impl SpanData {
@@ -497,12 +497,14 @@ impl SpanData {
     pub fn with_hi(&self, hi: BytePos) -> Span {
         Span::new(self.lo, hi, self.ctxt, self.parent)
     }
+    /// Avoid if possible, `Span::map_ctxt` should be preferred.
     #[inline]
-    pub fn with_ctxt(&self, ctxt: SyntaxContext) -> Span {
+    fn with_ctxt(&self, ctxt: SyntaxContext) -> Span {
         Span::new(self.lo, self.hi, ctxt, self.parent)
     }
+    /// Avoid if possible, `Span::with_parent` should be preferred.
     #[inline]
-    pub fn with_parent(&self, parent: Option<LocalDefId>) -> Span {
+    fn with_parent(&self, parent: Option<LocalDefId>) -> Span {
         Span::new(self.lo, self.hi, self.ctxt, parent)
     }
     /// Returns `true` if this is a dummy span with any hygienic context.
@@ -554,15 +556,7 @@ impl Span {
     }
     #[inline]
     pub fn with_ctxt(self, ctxt: SyntaxContext) -> Span {
-        self.data_untracked().with_ctxt(ctxt)
-    }
-    #[inline]
-    pub fn parent(self) -> Option<LocalDefId> {
-        self.data().parent
-    }
-    #[inline]
-    pub fn with_parent(self, ctxt: Option<LocalDefId>) -> Span {
-        self.data().with_parent(ctxt)
+        self.map_ctxt(|_| ctxt)
     }
 
     #[inline]
@@ -659,6 +653,13 @@ impl Span {
         if span.hi > other.hi { Some(span.with_lo(cmp::max(span.lo, other.hi))) } else { None }
     }
 
+    /// Returns `Some(span)`, where the end is trimmed by the start of `other`.
+    pub fn trim_end(self, other: Span) -> Option<Span> {
+        let span = self.data();
+        let other = other.data();
+        if span.lo < other.lo { Some(span.with_hi(cmp::min(span.hi, other.lo))) } else { None }
+    }
+
     /// Returns the source span -- this is either the supplied span, or the span for
     /// the macro callsite that expanded to it.
     pub fn source_callsite(self) -> Span {
@@ -718,6 +719,45 @@ impl Span {
             self = self.parent_callsite()?;
         }
         Some(self)
+    }
+
+    /// Recursively walk down the expansion ancestors to find the oldest ancestor span with the same
+    /// [`SyntaxContext`] the initial span.
+    ///
+    /// This method is suitable for peeling through *local* macro expansions to find the "innermost"
+    /// span that is still local and shares the same [`SyntaxContext`]. For example, given
+    ///
+    /// ```ignore (illustrative example, contains type error)
+    ///  macro_rules! outer {
+    ///      ($x: expr) => {
+    ///          inner!($x)
+    ///      }
+    ///  }
+    ///
+    ///  macro_rules! inner {
+    ///      ($x: expr) => {
+    ///          format!("error: {}", $x)
+    ///          //~^ ERROR mismatched types
+    ///      }
+    ///  }
+    ///
+    ///  fn bar(x: &str) -> Result<(), Box<dyn std::error::Error>> {
+    ///      Err(outer!(x))
+    ///  }
+    /// ```
+    ///
+    /// if provided the initial span of `outer!(x)` inside `bar`, this method will recurse
+    /// the parent callsites until we reach `format!("error: {}", $x)`, at which point it is the
+    /// oldest ancestor span that is both still local and shares the same [`SyntaxContext`] as the
+    /// initial span.
+    pub fn find_oldest_ancestor_in_same_ctxt(self) -> Span {
+        let mut cur = self;
+        while cur.eq_ctxt(self)
+            && let Some(parent_callsite) = cur.parent_callsite()
+        {
+            cur = parent_callsite;
+        }
+        cur
     }
 
     /// Edition of the crate from which this span came.
@@ -897,7 +937,7 @@ impl Span {
     /// This span, but in a larger context, may switch to the metavariable span if suitable.
     pub fn with_neighbor(self, neighbor: Span) -> Span {
         match Span::prepare_to_combine(self, neighbor) {
-            Ok((this, ..)) => Span::new(this.lo, this.hi, this.ctxt, this.parent),
+            Ok((this, ..)) => this.span(),
             Err(_) => self,
         }
     }
@@ -990,39 +1030,46 @@ impl Span {
 
     #[inline]
     pub fn apply_mark(self, expn_id: ExpnId, transparency: Transparency) -> Span {
-        let span = self.data();
-        span.with_ctxt(span.ctxt.apply_mark(expn_id, transparency))
+        self.map_ctxt(|ctxt| ctxt.apply_mark(expn_id, transparency))
     }
 
     #[inline]
     pub fn remove_mark(&mut self) -> ExpnId {
-        let mut span = self.data();
-        let mark = span.ctxt.remove_mark();
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = ExpnId::root();
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.remove_mark();
+            ctxt
+        });
         mark
     }
 
     #[inline]
     pub fn adjust(&mut self, expn_id: ExpnId) -> Option<ExpnId> {
-        let mut span = self.data();
-        let mark = span.ctxt.adjust(expn_id);
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = None;
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.adjust(expn_id);
+            ctxt
+        });
         mark
     }
 
     #[inline]
     pub fn normalize_to_macros_2_0_and_adjust(&mut self, expn_id: ExpnId) -> Option<ExpnId> {
-        let mut span = self.data();
-        let mark = span.ctxt.normalize_to_macros_2_0_and_adjust(expn_id);
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = None;
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.normalize_to_macros_2_0_and_adjust(expn_id);
+            ctxt
+        });
         mark
     }
 
     #[inline]
     pub fn glob_adjust(&mut self, expn_id: ExpnId, glob_span: Span) -> Option<Option<ExpnId>> {
-        let mut span = self.data();
-        let mark = span.ctxt.glob_adjust(expn_id, glob_span);
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = None;
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.glob_adjust(expn_id, glob_span);
+            ctxt
+        });
         mark
     }
 
@@ -1032,22 +1079,22 @@ impl Span {
         expn_id: ExpnId,
         glob_span: Span,
     ) -> Option<Option<ExpnId>> {
-        let mut span = self.data();
-        let mark = span.ctxt.reverse_glob_adjust(expn_id, glob_span);
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = None;
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.reverse_glob_adjust(expn_id, glob_span);
+            ctxt
+        });
         mark
     }
 
     #[inline]
     pub fn normalize_to_macros_2_0(self) -> Span {
-        let span = self.data();
-        span.with_ctxt(span.ctxt.normalize_to_macros_2_0())
+        self.map_ctxt(|ctxt| ctxt.normalize_to_macros_2_0())
     }
 
     #[inline]
     pub fn normalize_to_macro_rules(self) -> Span {
-        let span = self.data();
-        span.with_ctxt(span.ctxt.normalize_to_macro_rules())
+        self.map_ctxt(|ctxt| ctxt.normalize_to_macro_rules())
     }
 }
 
@@ -1256,25 +1303,6 @@ impl<D: SpanDecoder> Decodable<D> for AttrId {
     }
 }
 
-/// Insert `source_map` into the session globals for the duration of the
-/// closure's execution.
-pub fn set_source_map<T, F: FnOnce() -> T>(source_map: Lrc<SourceMap>, f: F) -> T {
-    with_session_globals(|session_globals| {
-        *session_globals.source_map.borrow_mut() = Some(source_map);
-    });
-    struct ClearSourceMap;
-    impl Drop for ClearSourceMap {
-        fn drop(&mut self) {
-            with_session_globals(|session_globals| {
-                session_globals.source_map.borrow_mut().take();
-            });
-        }
-    }
-
-    let _guard = ClearSourceMap;
-    f()
-}
-
 impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Use the global `SourceMap` to print the span. If that's not
@@ -1290,7 +1318,7 @@ impl fmt::Debug for Span {
 
         if SESSION_GLOBALS.is_set() {
             with_session_globals(|session_globals| {
-                if let Some(source_map) = &*session_globals.source_map.borrow() {
+                if let Some(source_map) = &session_globals.source_map {
                     write!(f, "{} ({:?})", source_map.span_to_diagnostic_string(*self), self.ctxt())
                 } else {
                     fallback(*self, f)
@@ -1304,7 +1332,7 @@ impl fmt::Debug for Span {
 
 impl fmt::Debug for SpanData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&Span::new(self.lo, self.hi, self.ctxt, self.parent), f)
+        fmt::Debug::fmt(&self.span(), f)
     }
 }
 

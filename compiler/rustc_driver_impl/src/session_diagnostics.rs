@@ -33,6 +33,12 @@ pub(crate) struct RLinkRustcVersionMismatch<'a> {
 pub(crate) struct RlinkNotAFile;
 
 #[derive(Diagnostic)]
+#[diag(driver_impl_rlink_corrupt_file)]
+pub(crate) struct RlinkCorruptFile<'a> {
+    pub file: &'a std::path::Path,
+}
+
+#[derive(Diagnostic)]
 #[diag(driver_impl_ice)]
 pub(crate) struct Ice;
 
@@ -41,6 +47,10 @@ pub(crate) struct Ice;
 pub(crate) struct IceBugReport<'a> {
     pub bug_report_url: &'a str,
 }
+
+#[derive(Diagnostic)]
+#[diag(driver_impl_ice_bug_report_update_note)]
+pub(crate) struct UpdateNightlyNote;
 
 #[derive(Diagnostic)]
 #[diag(driver_impl_ice_bug_report_internal_feature)]

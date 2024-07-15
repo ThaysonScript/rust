@@ -1,7 +1,7 @@
 use std::fmt::{self, Write};
 use std::num::NonZero;
 
-use rustc_errors::{DiagnosticBuilder, DiagnosticMessage, Level};
+use rustc_errors::{Diag, DiagMessage, Level};
 use rustc_span::{SpanData, Symbol, DUMMY_SP};
 use rustc_target::abi::{Align, Size};
 
@@ -42,11 +42,13 @@ pub enum TerminationInfo {
     },
     DataRace {
         involves_non_atomic: bool,
-        ptr: Pointer<AllocId>,
+        ptr: interpret::Pointer<AllocId>,
         op1: RacingOp,
         op2: RacingOp,
         extra: Option<&'static str>,
+        retag_explain: bool,
     },
+    UnsupportedForeignItem(String),
 }
 
 pub struct RacingOp {
@@ -65,7 +67,7 @@ impl fmt::Display for TerminationInfo {
             Int2PtrWithStrictProvenance =>
                 write!(
                     f,
-                    "integer-to-pointer casts and `ptr::from_exposed_addr` are not supported with `-Zmiri-strict-provenance`"
+                    "integer-to-pointer casts and `ptr::with_exposed_provenance` are not supported with `-Zmiri-strict-provenance`"
                 ),
             StackedBorrowsUb { msg, .. } => write!(f, "{msg}"),
             TreeBorrowsUb { title, .. } => write!(f, "{title}"),
@@ -84,6 +86,7 @@ impl fmt::Display for TerminationInfo {
                     op2.action,
                     op2.thread_info
                 ),
+            UnsupportedForeignItem(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -95,12 +98,12 @@ impl fmt::Debug for TerminationInfo {
 }
 
 impl MachineStopType for TerminationInfo {
-    fn diagnostic_message(&self) -> DiagnosticMessage {
+    fn diagnostic_message(&self) -> DiagMessage {
         self.to_string().into()
     }
     fn add_args(
         self: Box<Self>,
-        _: &mut dyn FnMut(std::borrow::Cow<'static, str>, rustc_errors::DiagnosticArgValue),
+        _: &mut dyn FnMut(std::borrow::Cow<'static, str>, rustc_errors::DiagArgValue),
     ) {
     }
 }
@@ -114,8 +117,9 @@ pub enum NonHaltingDiagnostic {
     /// This `Item` was popped from the borrow stack. The string explains the reason.
     PoppedPointerTag(Item, String),
     CreatedCallId(CallId),
-    CreatedAlloc(AllocId, Size, Align, MemoryKind<MiriMemoryKind>),
+    CreatedAlloc(AllocId, Size, Align, MemoryKind),
     FreedAlloc(AllocId),
+    AccessedAlloc(AllocId, AccessKind),
     RejectedIsolatedOp(String),
     ProgressReport {
         block_count: u64, // how many basic blocks have been run so far
@@ -123,7 +127,9 @@ pub enum NonHaltingDiagnostic {
     Int2Ptr {
         details: bool,
     },
-    WeakMemoryOutdatedLoad,
+    WeakMemoryOutdatedLoad {
+        ptr: Pointer,
+    },
 }
 
 /// Level of Miri specific diagnostics
@@ -138,7 +144,7 @@ pub enum DiagLevel {
 /// be pointing to a problem in the Rust runtime itself, and do not prune it at all.
 pub fn prune_stacktrace<'tcx>(
     mut stacktrace: Vec<FrameInfo<'tcx>>,
-    machine: &MiriMachine<'_, 'tcx>,
+    machine: &MiriMachine<'tcx>,
 ) -> (Vec<FrameInfo<'tcx>>, bool) {
     match machine.backtrace_style {
         BacktraceStyle::Off => {
@@ -195,8 +201,8 @@ pub fn prune_stacktrace<'tcx>(
 /// Emit a custom diagnostic without going through the miri-engine machinery.
 ///
 /// Returns `Some` if this was regular program termination with a given exit code and a `bool` indicating whether a leak check should happen; `None` otherwise.
-pub fn report_error<'tcx, 'mir>(
-    ecx: &InterpCx<'mir, 'tcx, MiriMachine<'mir, 'tcx>>,
+pub fn report_error<'tcx>(
+    ecx: &InterpCx<'tcx, MiriMachine<'tcx>>,
     e: InterpErrorInfo<'tcx>,
 ) -> Option<(i64, bool)> {
     use InterpError::*;
@@ -210,7 +216,7 @@ pub fn report_error<'tcx, 'mir>(
         let title = match info {
             Exit { code, leak_check } => return Some((*code, *leak_check)),
             Abort(_) => Some("abnormal termination"),
-            UnsupportedInIsolation(_) | Int2PtrWithStrictProvenance =>
+            UnsupportedInIsolation(_) | Int2PtrWithStrictProvenance | UnsupportedForeignItem(_) =>
                 Some("unsupported operation"),
             StackedBorrowsUb { .. } | TreeBorrowsUb { .. } | DataRace { .. } =>
                 Some("Undefined Behavior"),
@@ -221,9 +227,15 @@ pub fn report_error<'tcx, 'mir>(
         let helps = match info {
             UnsupportedInIsolation(_) =>
                 vec![
-                    (None, format!("pass the flag `-Zmiri-disable-isolation` to disable isolation;")),
-                    (None, format!("or pass `-Zmiri-isolation-error=warn` to configure Miri to return an error code from isolated operations (if supported for that operation) and continue with a warning")),
+                    (None, format!("set `MIRIFLAGS=-Zmiri-disable-isolation` to disable isolation;")),
+                    (None, format!("or set `MIRIFLAGS=-Zmiri-isolation-error=warn` to make Miri return an error code from isolated operations (if supported for that operation) and continue with a warning")),
                 ],
+            UnsupportedForeignItem(_) => {
+                vec![
+                    (None, format!("if this is a basic API commonly used on this target, please report an issue with Miri")),
+                    (None, format!("however, note that Miri does not aim to support every FFI function out there; for instance, we will not support APIs for things such as GUIs, scripting languages, or databases")),
+                ]
+            }
             StackedBorrowsUb { help, history, .. } => {
                 msg.extend(help.clone());
                 let mut helps = vec![
@@ -262,11 +274,16 @@ pub fn report_error<'tcx, 'mir>(
                 vec![(Some(*span), format!("the `{link_name}` symbol is defined here"))],
             Int2PtrWithStrictProvenance =>
                 vec![(None, format!("use Strict Provenance APIs (https://doc.rust-lang.org/nightly/std/ptr/index.html#strict-provenance, https://crates.io/crates/sptr) instead"))],
-            DataRace { op1, extra, .. } => {
+            DataRace { op1, extra, retag_explain, .. } => {
                 let mut helps = vec![(Some(op1.span), format!("and (1) occurred earlier here"))];
                 if let Some(extra) = extra {
                     helps.push((None, format!("{extra}")));
                     helps.push((None, format!("see https://doc.rust-lang.org/nightly/std/sync/atomic/index.html#memory-model-for-atomic-accesses for more information about the Rust memory model")));
+                }
+                if *retag_explain {
+                    helps.push((None, "retags occur on all (re)borrows and as well as when references are copied or moved".to_owned()));
+                    helps.push((None, "retags permit optimizations that insert speculative reads or writes".to_owned()));
+                    helps.push((None, "therefore from the perspective of data races, a retag has the same implications as a read or write".to_owned()));
                 }
                 helps.push((None, format!("this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior")));
                 helps.push((None, format!("see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information")));
@@ -284,7 +301,7 @@ pub fn report_error<'tcx, 'mir>(
                     ValidationErrorKind::PointerAsInt { .. } | ValidationErrorKind::PartialPointer
                 ) =>
             {
-                ecx.handle_ice(); // print interpreter backtrace
+                ecx.handle_ice(); // print interpreter backtrace (this is outside the eval `catch_unwind`)
                 bug!(
                     "This validation error should be impossible in Miri: {}",
                     format_interp_error(ecx.tcx.dcx(), e)
@@ -294,14 +311,16 @@ pub fn report_error<'tcx, 'mir>(
             ResourceExhaustion(_) => "resource exhaustion",
             Unsupported(
                 // We list only the ones that can actually happen.
-                UnsupportedOpInfo::Unsupported(_) | UnsupportedOpInfo::UnsizedLocal,
+                UnsupportedOpInfo::Unsupported(_)
+                | UnsupportedOpInfo::UnsizedLocal
+                | UnsupportedOpInfo::ExternTypeField,
             ) => "unsupported operation",
             InvalidProgram(
                 // We list only the ones that can actually happen.
                 InvalidProgramInfo::AlreadyReported(_) | InvalidProgramInfo::Layout(..),
             ) => "post-monomorphization error",
             _ => {
-                ecx.handle_ice(); // print interpreter backtrace
+                ecx.handle_ice(); // print interpreter backtrace (this is outside the eval `catch_unwind`)
                 bug!(
                     "This error should be impossible in Miri: {}",
                     format_interp_error(ecx.tcx.dcx(), e)
@@ -311,7 +330,9 @@ pub fn report_error<'tcx, 'mir>(
         #[rustfmt::skip]
         let helps = match e.kind() {
             Unsupported(_) =>
-                vec![(None, format!("this is likely not a bug in the program; it indicates that the program performed an operation that the interpreter does not support"))],
+                vec![
+                    (None, format!("this is likely not a bug in the program; it indicates that the program performed an operation that Miri does not support")),
+                ],
             UndefinedBehavior(AlignmentCheckFailed { .. })
                 if ecx.machine.check_alignment == AlignmentCheck::Symbolic
             =>
@@ -335,7 +356,7 @@ pub fn report_error<'tcx, 'mir>(
                     }
                     AbiMismatchArgument { .. } | AbiMismatchReturn { .. } => {
                         helps.push((None, format!("this means these two types are not *guaranteed* to be ABI-compatible across all targets")));
-                        helps.push((None, format!("if you think this code should be accepted anyway, please report an issue")));
+                        helps.push((None, format!("if you think this code should be accepted anyway, please report an issue with Miri")));
                     }
                     _ => {},
                 }
@@ -354,9 +375,12 @@ pub fn report_error<'tcx, 'mir>(
     };
 
     let stacktrace = ecx.generate_stacktrace();
-    let (stacktrace, was_pruned) = prune_stacktrace(stacktrace, &ecx.machine);
+    let (stacktrace, mut any_pruned) = prune_stacktrace(stacktrace, &ecx.machine);
 
-    // We want to dump the allocation if this is `InvalidUninitBytes`. Since `format_error` consumes `e`, we compute the outut early.
+    let mut show_all_threads = false;
+
+    // We want to dump the allocation if this is `InvalidUninitBytes`.
+    // Since `format_interp_error` consumes `e`, we compute the outut early.
     let mut extra = String::new();
     match e.kind() {
         UndefinedBehavior(InvalidUninitBytes(Some((alloc_id, access)))) => {
@@ -367,6 +391,15 @@ pub fn report_error<'tcx, 'mir>(
             )
             .unwrap();
             writeln!(extra, "{:?}", ecx.dump_alloc(*alloc_id)).unwrap();
+        }
+        MachineStop(info) => {
+            let info = info.downcast_ref::<TerminationInfo>().expect("invalid MachineStop payload");
+            match info {
+                TerminationInfo::Deadlock => {
+                    show_all_threads = true;
+                }
+                _ => {}
+            }
         }
         _ => {}
     }
@@ -380,17 +413,38 @@ pub fn report_error<'tcx, 'mir>(
         vec![],
         helps,
         &stacktrace,
+        Some(ecx.active_thread()),
         &ecx.machine,
     );
 
+    eprint!("{extra}"); // newlines are already in the string
+
+    if show_all_threads {
+        for (thread, stack) in ecx.machine.threads.all_stacks() {
+            if thread != ecx.active_thread() {
+                let stacktrace = Frame::generate_stacktrace_from_stack(stack);
+                let (stacktrace, was_pruned) = prune_stacktrace(stacktrace, &ecx.machine);
+                any_pruned |= was_pruned;
+                report_msg(
+                    DiagLevel::Error,
+                    format!("deadlock: the evaluated program deadlocked"),
+                    vec![format!("the evaluated program deadlocked")],
+                    vec![],
+                    vec![],
+                    &stacktrace,
+                    Some(thread),
+                    &ecx.machine,
+                )
+            }
+        }
+    }
+
     // Include a note like `std` does when we omit frames from a backtrace
-    if was_pruned {
+    if any_pruned {
         ecx.tcx.dcx().note(
             "some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace",
         );
     }
-
-    eprint!("{extra}"); // newlines are already in the string
 
     // Debug-dump all locals.
     for (i, frame) in ecx.active_thread_stack().iter().enumerate() {
@@ -405,29 +459,33 @@ pub fn report_error<'tcx, 'mir>(
     None
 }
 
-pub fn report_leaks<'mir, 'tcx>(
-    ecx: &InterpCx<'mir, 'tcx, MiriMachine<'mir, 'tcx>>,
-    leaks: Vec<(AllocId, MemoryKind<MiriMemoryKind>, Allocation<Provenance, AllocExtra<'tcx>>)>,
+pub fn report_leaks<'tcx>(
+    ecx: &InterpCx<'tcx, MiriMachine<'tcx>>,
+    leaks: Vec<(AllocId, MemoryKind, Allocation<Provenance, AllocExtra<'tcx>, MiriAllocBytes>)>,
 ) {
     let mut any_pruned = false;
     for (id, kind, mut alloc) in leaks {
+        let mut title = format!(
+            "memory leaked: {id:?} ({}, size: {:?}, align: {:?})",
+            kind,
+            alloc.size().bytes(),
+            alloc.align.bytes()
+        );
         let Some(backtrace) = alloc.extra.backtrace.take() else {
+            ecx.tcx.dcx().err(title);
             continue;
         };
+        title.push_str(", allocated here:");
         let (backtrace, pruned) = prune_stacktrace(backtrace, &ecx.machine);
         any_pruned |= pruned;
         report_msg(
             DiagLevel::Error,
-            format!(
-                "memory leaked: {id:?} ({}, size: {:?}, align: {:?}), allocated here:",
-                kind,
-                alloc.size().bytes(),
-                alloc.align.bytes()
-            ),
+            title,
             vec![],
             vec![],
             vec![],
             &backtrace,
+            None, // we don't know the thread this is from
             &ecx.machine,
         );
     }
@@ -450,7 +508,8 @@ pub fn report_msg<'tcx>(
     notes: Vec<(Option<SpanData>, String)>,
     helps: Vec<(Option<SpanData>, String)>,
     stacktrace: &[FrameInfo<'tcx>],
-    machine: &MiriMachine<'_, 'tcx>,
+    thread: Option<ThreadId>,
+    machine: &MiriMachine<'tcx>,
 ) {
     let span = stacktrace.first().map_or(DUMMY_SP, |fi| fi.span);
     let sess = machine.tcx.sess;
@@ -459,7 +518,7 @@ pub fn report_msg<'tcx>(
         DiagLevel::Warning => Level::Warning,
         DiagLevel::Note => Level::Note,
     };
-    let mut err = DiagnosticBuilder::<()>::new(sess.dcx(), level, title);
+    let mut err = Diag::<()>::new(sess.dcx(), level, title);
     err.span(span);
 
     // Show main message.
@@ -477,7 +536,6 @@ pub fn report_msg<'tcx>(
 
     // Show note and help messages.
     let mut extra_span = false;
-    let notes_len = notes.len();
     for (span_data, note) in notes {
         if let Some(span_data) = span_data {
             err.span_note(span_data.span(), note);
@@ -486,7 +544,6 @@ pub fn report_msg<'tcx>(
             err.note(note);
         }
     }
-    let helps_len = helps.len();
     for (span_data, help) in helps {
         if let Some(span_data) = span_data {
             err.span_help(span_data.span(), help);
@@ -495,17 +552,26 @@ pub fn report_msg<'tcx>(
             err.help(help);
         }
     }
-    if notes_len + helps_len > 0 {
-        // Add visual separator before backtrace.
-        err.note(if extra_span { "BACKTRACE (of the first span):" } else { "BACKTRACE:" });
-    }
 
     // Add backtrace
+    let mut backtrace_title = String::from("BACKTRACE");
+    if extra_span {
+        write!(backtrace_title, " (of the first span)").unwrap();
+    }
+    if let Some(thread) = thread {
+        let thread_name = machine.threads.get_thread_display_name(thread);
+        if thread_name != "main" {
+            // Only print thread name if it is not `main`.
+            write!(backtrace_title, " on thread `{thread_name}`").unwrap();
+        };
+    }
+    write!(backtrace_title, ":").unwrap();
+    err.note(backtrace_title);
     for (idx, frame_info) in stacktrace.iter().enumerate() {
         let is_local = machine.is_local(frame_info);
         // No span for non-local frames and the first frame (which is the error site).
         if is_local && idx > 0 {
-            err.subdiagnostic(err.dcx, frame_info.as_note(machine.tcx));
+            err.subdiagnostic(frame_info.as_note(machine.tcx));
         } else {
             let sm = sess.source_map();
             let span = sm.span_to_embeddable_string(frame_info.span);
@@ -516,12 +582,11 @@ pub fn report_msg<'tcx>(
     err.emit();
 }
 
-impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
+impl<'tcx> MiriMachine<'tcx> {
     pub fn emit_diagnostic(&self, e: NonHaltingDiagnostic) {
         use NonHaltingDiagnostic::*;
 
-        let stacktrace =
-            MiriInterpCx::generate_stacktrace_from_stack(self.threads.active_thread_stack());
+        let stacktrace = Frame::generate_stacktrace_from_stack(self.threads.active_thread_stack());
         let (stacktrace, _was_pruned) = prune_stacktrace(stacktrace, self);
 
         let (title, diag_level) = match &e {
@@ -532,9 +597,11 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             | PoppedPointerTag(..)
             | CreatedCallId(..)
             | CreatedAlloc(..)
+            | AccessedAlloc(..)
             | FreedAlloc(..)
             | ProgressReport { .. }
-            | WeakMemoryOutdatedLoad => ("tracking was triggered".to_string(), DiagLevel::Note),
+            | WeakMemoryOutdatedLoad { .. } =>
+                ("tracking was triggered".to_string(), DiagLevel::Note),
         };
 
         let msg = match &e {
@@ -553,14 +620,16 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                     size = size.bytes(),
                     align = align.bytes(),
                 ),
+            AccessedAlloc(AllocId(id), access_kind) =>
+                format!("{access_kind} to allocation with id {id}"),
             FreedAlloc(AllocId(id)) => format!("freed allocation with id {id}"),
             RejectedIsolatedOp(ref op) =>
                 format!("{op} was made to return an error due to isolation"),
             ProgressReport { .. } =>
                 format!("progress report: current operation being executed is here"),
             Int2Ptr { .. } => format!("integer-to-pointer cast"),
-            WeakMemoryOutdatedLoad =>
-                format!("weak memory emulation: outdated value returned from load"),
+            WeakMemoryOutdatedLoad { ptr } =>
+                format!("weak memory emulation: outdated value returned from load at {ptr}"),
         };
 
         let notes = match &e {
@@ -578,17 +647,13 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                     (
                         None,
                         format!(
-                            "This program is using integer-to-pointer casts or (equivalently) `ptr::from_exposed_addr`,"
+                            "This program is using integer-to-pointer casts or (equivalently) `ptr::with_exposed_provenance`, which means that Miri might miss pointer bugs in this program."
                         ),
                     ),
                     (
                         None,
-                        format!("which means that Miri might miss pointer bugs in this program."),
-                    ),
-                    (
-                        None,
                         format!(
-                            "See https://doc.rust-lang.org/nightly/std/ptr/fn.from_exposed_addr.html for more details on that operation."
+                            "See https://doc.rust-lang.org/nightly/std/ptr/fn.with_exposed_provenance.html for more details on that operation."
                         ),
                     ),
                     (
@@ -600,25 +665,34 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                     (
                         None,
                         format!(
-                            "You can then pass the `-Zmiri-strict-provenance` flag to Miri, to ensure you are not relying on `from_exposed_addr` semantics."
+                            "You can then set `MIRIFLAGS=-Zmiri-strict-provenance` to ensure you are not relying on `with_exposed_provenance` semantics."
                         ),
                     ),
                     (
                         None,
                         format!(
-                            "Alternatively, the `-Zmiri-permissive-provenance` flag disables this warning."
+                            "Alternatively, `MIRIFLAGS=-Zmiri-permissive-provenance` disables this warning."
                         ),
                     ),
                 ],
             _ => vec![],
         };
 
-        report_msg(diag_level, title, vec![msg], notes, helps, &stacktrace, self);
+        report_msg(
+            diag_level,
+            title,
+            vec![msg],
+            notes,
+            helps,
+            &stacktrace,
+            Some(self.threads.active_thread()),
+            self,
+        );
     }
 }
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emit_diagnostic(&self, e: NonHaltingDiagnostic) {
         let this = self.eval_context_ref();
         this.machine.emit_diagnostic(e);
@@ -639,6 +713,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             vec![],
             vec![],
             &stacktrace,
+            Some(this.active_thread()),
             &this.machine,
         );
     }

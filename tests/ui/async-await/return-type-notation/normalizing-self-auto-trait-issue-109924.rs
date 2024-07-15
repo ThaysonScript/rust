@@ -1,5 +1,6 @@
 //@ check-pass
 //@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 //@ edition:2021
 
@@ -15,7 +16,7 @@ impl Foo for Bar {
     async fn bar(&self) {}
 }
 
-fn build<T>(_: T) where T: Foo<bar(): Send> {}
+fn build<T>(_: T) where T: Foo<bar(..): Send> {}
 
 fn main() {
     build(Bar);

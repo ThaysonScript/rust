@@ -1,7 +1,8 @@
 use std::fmt;
+use std::path::PathBuf;
 
-use rustc_errors::{codes::*, DiagnosticArgName, DiagnosticArgValue, DiagnosticMessage};
-use rustc_macros::Diagnostic;
+use rustc_errors::{codes::*, DiagArgName, DiagArgValue, DiagMessage};
+use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Span, Symbol};
 
 use crate::ty::Ty;
@@ -93,16 +94,16 @@ pub(super) struct ConstNotUsedTraitAlias {
 }
 
 pub struct CustomSubdiagnostic<'a> {
-    pub msg: fn() -> DiagnosticMessage,
-    pub add_args: Box<dyn FnOnce(&mut dyn FnMut(DiagnosticArgName, DiagnosticArgValue)) + 'a>,
+    pub msg: fn() -> DiagMessage,
+    pub add_args: Box<dyn FnOnce(&mut dyn FnMut(DiagArgName, DiagArgValue)) + 'a>,
 }
 
 impl<'a> CustomSubdiagnostic<'a> {
-    pub fn label(x: fn() -> DiagnosticMessage) -> Self {
+    pub fn label(x: fn() -> DiagMessage) -> Self {
         Self::label_and_then(x, |_| {})
     }
-    pub fn label_and_then<F: FnOnce(&mut dyn FnMut(DiagnosticArgName, DiagnosticArgValue)) + 'a>(
-        msg: fn() -> DiagnosticMessage,
+    pub fn label_and_then<F: FnOnce(&mut dyn FnMut(DiagArgName, DiagArgValue)) + 'a>(
+        msg: fn() -> DiagMessage,
         f: F,
     ) -> Self {
         Self { msg, add_args: Box::new(move |x| f(x)) }
@@ -149,3 +150,16 @@ pub struct ErroneousConstant {
 
 /// Used by `rustc_const_eval`
 pub use crate::fluent_generated::middle_adjust_for_foreign_abi_error;
+
+#[derive(Diagnostic)]
+#[diag(middle_type_length_limit)]
+#[help(middle_consider_type_length_limit)]
+pub struct TypeLengthLimit {
+    #[primary_span]
+    pub span: Span,
+    pub shrunk: String,
+    #[note(middle_written_to_path)]
+    pub was_written: Option<()>,
+    pub path: PathBuf,
+    pub type_length: usize,
+}

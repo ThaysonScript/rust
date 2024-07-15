@@ -7,7 +7,7 @@ use rustc_errors::Applicability;
 use rustc_hir::{Item, ItemKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::lint::in_external_macro;
-use rustc_middle::ty::{Adt, Ty};
+use rustc_middle::ty::{self, Ty};
 use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 
@@ -77,17 +77,12 @@ impl_lint_pass!(LargeEnumVariant => [LARGE_ENUM_VARIANT]);
 
 impl<'tcx> LateLintPass<'tcx> for LargeEnumVariant {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &Item<'tcx>) {
-        if in_external_macro(cx.tcx.sess, item.span) {
-            return;
-        }
-        if let ItemKind::Enum(ref def, _) = item.kind {
-            let ty = cx.tcx.type_of(item.owner_id).instantiate_identity();
-            let Adt(adt, subst) = ty.kind() else {
-                panic!("already checked whether this is an enum")
-            };
-            if adt.variants().len() <= 1 {
-                return;
-            }
+        if let ItemKind::Enum(ref def, _) = item.kind
+            && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity()
+            && let ty::Adt(adt, subst) = ty.kind()
+            && adt.variants().len() > 1
+            && !in_external_macro(cx.tcx.sess, item.span)
+        {
             let variants_size = AdtVariantInfo::new(cx, *adt, subst);
 
             let mut difference = variants_size[0].size - variants_size[1].size;
@@ -167,7 +162,7 @@ impl<'tcx> LateLintPass<'tcx> for LargeEnumVariant {
 }
 
 fn maybe_copy<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
-    if let Adt(_def, args) = ty.kind()
+    if let ty::Adt(_def, args) = ty.kind()
         && args.types().next().is_some()
         && let Some(copy_trait) = cx.tcx.lang_items().copy_trait()
     {

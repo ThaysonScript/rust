@@ -422,7 +422,7 @@ marker_impls! {
     Copy for
         usize, u8, u16, u32, u64, u128,
         isize, i8, i16, i32, i64, i128,
-        f32, f64,
+        f16, f32, f64, f128,
         bool, char,
         {T: ?Sized} *const T,
         {T: ?Sized} *mut T,
@@ -810,15 +810,28 @@ pub trait DiscriminantKind {
     type Discriminant: Clone + Copy + Debug + Eq + PartialEq + Hash + Send + Sync + Unpin;
 }
 
-/// Compiler-internal trait used to determine whether a type contains
+/// Used to determine whether a type contains
 /// any `UnsafeCell` internally, but not through an indirection.
 /// This affects, for example, whether a `static` of that type is
 /// placed in read-only static memory or writable static memory.
+/// This can be used to declare that a constant with a generic type
+/// will not contain interior mutability, and subsequently allow
+/// placing the constant behind references.
+///
+/// # Safety
+///
+/// This trait is a core part of the language, it is just expressed as a trait in libcore for
+/// convenience. Do *not* implement it for other types.
+// FIXME: Eventually this trait should become `#[rustc_deny_explicit_impl]`.
+// That requires porting the impls below to native internal impls.
 #[lang = "freeze"]
-pub(crate) unsafe auto trait Freeze {}
+#[unstable(feature = "freeze", issue = "121675")]
+pub unsafe auto trait Freeze {}
 
+#[unstable(feature = "freeze", issue = "121675")]
 impl<T: ?Sized> !Freeze for UnsafeCell<T> {}
 marker_impls! {
+    #[unstable(feature = "freeze", issue = "121675")]
     unsafe Freeze for
         {T: ?Sized} PhantomData<T>,
         {T: ?Sized} *const T,
@@ -931,7 +944,6 @@ marker_impls! {
 #[lang = "destruct"]
 #[rustc_on_unimplemented(message = "can't drop `{Self}`", append_const_msg)]
 #[rustc_deny_explicit_impl(implement_via_object = false)]
-#[const_trait]
 pub trait Destruct {}
 
 /// A marker for tuple types.
@@ -984,14 +996,11 @@ marker_impls! {
         bool,
         char,
         str /* Technically requires `[u8]: ConstParamTy` */,
+        (),
         {T: ConstParamTy, const N: usize} [T; N],
         {T: ConstParamTy} [T],
         {T: ?Sized + ConstParamTy} &T,
 }
-
-// FIXME(adt_const_params): Add to marker_impls call above once not in bootstrap
-#[unstable(feature = "adt_const_params", issue = "95174")]
-impl ConstParamTy for () {}
 
 /// A common trait implemented by all function pointers.
 #[unstable(
@@ -1005,4 +1014,59 @@ pub trait FnPtr: Copy + Clone {
     /// Returns the address of the function pointer.
     #[lang = "fn_ptr_addr"]
     fn addr(self) -> *const ();
+}
+
+/// Derive macro generating impls of traits related to smart pointers.
+#[cfg(not(bootstrap))]
+#[rustc_builtin_macro]
+#[allow_internal_unstable(dispatch_from_dyn, coerce_unsized, unsize)]
+#[unstable(feature = "derive_smart_pointer", issue = "123430")]
+pub macro SmartPointer($item:item) {
+    /* compiler built-in */
+}
+
+// Support traits and types for the desugaring of const traits and
+// `~const` bounds. Not supposed to be used by anything other than
+// the compiler.
+#[doc(hidden)]
+#[unstable(
+    feature = "effect_types",
+    issue = "none",
+    reason = "internal module for implementing effects"
+)]
+#[allow(missing_debug_implementations)] // these unit structs don't need `Debug` impls.
+#[cfg(not(bootstrap))]
+pub mod effects {
+    #[lang = "EffectsNoRuntime"]
+    pub struct NoRuntime;
+    #[lang = "EffectsMaybe"]
+    pub struct Maybe;
+    #[lang = "EffectsRuntime"]
+    pub struct Runtime;
+
+    #[lang = "EffectsCompat"]
+    pub trait Compat<#[rustc_runtime] const RUNTIME: bool> {}
+
+    impl Compat<false> for NoRuntime {}
+    impl Compat<true> for Runtime {}
+    impl<#[rustc_runtime] const RUNTIME: bool> Compat<RUNTIME> for Maybe {}
+
+    #[lang = "EffectsTyCompat"]
+    #[marker]
+    pub trait TyCompat<T: ?Sized> {}
+
+    impl<T: ?Sized> TyCompat<T> for T {}
+    impl<T: ?Sized> TyCompat<T> for Maybe {}
+    impl<T: ?Sized> TyCompat<Maybe> for T {}
+
+    #[lang = "EffectsIntersection"]
+    pub trait Intersection {
+        #[lang = "EffectsIntersectionOutput"]
+        type Output: ?Sized;
+    }
+
+    // FIXME(effects): remove this after next trait solver lands
+    impl Intersection for () {
+        type Output = Maybe;
+    }
 }

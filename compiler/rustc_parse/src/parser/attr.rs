@@ -1,15 +1,13 @@
-use crate::errors::{
-    InvalidMetaItem, InvalidMetaItemSuggQuoteIdent, InvalidMetaItemUnquotedIdent,
-    SuffixedLiteralInAttribute,
-};
+use crate::errors;
 use crate::fluent_generated as fluent;
+use crate::maybe_whole;
 
 use super::{AttrWrapper, Capturing, FnParseMode, ForceCollect, Parser, PathStyle};
 use rustc_ast as ast;
 use rustc_ast::attr;
-use rustc_ast::token::{self, Delimiter, Nonterminal};
-use rustc_errors::{codes::*, DiagnosticBuilder, PResult};
-use rustc_span::{sym, BytePos, Span};
+use rustc_ast::token::{self, Delimiter};
+use rustc_errors::{codes::*, Diag, PResult};
+use rustc_span::{sym, symbol::kw, BytePos, Span};
 use thin_vec::ThinVec;
 use tracing::debug;
 
@@ -85,7 +83,7 @@ impl<'a> Parser<'a> {
                 // Always make an outer attribute - this allows us to recover from a misplaced
                 // inner attribute.
                 Some(attr::mk_doc_comment(
-                    &self.sess.attr_id_generator,
+                    &self.psess.attr_id_generator,
                     comment_kind,
                     ast::AttrStyle::Outer,
                     data,
@@ -135,13 +133,13 @@ impl<'a> Parser<'a> {
                 this.error_on_forbidden_inner_attr(attr_sp, inner_parse_policy);
             }
 
-            Ok(attr::mk_attr_from_item(&self.sess.attr_id_generator, item, None, style, attr_sp))
+            Ok(attr::mk_attr_from_item(&self.psess.attr_id_generator, item, None, style, attr_sp))
         })
     }
 
     fn annotate_following_item_if_applicable(
         &self,
-        err: &mut DiagnosticBuilder<'_>,
+        err: &mut Diag<'_>,
         span: Span,
         attr_type: OuterAttributeType,
     ) -> Option<Span> {
@@ -251,25 +249,29 @@ impl<'a> Parser<'a> {
     ///     PATH `=` UNSUFFIXED_LIT
     /// The delimiters or `=` are still put into the resulting token stream.
     pub fn parse_attr_item(&mut self, capture_tokens: bool) -> PResult<'a, ast::AttrItem> {
-        let item = match &self.token.kind {
-            token::Interpolated(nt) => match &nt.0 {
-                Nonterminal::NtMeta(item) => Some(item.clone().into_inner()),
-                _ => None,
-            },
-            _ => None,
-        };
-        Ok(if let Some(item) = item {
-            self.bump();
-            item
-        } else {
-            let do_parse = |this: &mut Self| {
-                let path = this.parse_path(PathStyle::Mod)?;
-                let args = this.parse_attr_args()?;
-                Ok(ast::AttrItem { path, args, tokens: None })
+        maybe_whole!(self, NtMeta, |attr| attr.into_inner());
+
+        let do_parse = |this: &mut Self| {
+            let is_unsafe = this.eat_keyword(kw::Unsafe);
+            let unsafety = if is_unsafe {
+                let unsafe_span = this.prev_token.span;
+                this.psess.gated_spans.gate(sym::unsafe_attributes, unsafe_span);
+                this.expect(&token::OpenDelim(Delimiter::Parenthesis))?;
+
+                ast::Safety::Unsafe(unsafe_span)
+            } else {
+                ast::Safety::Default
             };
-            // Attr items don't have attributes
-            if capture_tokens { self.collect_tokens_no_attrs(do_parse) } else { do_parse(self) }?
-        })
+
+            let path = this.parse_path(PathStyle::Mod)?;
+            let args = this.parse_attr_args()?;
+            if is_unsafe {
+                this.expect(&token::CloseDelim(Delimiter::Parenthesis))?;
+            }
+            Ok(ast::AttrItem { unsafety, path, args, tokens: None })
+        };
+        // Attr items don't have attributes
+        if capture_tokens { self.collect_tokens_no_attrs(do_parse) } else { do_parse(self) }
     }
 
     /// Parses attributes that appear after the opening of an item. These should
@@ -277,10 +279,10 @@ impl<'a> Parser<'a> {
     /// terminated by a semicolon.
     ///
     /// Matches `inner_attrs*`.
-    pub(crate) fn parse_inner_attributes(&mut self) -> PResult<'a, ast::AttrVec> {
+    pub fn parse_inner_attributes(&mut self) -> PResult<'a, ast::AttrVec> {
         let mut attrs = ast::AttrVec::new();
         loop {
-            let start_pos: u32 = self.num_bump_calls.try_into().unwrap();
+            let start_pos = self.num_bump_calls;
             // Only try to parse if it is an inner attribute (has `!`).
             let attr = if self.check(&token::Pound) && self.look_ahead(1, |t| t == &token::Not) {
                 Some(self.parse_attribute(InnerAttrPolicy::Permitted)?)
@@ -288,7 +290,7 @@ impl<'a> Parser<'a> {
                 if attr_style == ast::AttrStyle::Inner {
                     self.bump();
                     Some(attr::mk_doc_comment(
-                        &self.sess.attr_id_generator,
+                        &self.psess.attr_id_generator,
                         comment_kind,
                         attr_style,
                         data,
@@ -301,7 +303,7 @@ impl<'a> Parser<'a> {
                 None
             };
             if let Some(attr) = attr {
-                let end_pos: u32 = self.num_bump_calls.try_into().unwrap();
+                let end_pos = self.num_bump_calls;
                 // If we are currently capturing tokens, mark the location of this inner attribute.
                 // If capturing ends up creating a `LazyAttrTokenStream`, we will include
                 // this replace range with it, removing the inner attribute from the final
@@ -311,7 +313,7 @@ impl<'a> Parser<'a> {
                 // corresponding macro).
                 let range = start_pos..end_pos;
                 if let Capturing::Yes = self.capture_state.capturing {
-                    self.capture_state.inner_attr_ranges.insert(attr.id, (range, vec![]));
+                    self.capture_state.inner_attr_ranges.insert(attr.id, (range, None));
                 }
                 attrs.push(attr);
             } else {
@@ -327,7 +329,7 @@ impl<'a> Parser<'a> {
         debug!("checking if {:?} is unsuffixed", lit);
 
         if !lit.kind.is_unsuffixed() {
-            self.dcx().emit_err(SuffixedLiteralInAttribute { span: lit.span });
+            self.dcx().emit_err(errors::SuffixedLiteralInAttribute { span: lit.span });
         }
 
         Ok(lit)
@@ -365,42 +367,53 @@ impl<'a> Parser<'a> {
         Ok(nmis)
     }
 
-    /// Matches the following grammar (per RFC 1559).
+    /// Parse a meta item per RFC 1559.
+    ///
     /// ```ebnf
-    /// meta_item : PATH ( '=' UNSUFFIXED_LIT | '(' meta_item_inner? ')' )? ;
-    /// meta_item_inner : (meta_item | UNSUFFIXED_LIT) (',' meta_item_inner)? ;
+    /// MetaItem = SimplePath ( '=' UNSUFFIXED_LIT | '(' MetaSeq? ')' )? ;
+    /// MetaSeq = MetaItemInner (',' MetaItemInner)* ','? ;
     /// ```
     pub fn parse_meta_item(&mut self) -> PResult<'a, ast::MetaItem> {
-        let nt_meta = match &self.token.kind {
-            token::Interpolated(nt) => match &nt.0 {
-                token::NtMeta(e) => Some(e.clone()),
-                _ => None,
-            },
-            _ => None,
-        };
-
-        if let Some(item) = nt_meta {
-            return match item.meta(item.path.span) {
+        // We can't use `maybe_whole` here because it would bump in the `None`
+        // case, which we don't want.
+        if let token::Interpolated(nt) = &self.token.kind
+            && let token::NtMeta(attr_item) = &**nt
+        {
+            match attr_item.meta(attr_item.path.span) {
                 Some(meta) => {
                     self.bump();
-                    Ok(meta)
+                    return Ok(meta);
                 }
-                None => self.unexpected(),
-            };
+                None => self.unexpected()?,
+            }
         }
 
         let lo = self.token.span;
+        let is_unsafe = self.eat_keyword(kw::Unsafe);
+        let unsafety = if is_unsafe {
+            let unsafe_span = self.prev_token.span;
+            self.psess.gated_spans.gate(sym::unsafe_attributes, unsafe_span);
+            self.expect(&token::OpenDelim(Delimiter::Parenthesis))?;
+
+            ast::Safety::Unsafe(unsafe_span)
+        } else {
+            ast::Safety::Default
+        };
+
         let path = self.parse_path(PathStyle::Mod)?;
         let kind = self.parse_meta_item_kind()?;
+        if is_unsafe {
+            self.expect(&token::CloseDelim(Delimiter::Parenthesis))?;
+        }
         let span = lo.to(self.prev_token.span);
-        Ok(ast::MetaItem { path, kind, span })
+
+        Ok(ast::MetaItem { unsafety, path, kind, span })
     }
 
     pub(crate) fn parse_meta_item_kind(&mut self) -> PResult<'a, ast::MetaItemKind> {
         Ok(if self.eat(&token::Eq) {
             ast::MetaItemKind::NameValue(self.parse_unsuffixed_meta_item_lit()?)
         } else if self.check(&token::OpenDelim(Delimiter::Parenthesis)) {
-            // Matches `meta_seq = ( COMMASEP(meta_item_inner) )`.
             let (list, _) = self.parse_paren_comma_seq(|p| p.parse_meta_item_inner())?;
             ast::MetaItemKind::List(list)
         } else {
@@ -408,38 +421,45 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Matches `meta_item_inner : (meta_item | UNSUFFIXED_LIT) ;`.
+    /// Parse an inner meta item per RFC 1559.
+    ///
+    /// ```ebnf
+    /// MetaItemInner = UNSUFFIXED_LIT | MetaItem ;
+    /// ```
     fn parse_meta_item_inner(&mut self) -> PResult<'a, ast::NestedMetaItem> {
         match self.parse_unsuffixed_meta_item_lit() {
             Ok(lit) => return Ok(ast::NestedMetaItem::Lit(lit)),
-            Err(err) => err.cancel(),
+            Err(err) => err.cancel(), // we provide a better error below
         }
 
         match self.parse_meta_item() {
             Ok(mi) => return Ok(ast::NestedMetaItem::MetaItem(mi)),
-            Err(err) => err.cancel(),
+            Err(err) => err.cancel(), // we provide a better error below
         }
 
-        let token = self.token.clone();
+        let mut err = errors::InvalidMetaItem {
+            span: self.token.span,
+            token: self.token.clone(),
+            quote_ident_sugg: None,
+        };
 
-        // Check for unquoted idents in meta items, e.g.: #[cfg(key = foo)]
-        // `from_expansion()` ensures we don't suggest for cases such as
-        // `#[cfg(feature = $expr)]` in macros
-        if self.prev_token == token::Eq && !self.token.span.from_expansion() {
+        // Suggest quoting idents, e.g. in `#[cfg(key = value)]`. We don't use `Token::ident` and
+        // don't `uninterpolate` the token to avoid suggesting anything butchered or questionable
+        // when macro metavariables are involved.
+        if self.prev_token == token::Eq
+            && let token::Ident(..) = self.token.kind
+        {
             let before = self.token.span.shrink_to_lo();
-            while matches!(self.token.kind, token::Ident(..)) {
+            while let token::Ident(..) = self.token.kind {
                 self.bump();
             }
-            let after = self.prev_token.span.shrink_to_hi();
-            let sugg = InvalidMetaItemSuggQuoteIdent { before, after };
-            return Err(self.dcx().create_err(InvalidMetaItemUnquotedIdent {
-                span: token.span,
-                token,
-                sugg,
-            }));
+            err.quote_ident_sugg = Some(errors::InvalidMetaItemQuoteIdentSugg {
+                before,
+                after: self.prev_token.span.shrink_to_hi(),
+            });
         }
 
-        Err(self.dcx().create_err(InvalidMetaItem { span: token.span, token }))
+        Err(self.dcx().create_err(err))
     }
 }
 

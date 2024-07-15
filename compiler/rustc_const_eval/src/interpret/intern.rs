@@ -13,19 +13,23 @@
 //! but that would require relying on type information, and given how many ways Rust has to lie
 //! about type information, we want to avoid doing that.
 
+use hir::def::DefKind;
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
-use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
-use rustc_middle::mir::interpret::{CtfeProvenance, InterpResult};
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
+use rustc_middle::mir::interpret::{ConstAllocation, CtfeProvenance, InterpResult};
+use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::TyAndLayout;
+use rustc_span::def_id::LocalDefId;
+use rustc_span::sym;
+use tracing::{instrument, trace};
 
-use super::{AllocId, Allocation, InterpCx, MPlaceTy, Machine, MemoryKind, PlaceTy};
+use super::{err_ub, AllocId, Allocation, InterpCx, MPlaceTy, Machine, MemoryKind, PlaceTy};
 use crate::const_eval;
-use crate::errors::{DanglingPtrInFinal, MutablePtrInFinal};
+use crate::errors::NestedStaticInThreadLocal;
 
-pub trait CompileTimeMachine<'mir, 'tcx: 'mir, T> = Machine<
-        'mir,
+pub trait CompileTimeMachine<'tcx, T> = Machine<
         'tcx,
         MemoryKind = T,
         Provenance = CtfeProvenance,
@@ -33,7 +37,19 @@ pub trait CompileTimeMachine<'mir, 'tcx: 'mir, T> = Machine<
         FrameExtra = (),
         AllocExtra = (),
         MemoryMap = FxIndexMap<AllocId, (MemoryKind<T>, Allocation)>,
-    >;
+    > + HasStaticRootDefId;
+
+pub trait HasStaticRootDefId {
+    /// Returns the `DefId` of the static item that is currently being evaluated.
+    /// Used for interning to be able to handle nested allocations.
+    fn static_def_id(&self) -> Option<LocalDefId>;
+}
+
+impl HasStaticRootDefId for const_eval::CompileTimeMachine<'_> {
+    fn static_def_id(&self) -> Option<LocalDefId> {
+        Some(self.static_root_ids?.1)
+    }
+}
 
 /// Intern an allocation. Returns `Err` if the allocation does not exist in the local memory.
 ///
@@ -42,8 +58,8 @@ pub trait CompileTimeMachine<'mir, 'tcx: 'mir, T> = Machine<
 /// already mutable (as a sanity check).
 ///
 /// Returns an iterator over all relocations referred to by this allocation.
-fn intern_shallow<'rt, 'mir, 'tcx, T, M: CompileTimeMachine<'mir, 'tcx, T>>(
-    ecx: &'rt mut InterpCx<'mir, 'tcx, M>,
+fn intern_shallow<'rt, 'tcx, T, M: CompileTimeMachine<'tcx, T>>(
+    ecx: &'rt mut InterpCx<'tcx, M>,
     alloc_id: AllocId,
     mutability: Mutability,
 ) -> Result<impl Iterator<Item = CtfeProvenance> + 'tcx, ()> {
@@ -67,8 +83,43 @@ fn intern_shallow<'rt, 'mir, 'tcx, T, M: CompileTimeMachine<'mir, 'tcx, T>>(
     }
     // link the alloc id to the actual allocation
     let alloc = ecx.tcx.mk_const_alloc(alloc);
-    ecx.tcx.set_alloc_id_memory(alloc_id, alloc);
+    if let Some(static_id) = ecx.machine.static_def_id() {
+        intern_as_new_static(ecx.tcx, static_id, alloc_id, alloc);
+    } else {
+        ecx.tcx.set_alloc_id_memory(alloc_id, alloc);
+    }
     Ok(alloc.0.0.provenance().ptrs().iter().map(|&(_, prov)| prov))
+}
+
+/// Creates a new `DefId` and feeds all the right queries to make this `DefId`
+/// appear as if it were a user-written `static` (though it has no HIR).
+fn intern_as_new_static<'tcx>(
+    tcx: TyCtxtAt<'tcx>,
+    static_id: LocalDefId,
+    alloc_id: AllocId,
+    alloc: ConstAllocation<'tcx>,
+) {
+    let feed = tcx.create_def(
+        static_id,
+        sym::nested,
+        DefKind::Static { safety: hir::Safety::Safe, mutability: alloc.0.mutability, nested: true },
+    );
+    tcx.set_nested_alloc_id_static(alloc_id, feed.def_id());
+
+    if tcx.is_thread_local_static(static_id.into()) {
+        tcx.dcx().emit_err(NestedStaticInThreadLocal { span: tcx.def_span(static_id) });
+    }
+
+    // These do not inherit the codegen attrs of the parent static allocation, since
+    // it doesn't make sense for them to inherit their `#[no_mangle]` and `#[link_name = ..]`
+    // and the like.
+    feed.codegen_fn_attrs(CodegenFnAttrs::new());
+
+    feed.eval_static_initializer(Ok(alloc));
+    feed.generics_of(tcx.generics_of(static_id).clone());
+    feed.def_ident_span(tcx.def_ident_span(static_id));
+    feed.explicit_predicates_of(tcx.explicit_predicates_of(static_id));
+    feed.feed_hir();
 }
 
 /// How a constant value should be interned.
@@ -81,6 +132,12 @@ pub enum InternKind {
     Promoted,
 }
 
+#[derive(Debug)]
+pub enum InternResult {
+    FoundBadMutablePointer,
+    FoundDanglingPointer,
+}
+
 /// Intern `ret` and everything it references.
 ///
 /// This *cannot raise an interpreter error*. Doing so is left to validation, which
@@ -88,15 +145,11 @@ pub enum InternKind {
 ///
 /// For `InternKind::Static` the root allocation will not be interned, but must be handled by the caller.
 #[instrument(level = "debug", skip(ecx))]
-pub fn intern_const_alloc_recursive<
-    'mir,
-    'tcx: 'mir,
-    M: CompileTimeMachine<'mir, 'tcx, const_eval::MemoryKind>,
->(
-    ecx: &mut InterpCx<'mir, 'tcx, M>,
+pub fn intern_const_alloc_recursive<'tcx, M: CompileTimeMachine<'tcx, const_eval::MemoryKind>>(
+    ecx: &mut InterpCx<'tcx, M>,
     intern_kind: InternKind,
     ret: &MPlaceTy<'tcx>,
-) -> Result<(), ErrorGuaranteed> {
+) -> Result<(), InternResult> {
     // We are interning recursively, and for mutability we are distinguishing the "root" allocation
     // that we are starting in, and all other allocations that we are encountering recursively.
     let (base_mutability, inner_mutability, is_static) = match intern_kind {
@@ -134,7 +187,7 @@ pub fn intern_const_alloc_recursive<
     // This gives us the initial set of nested allocations, which will then all be processed
     // recursively in the loop below.
     let mut todo: Vec<_> = if is_static {
-        // Do not steal the root allocation, we need it later for `take_static_root_alloc`
+        // Do not steal the root allocation, we need it later to create the return value of `eval_static_initializer`.
         // But still change its mutability to match the requested one.
         let alloc = ecx.memory.alloc_map.get_mut(&base_alloc_id).unwrap();
         alloc.1.mutability = base_mutability;
@@ -148,7 +201,7 @@ pub fn intern_const_alloc_recursive<
     // Whether we encountered a bad mutable pointer.
     // We want to first report "dangling" and then "mutable", so we need to delay reporting these
     // errors.
-    let mut found_bad_mutable_pointer = false;
+    let mut result = Ok(());
 
     // Keep interning as long as there are things to intern.
     // We show errors if there are dangling pointers, or mutable pointers in immutable contexts
@@ -198,7 +251,10 @@ pub fn intern_const_alloc_recursive<
             // on the promotion analysis not screwing up to ensure that it is sound to intern
             // promoteds as immutable.
             trace!("found bad mutable pointer");
-            found_bad_mutable_pointer = true;
+            // Prefer dangling pointer errors over mutable pointer errors
+            if result.is_ok() {
+                result = Err(InternResult::FoundBadMutablePointer);
+            }
         }
         if ecx.tcx.try_get_global_alloc(alloc_id).is_some() {
             // Already interned.
@@ -216,29 +272,21 @@ pub fn intern_const_alloc_recursive<
         // pointers before deciding which allocations can be made immutable; but for now we are
         // okay with losing some potential for immutability here. This can anyway only affect
         // `static mut`.
-        todo.extend(intern_shallow(ecx, alloc_id, inner_mutability).map_err(|()| {
-            ecx.tcx.dcx().emit_err(DanglingPtrInFinal { span: ecx.tcx.span, kind: intern_kind })
-        })?);
+        match intern_shallow(ecx, alloc_id, inner_mutability) {
+            Ok(nested) => todo.extend(nested),
+            Err(()) => {
+                ecx.tcx.dcx().delayed_bug("found dangling pointer during const interning");
+                result = Err(InternResult::FoundDanglingPointer);
+            }
+        }
     }
-    if found_bad_mutable_pointer {
-        return Err(ecx
-            .tcx
-            .dcx()
-            .emit_err(MutablePtrInFinal { span: ecx.tcx.span, kind: intern_kind }));
-    }
-
-    Ok(())
+    result
 }
 
 /// Intern `ret`. This function assumes that `ret` references no other allocation.
 #[instrument(level = "debug", skip(ecx))]
-pub fn intern_const_alloc_for_constprop<
-    'mir,
-    'tcx: 'mir,
-    T,
-    M: CompileTimeMachine<'mir, 'tcx, T>,
->(
-    ecx: &mut InterpCx<'mir, 'tcx, M>,
+pub fn intern_const_alloc_for_constprop<'tcx, T, M: CompileTimeMachine<'tcx, T>>(
+    ecx: &mut InterpCx<'tcx, M>,
     alloc_id: AllocId,
 ) -> InterpResult<'tcx, ()> {
     if ecx.tcx.try_get_global_alloc(alloc_id).is_some() {
@@ -246,7 +294,9 @@ pub fn intern_const_alloc_for_constprop<
         return Ok(());
     }
     // Move allocation to `tcx`.
-    for _ in intern_shallow(ecx, alloc_id, Mutability::Not).map_err(|()| err_ub!(DeadLocal))? {
+    if let Some(_) =
+        (intern_shallow(ecx, alloc_id, Mutability::Not).map_err(|()| err_ub!(DeadLocal))?).next()
+    {
         // We are not doing recursive interning, so we don't currently support provenance.
         // (If this assertion ever triggers, we should just implement a
         // proper recursive interning loop -- or just call `intern_const_alloc_recursive`.
@@ -255,19 +305,14 @@ pub fn intern_const_alloc_for_constprop<
     Ok(())
 }
 
-impl<'mir, 'tcx: 'mir, M: super::intern::CompileTimeMachine<'mir, 'tcx, !>>
-    InterpCx<'mir, 'tcx, M>
-{
+impl<'tcx, M: super::intern::CompileTimeMachine<'tcx, !>> InterpCx<'tcx, M> {
     /// A helper function that allocates memory for the layout given and gives you access to mutate
     /// it. Once your own mutation code is done, the backing `Allocation` is removed from the
     /// current `Memory` and interned as read-only into the global memory.
     pub fn intern_with_temp_alloc(
         &mut self,
         layout: TyAndLayout<'tcx>,
-        f: impl FnOnce(
-            &mut InterpCx<'mir, 'tcx, M>,
-            &PlaceTy<'tcx, M::Provenance>,
-        ) -> InterpResult<'tcx, ()>,
+        f: impl FnOnce(&mut InterpCx<'tcx, M>, &PlaceTy<'tcx, M::Provenance>) -> InterpResult<'tcx, ()>,
     ) -> InterpResult<'tcx, AllocId> {
         // `allocate` picks a fresh AllocId that we will associate with its data below.
         let dest = self.allocate(layout, MemoryKind::Stack)?;

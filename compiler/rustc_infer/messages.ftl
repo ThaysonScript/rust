@@ -104,10 +104,10 @@ infer_compare_impl_item_obligation = ...so that the definition in impl matches t
 infer_consider_specifying_length = consider specifying the actual array length
 infer_data_flows = ...but data{$label_var1_exists ->
     [true] {" "}from `{$label_var1}`
-    *[false] -> {""}
+    *[false] {""}
 } flows{$label_var2_exists ->
     [true] {" "}into `{$label_var2}`
-    *[false] -> {""}
+    *[false] {""}
 } here
 
 infer_data_lifetime_flow = ...but data with one lifetime flows into the other here
@@ -144,6 +144,9 @@ infer_fps_items_are_distinct = fn items are distinct from fn pointers
 infer_fps_remove_ref = consider removing the reference
 infer_fps_use_ref = consider using a reference
 infer_fulfill_req_lifetime = the type `{$ty}` does not fulfill the required lifetime
+
+infer_full_type_written = the full type name has been written to '{$path}'
+
 infer_implicit_static_lifetime_note = this has an implicit `'static` lifetime requirement
 infer_implicit_static_lifetime_suggestion = consider relaxing the implicit `'static` requirement
 infer_label_bad = {$bad_kind ->
@@ -161,7 +164,10 @@ infer_label_bad = {$bad_kind ->
 infer_lf_bound_not_satisfied = lifetime bound not satisfied
 infer_lifetime_mismatch = lifetime mismatch
 
-infer_lifetime_param_suggestion = consider introducing a named lifetime parameter{$is_impl ->
+infer_lifetime_param_suggestion = consider {$is_reuse ->
+    [true] reusing
+    *[false] introducing
+} a named lifetime parameter{$is_impl ->
     [true] {" "}and update trait if needed
     *[false] {""}
 }
@@ -169,7 +175,7 @@ infer_lifetime_param_suggestion_elided = each elided lifetime in input position 
 
 infer_meant_byte_literal = if you meant to write a byte literal, prefix with `b`
 infer_meant_char_literal = if you meant to write a `char` literal, use single quotes
-infer_meant_str_literal = if you meant to write a `str` literal, use double quotes
+infer_meant_str_literal = if you meant to write a string literal, use double quotes
 infer_mismatched_static_lifetime = incompatible lifetime on type
 infer_more_targeted = {$has_param_name ->
     [true] `{$param_name}`
@@ -181,14 +187,6 @@ infer_more_targeted = {$has_param_name ->
 
 infer_msl_introduces_static = introduces a `'static` lifetime requirement
 infer_msl_unmet_req = because this has an unmet lifetime requirement
-infer_need_type_info_in_coroutine =
-    type inside {$coroutine_kind ->
-    [async_block] `async` block
-    [async_closure] `async` closure
-    [async_fn] `async fn` body
-    *[coroutine] coroutine
-    } must be known in this context
-
 
 infer_nothing = {""}
 
@@ -223,6 +221,10 @@ infer_opaque_hidden_type =
 
 infer_outlives_bound = lifetime of the source pointer does not outlive lifetime bound of the object type
 infer_outlives_content = lifetime of reference outlives lifetime of borrowed content...
+
+infer_precise_capturing_existing = add `{$new_lifetime}` to the `use<...>` bound to explicitly capture it
+infer_precise_capturing_new = add a `use<...>` bound to explicitly capture `{$new_lifetime}`
+
 infer_prlf_defined_with_sub = the lifetime `{$sub_symbol}` defined here...
 infer_prlf_defined_without_sub = the lifetime defined here...
 infer_prlf_known_limitation = this is a known limitation that will be removed in the future (see issue #100013 <https://github.com/rust-lang/rust/issues/100013> for more information)
@@ -278,9 +280,6 @@ infer_ril_introduced_by = requirement introduced by this return type
 infer_ril_introduced_here = `'static` requirement introduced here
 infer_ril_static_introduced_by = "`'static` lifetime requirement introduced by the return type
 
-infer_sbfrit_box_return_expr = if you change the return type to expect trait objects, box the returned expressions
-
-infer_sbfrit_change_return_type = you could change the return type to be a boxed trait object
 infer_source_kind_closure_return =
     try giving this closure an explicit return type
 

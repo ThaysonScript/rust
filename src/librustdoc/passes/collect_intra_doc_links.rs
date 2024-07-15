@@ -8,11 +8,11 @@ use rustc_data_structures::{
     fx::{FxHashMap, FxHashSet},
     intern::Interned,
 };
-use rustc_errors::{Applicability, DiagnosticBuilder, DiagnosticMessage};
+use rustc_errors::{Applicability, Diag, DiagMessage};
 use rustc_hir::def::Namespace::*;
 use rustc_hir::def::{DefKind, Namespace, PerNS};
 use rustc_hir::def_id::{DefId, CRATE_DEF_ID};
-use rustc_hir::Mutability;
+use rustc_hir::{Mutability, Safety};
 use rustc_middle::ty::{Ty, TyCtxt};
 use rustc_middle::{bug, span_bug, ty};
 use rustc_resolve::rustdoc::{has_primitive_or_keyword_docs, prepare_to_doc_link_resolution};
@@ -123,7 +123,7 @@ impl Res {
             DefKind::Const | DefKind::ConstParam | DefKind::AssocConst | DefKind::AnonConst => {
                 "const"
             }
-            DefKind::Static(_) => "static",
+            DefKind::Static { .. } => "static",
             // Now handle things that don't have a specific disambiguator
             _ => match kind
                 .ns()
@@ -491,9 +491,10 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
             ty::Str => Res::Primitive(Str),
             ty::Tuple(tys) if tys.is_empty() => Res::Primitive(Unit),
             ty::Tuple(_) => Res::Primitive(Tuple),
+            ty::Pat(..) => Res::Primitive(Pat),
             ty::Array(..) => Res::Primitive(Array),
             ty::Slice(_) => Res::Primitive(Slice),
-            ty::RawPtr(_) => Res::Primitive(RawPointer),
+            ty::RawPtr(_, _) => Res::Primitive(RawPointer),
             ty::Ref(..) => Res::Primitive(Reference),
             ty::FnDef(..) => panic!("type alias to a function definition"),
             ty::FnPtr(_) => Res::Primitive(Fn),
@@ -536,8 +537,10 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
             I64 => tcx.types.i64,
             I128 => tcx.types.i128,
             Isize => tcx.types.isize,
+            F16 => tcx.types.f16,
             F32 => tcx.types.f32,
             F64 => tcx.types.f64,
+            F128 => tcx.types.f128,
             U8 => tcx.types.u8,
             U16 => tcx.types.u16,
             U32 => tcx.types.u32,
@@ -1173,22 +1176,21 @@ impl LinkCollector<'_, '_> {
     ) {
         // The resolved item did not match the disambiguator; give a better error than 'not found'
         let msg = format!("incompatible link kind for `{path_str}`");
-        let callback =
-            |diag: &mut DiagnosticBuilder<'_, ()>, sp: Option<rustc_span::Span>, link_range| {
-                let note = format!(
-                    "this link resolved to {} {}, which is not {} {}",
-                    resolved.article(),
-                    resolved.descr(),
-                    specified.article(),
-                    specified.descr(),
-                );
-                if let Some(sp) = sp {
-                    diag.span_label(sp, note);
-                } else {
-                    diag.note(note);
-                }
-                suggest_disambiguator(resolved, diag, path_str, link_range, sp, diag_info);
-            };
+        let callback = |diag: &mut Diag<'_, ()>, sp: Option<rustc_span::Span>, link_range| {
+            let note = format!(
+                "this link resolved to {} {}, which is not {} {}",
+                resolved.article(),
+                resolved.descr(),
+                specified.article(),
+                specified.descr(),
+            );
+            if let Some(sp) = sp {
+                diag.span_label(sp, note);
+            } else {
+                diag.note(note);
+            }
+            suggest_disambiguator(resolved, diag, path_str, link_range, sp, diag_info);
+        };
         report_diagnostic(self.cx.tcx, BROKEN_INTRA_DOC_LINKS, msg, diag_info, callback);
     }
 
@@ -1418,7 +1420,7 @@ impl LinkCollector<'_, '_> {
         //
         // Otherwise, check if 2 links are same, if so, skip the resolve process.
         //
-        // Notice that this algorithm is passive, might possibly miss actual redudant cases.
+        // Notice that this algorithm is passive, might possibly miss actual redundant cases.
         let explicit_link = explicit_link.to_string();
         let display_text = ori_link.display_text.as_ref().unwrap();
 
@@ -1505,6 +1507,15 @@ impl Disambiguator {
     fn from_str(link: &str) -> Result<Option<(Self, &str, &str)>, (String, Range<usize>)> {
         use Disambiguator::{Kind, Namespace as NS, Primitive};
 
+        let suffixes = [
+            // If you update this list, please also update the relevant rustdoc book section!
+            ("!()", DefKind::Macro(MacroKind::Bang)),
+            ("!{}", DefKind::Macro(MacroKind::Bang)),
+            ("![]", DefKind::Macro(MacroKind::Bang)),
+            ("()", DefKind::Fn),
+            ("!", DefKind::Macro(MacroKind::Bang)),
+        ];
+
         if let Some(idx) = link.find('@') {
             let (prefix, rest) = link.split_at(idx);
             let d = match prefix {
@@ -1515,7 +1526,11 @@ impl Disambiguator {
                 "union" => Kind(DefKind::Union),
                 "module" | "mod" => Kind(DefKind::Mod),
                 "const" | "constant" => Kind(DefKind::Const),
-                "static" => Kind(DefKind::Static(Mutability::Not)),
+                "static" => Kind(DefKind::Static {
+                    mutability: Mutability::Not,
+                    nested: false,
+                    safety: Safety::Safe,
+                }),
                 "function" | "fn" | "method" => Kind(DefKind::Fn),
                 "derive" => Kind(DefKind::Macro(MacroKind::Derive)),
                 "type" => NS(Namespace::TypeNS),
@@ -1524,16 +1539,23 @@ impl Disambiguator {
                 "prim" | "primitive" => Primitive,
                 _ => return Err((format!("unknown disambiguator `{prefix}`"), 0..idx)),
             };
+
+            for (suffix, kind) in suffixes {
+                if let Some(path_str) = rest.strip_suffix(suffix) {
+                    if d.ns() != Kind(kind).ns() {
+                        return Err((
+                            format!("unmatched disambiguator `{prefix}` and suffix `{suffix}`"),
+                            0..idx,
+                        ));
+                    } else if path_str.len() > 1 {
+                        // path_str != "@"
+                        return Ok(Some((d, &path_str[1..], &rest[1..])));
+                    }
+                }
+            }
+
             Ok(Some((d, &rest[1..], &rest[1..])))
         } else {
-            let suffixes = [
-                // If you update this list, please also update the relevant rustdoc book section!
-                ("!()", DefKind::Macro(MacroKind::Bang)),
-                ("!{}", DefKind::Macro(MacroKind::Bang)),
-                ("![]", DefKind::Macro(MacroKind::Bang)),
-                ("()", DefKind::Fn),
-                ("!", DefKind::Macro(MacroKind::Bang)),
-            ];
             for (suffix, kind) in suffixes {
                 if let Some(path_str) = link.strip_suffix(suffix) {
                     // Avoid turning `!` or `()` into an empty string
@@ -1675,9 +1697,9 @@ impl Suggestion {
 fn report_diagnostic(
     tcx: TyCtxt<'_>,
     lint: &'static Lint,
-    msg: impl Into<DiagnosticMessage> + Display,
+    msg: impl Into<DiagMessage> + Display,
     DiagnosticInfo { item, ori_link: _, dox, link_range }: &DiagnosticInfo<'_>,
-    decorate: impl FnOnce(&mut DiagnosticBuilder<'_, ()>, Option<rustc_span::Span>, MarkdownLinkRange),
+    decorate: impl FnOnce(&mut Diag<'_, ()>, Option<rustc_span::Span>, MarkdownLinkRange),
 ) {
     let Some(hir_id) = DocContext::as_local_hir_id(tcx, item.item_id) else {
         // If non-local, no need to check anything.
@@ -1687,7 +1709,9 @@ fn report_diagnostic(
 
     let sp = item.attr_span(tcx);
 
-    tcx.node_span_lint(lint, hir_id, sp, msg, |lint| {
+    tcx.node_span_lint(lint, hir_id, sp, |lint| {
+        lint.primary_message(msg);
+
         let (span, link_range) = match link_range {
             MarkdownLinkRange::Destination(md_range) => {
                 let mut md_range = md_range.clone();
@@ -1927,7 +1951,7 @@ fn resolution_failure(
                             | OpaqueTy
                             | TraitAlias
                             | TyParam
-                            | Static(_) => "associated item",
+                            | Static { .. } => "associated item",
                             Impl { .. } | GlobalAsm => unreachable!("not a path"),
                         }
                     } else {
@@ -2011,7 +2035,7 @@ fn disambiguator_error(
     cx: &DocContext<'_>,
     mut diag_info: DiagnosticInfo<'_>,
     disambiguator_range: MarkdownLinkRange,
-    msg: impl Into<DiagnosticMessage> + Display,
+    msg: impl Into<DiagMessage> + Display,
 ) {
     diag_info.link_range = disambiguator_range;
     report_diagnostic(cx.tcx, BROKEN_INTRA_DOC_LINKS, msg, &diag_info, |diag, _sp, _link_range| {
@@ -2125,7 +2149,7 @@ fn ambiguity_error(
 /// disambiguator.
 fn suggest_disambiguator(
     res: Res,
-    diag: &mut DiagnosticBuilder<'_, ()>,
+    diag: &mut Diag<'_, ()>,
     path_str: &str,
     link_range: MarkdownLinkRange,
     sp: Option<rustc_span::Span>,
@@ -2197,8 +2221,10 @@ fn resolve_primitive(path_str: &str, ns: Namespace) -> Option<Res> {
         "u32" => U32,
         "u64" => U64,
         "u128" => U128,
+        "f16" => F16,
         "f32" => F32,
         "f64" => F64,
+        "f128" => F128,
         "char" => Char,
         "bool" | "true" | "false" => Bool,
         "str" | "&str" => Str,

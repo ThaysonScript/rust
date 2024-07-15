@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// rustdoc format-version.
-pub const FORMAT_VERSION: u32 = 28;
+pub const FORMAT_VERSION: u32 = 32;
 
 /// A `Crate` is the root of the emitted JSON blob. It contains all type/documentation information
 /// about the language items in the local crate, as well as info about external items to allow
@@ -167,8 +167,6 @@ pub enum GenericArg {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Constant {
-    #[serde(rename = "type")]
-    pub type_: Type,
     pub expr: String,
     pub value: Option<String>,
     pub is_literal: bool,
@@ -188,7 +186,19 @@ pub enum TypeBindingKind {
     Constraint(Vec<GenericBound>),
 }
 
+/// An opaque identifier for an item.
+///
+/// It can be used to lookup in [Crate::index] or [Crate::paths] to resolve it
+/// to an [Item].
+///
+/// Id's are only valid within a single JSON blob. They cannot be used to
+/// resolve references between the JSON output's for different crates.
+///
+/// Rustdoc makes no guarantees about the inner value of Id's. Applications
+/// should treat them as opaque keys to lookup items, and avoid attempting
+/// to parse them, or otherwise depend on any implementation details.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// FIXME(aDotInTheVoid): Consider making this non-public in rustdoc-types.
 pub struct Id(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -244,7 +254,12 @@ pub enum ItemEnum {
 
     TypeAlias(TypeAlias),
     OpaqueTy(OpaqueTy),
-    Constant(Constant),
+    Constant {
+        #[serde(rename = "type")]
+        type_: Type,
+        #[serde(rename = "const")]
+        const_: Constant,
+    },
 
     Static(Static),
 
@@ -314,7 +329,7 @@ pub enum StructKind {
     /// All [`Id`]'s will point to [`ItemEnum::StructField`]. Private and
     /// `#[doc(hidden)]` fields will be given as `None`
     Tuple(Vec<Option<Id>>),
-    /// A struct with nammed fields.
+    /// A struct with named fields.
     ///
     /// ```rust
     /// pub struct PlainStruct { x: i32 }
@@ -496,9 +511,9 @@ pub enum WherePredicate {
         /// ```
         generic_params: Vec<GenericParamDef>,
     },
-    RegionPredicate {
+    LifetimePredicate {
         lifetime: String,
-        bounds: Vec<GenericBound>,
+        outlives: Vec<String>,
     },
     EqPredicate {
         lhs: Type,
@@ -523,6 +538,8 @@ pub enum GenericBound {
         modifier: TraitBoundModifier,
     },
     Outlives(String),
+    /// `use<'a, T>` precise-capturing bound syntax
+    Use(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -561,6 +578,13 @@ pub enum Type {
         #[serde(rename = "type")]
         type_: Box<Type>,
         len: String,
+    },
+    /// `u32 is 1..`
+    Pat {
+        #[serde(rename = "type")]
+        type_: Box<Type>,
+        #[doc(hidden)]
+        __pat_unstable_do_not_use: String,
     },
     /// `impl TraitA + TraitB + ...`
     ImplTrait(Vec<GenericBound>),

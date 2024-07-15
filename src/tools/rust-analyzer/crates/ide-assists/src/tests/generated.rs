@@ -346,6 +346,21 @@ pub(crate) fn frobnicate() {}
 }
 
 #[test]
+fn doctest_comment_to_doc() {
+    check_doc_test(
+        "comment_to_doc",
+        r#####"
+// Wow what $0a nice module
+// I sure hope this shows up when I hover over it
+"#####,
+        r#####"
+//! Wow what a nice module
+//! I sure hope this shows up when I hover over it
+"#####,
+    )
+}
+
+#[test]
 fn doctest_convert_bool_then_to_if() {
     check_doc_test(
         "convert_bool_then_to_if",
@@ -385,6 +400,36 @@ fn main() {
     x.into_iter().for_each(|v| {
         let y = v * 2;
     });
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_from_to_tryfrom() {
+    check_doc_test(
+        "convert_from_to_tryfrom",
+        r#####"
+//- minicore: from
+impl $0From<usize> for Thing {
+    fn from(val: usize) -> Self {
+        Thing {
+            b: val.to_string(),
+            a: val
+        }
+    }
+}
+"#####,
+        r#####"
+impl TryFrom<usize> for Thing {
+    type Error = ${0:()};
+
+    fn try_from(val: usize) -> Result<Self, Self::Error> {
+        Ok(Thing {
+            b: val.to_string(),
+            a: val
+        })
+    }
 }
 "#####,
     )
@@ -723,6 +768,35 @@ fn main() {
 }
 
 #[test]
+fn doctest_destructure_struct_binding() {
+    check_doc_test(
+        "destructure_struct_binding",
+        r#####"
+struct Foo {
+    bar: i32,
+    baz: i32,
+}
+fn main() {
+    let $0foo = Foo { bar: 1, baz: 2 };
+    let bar2 = foo.bar;
+    let baz2 = &foo.baz;
+}
+"#####,
+        r#####"
+struct Foo {
+    bar: i32,
+    baz: i32,
+}
+fn main() {
+    let Foo { bar, baz } = Foo { bar: 1, baz: 2 };
+    let bar2 = bar;
+    let baz2 = &baz;
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_destructure_tuple_binding() {
     check_doc_test(
         "destructure_tuple_binding",
@@ -736,6 +810,24 @@ fn main() {
 fn main() {
     let ($0_0, _1) = (1,2);
     let v = _0;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_desugar_async_into_impl_future() {
+    check_doc_test(
+        "desugar_async_into_impl_future",
+        r#####"
+//- minicore: future
+pub as$0ync fn foo() -> usize {
+    0
+}
+"#####,
+        r#####"
+pub fn foo() -> impl core::future::Future<Output = usize> {
+    0
 }
 "#####,
     )
@@ -904,6 +996,27 @@ fn main() {
 fn main() {
     let $0var_name = (1 + 2);
     var_name * 4;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_fill_record_pattern_fields() {
+    check_doc_test(
+        "fill_record_pattern_fields",
+        r#####"
+struct Bar { y: Y, z: Z }
+
+fn foo(bar: Bar) {
+    let Bar { ..$0 } = bar;
+}
+"#####,
+        r#####"
+struct Bar { y: Y, z: Z }
+
+fn foo(bar: Bar) {
+    let Bar { y, z  } = bar;
 }
 "#####,
     )
@@ -1770,13 +1883,13 @@ fn print(_: &str) {}
 
 fn bar() {
     {
-        let word = "안녕하세요";
+        let word: &str = "안녕하세요";
         if !word.is_empty() {
             print(word);
         }
     };
     {
-        let word = "여러분";
+        let word: &str = "여러분";
         if !word.is_empty() {
             print(word);
         }
@@ -2941,6 +3054,24 @@ use std::{collections::HashMap};
 }
 
 #[test]
+fn doctest_sugar_impl_future_into_async() {
+    check_doc_test(
+        "sugar_impl_future_into_async",
+        r#####"
+//- minicore: future
+pub fn foo() -> impl core::future::F$0uture<Output = usize> {
+    async { 0 }
+}
+"#####,
+        r#####"
+pub async fn foo() -> usize {
+    async { 0 }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_toggle_ignore() {
     check_doc_test(
         "toggle_ignore",
@@ -3098,6 +3229,25 @@ fn foo() -> i32$0 { 42i32 }
 "#####,
         r#####"
 fn foo() -> Result<i32, ${0:_}> { Ok(42i32) }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_wrap_unwrap_cfg_attr() {
+    check_doc_test(
+        "wrap_unwrap_cfg_attr",
+        r#####"
+#[derive$0(Debug)]
+struct S {
+   field: i32
+}
+"#####,
+        r#####"
+#[cfg_attr($0, derive(Debug))]
+struct S {
+   field: i32
+}
 "#####,
     )
 }

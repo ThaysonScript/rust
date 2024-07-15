@@ -147,6 +147,8 @@ Options:
                         
         --test-builder PATH
                         The rustc-like binary to use as the test builder
+        --test-builder-wrapper PATH
+                        Wrapper program to pass test-builder and arguments
         --check         Run rustdoc checks
         --generate-redirect-map 
                         Generate JSON file at the top level instead of
@@ -155,6 +157,8 @@ Options:
                         Comma separated list of types of output for rustdoc to
                         emit
         --no-run        Compile doctests without running them
+        --remap-path-prefix FROM=TO
+                        Remap source names in compiler messages
         --show-type-layout 
                         Include the memory layout of types in the docs
         --nocapture     Don't capture stdout and stderr of tests

@@ -116,7 +116,7 @@ pub enum AdjustmentHintsMode {
     PreferPostfix,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum InlayKind {
     Adjustment,
     BindingMode,
@@ -132,7 +132,7 @@ pub enum InlayKind {
     RangeExclusive,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub enum InlayHintPosition {
     Before,
     After,
@@ -151,13 +151,23 @@ pub struct InlayHint {
     pub label: InlayHintLabel,
     /// Text edit to apply when "accepting" this inlay hint.
     pub text_edit: Option<TextEdit>,
-    pub needs_resolve: bool,
+}
+
+impl std::hash::Hash for InlayHint {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.range.hash(state);
+        self.position.hash(state);
+        self.pad_left.hash(state);
+        self.pad_right.hash(state);
+        self.kind.hash(state);
+        self.label.hash(state);
+        self.text_edit.is_some().hash(state);
+    }
 }
 
 impl InlayHint {
     fn closing_paren_after(kind: InlayKind, range: TextRange) -> InlayHint {
         InlayHint {
-            needs_resolve: false,
             range,
             kind,
             label: InlayHintLabel::from(")"),
@@ -167,9 +177,9 @@ impl InlayHint {
             pad_right: false,
         }
     }
+
     fn opening_paren_before(kind: InlayKind, range: TextRange) -> InlayHint {
         InlayHint {
-            needs_resolve: false,
             range,
             kind,
             label: InlayHintLabel::from("("),
@@ -179,15 +189,19 @@ impl InlayHint {
             pad_right: false,
         }
     }
+
+    pub fn needs_resolve(&self) -> bool {
+        self.text_edit.is_some() || self.label.needs_resolve()
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub enum InlayTooltip {
     String(String),
     Markdown(String),
 }
 
-#[derive(Default)]
+#[derive(Default, Hash)]
 pub struct InlayHintLabel {
     pub parts: SmallVec<[InlayHintLabelPart; 1]>,
 }
@@ -265,6 +279,7 @@ impl fmt::Debug for InlayHintLabel {
     }
 }
 
+#[derive(Hash)]
 pub struct InlayHintLabelPart {
     pub text: String,
     /// Source location represented by this label part. The client will use this to fetch the part's
@@ -313,9 +328,7 @@ impl fmt::Write for InlayHintLabelBuilder<'_> {
 
 impl HirWrite for InlayHintLabelBuilder<'_> {
     fn start_location_link(&mut self, def: ModuleDefId) {
-        if self.location.is_some() {
-            never!("location link is already started");
-        }
+        never!(self.location.is_some(), "location link is already started");
         self.make_new_part();
         let Some(location) = ModuleDef::from(def).try_to_nav(self.db) else { return };
         let location = location.call_site();
@@ -425,11 +438,6 @@ fn ty_to_text_edit(
     Some(builder.finish())
 }
 
-pub enum RangeLimit {
-    Fixed(TextRange),
-    NearestParent(TextSize),
-}
-
 // Feature: Inlay Hints
 //
 // rust-analyzer shows additional information inline with the source code.
@@ -447,14 +455,31 @@ pub enum RangeLimit {
 // * elided lifetimes
 // * compiler inserted reborrows
 //
+// Note: inlay hints for function argument names are heuristically omitted to reduce noise and will not appear if
+// any of the
+// link:https://github.com/rust-lang/rust-analyzer/blob/6b8b8ff4c56118ddee6c531cde06add1aad4a6af/crates/ide/src/inlay_hints/param_name.rs#L92-L99[following criteria]
+// are met:
+//
+// * the parameter name is a suffix of the function's name
+// * the argument is a qualified constructing or call expression where the qualifier is an ADT
+// * exact argument<->parameter match(ignoring leading underscore) or parameter is a prefix/suffix
+//   of argument with _ splitting it off
+// * the parameter name starts with `ra_fixture`
+// * the parameter name is a
+// link:https://github.com/rust-lang/rust-analyzer/blob/6b8b8ff4c56118ddee6c531cde06add1aad4a6af/crates/ide/src/inlay_hints/param_name.rs#L200[well known name]
+// in a unary function
+// * the parameter name is a
+// link:https://github.com/rust-lang/rust-analyzer/blob/6b8b8ff4c56118ddee6c531cde06add1aad4a6af/crates/ide/src/inlay_hints/param_name.rs#L201[single character]
+// in a unary function
+//
 // image::https://user-images.githubusercontent.com/48062697/113020660-b5f98b80-917a-11eb-8d70-3be3fd558cdd.png[]
 pub(crate) fn inlay_hints(
     db: &RootDatabase,
     file_id: FileId,
-    range_limit: Option<RangeLimit>,
+    range_limit: Option<TextRange>,
     config: &InlayHintsConfig,
 ) -> Vec<InlayHint> {
-    let _p = tracing::span!(tracing::Level::INFO, "inlay_hints").entered();
+    let _p = tracing::info_span!("inlay_hints").entered();
     let sema = Semantics::new(db);
     let file = sema.parse(file_id);
     let file = file.syntax();
@@ -466,36 +491,48 @@ pub(crate) fn inlay_hints(
 
         let hints = |node| hints(&mut acc, &famous_defs, config, file_id, node);
         match range_limit {
-            Some(RangeLimit::Fixed(range)) => match file.covering_element(range) {
+            Some(range) => match file.covering_element(range) {
                 NodeOrToken::Token(_) => return acc,
                 NodeOrToken::Node(n) => n
                     .descendants()
                     .filter(|descendant| range.intersect(descendant.text_range()).is_some())
                     .for_each(hints),
             },
-            Some(RangeLimit::NearestParent(position)) => {
-                match file.token_at_offset(position).left_biased() {
-                    Some(token) => {
-                        if let Some(parent_block) =
-                            token.parent_ancestors().find_map(ast::BlockExpr::cast)
-                        {
-                            parent_block.syntax().descendants().for_each(hints)
-                        } else if let Some(parent_item) =
-                            token.parent_ancestors().find_map(ast::Item::cast)
-                        {
-                            parent_item.syntax().descendants().for_each(hints)
-                        } else {
-                            return acc;
-                        }
-                    }
-                    None => return acc,
-                }
-            }
             None => file.descendants().for_each(hints),
         };
     }
 
     acc
+}
+
+pub(crate) fn inlay_hints_resolve(
+    db: &RootDatabase,
+    file_id: FileId,
+    position: TextSize,
+    hash: u64,
+    config: &InlayHintsConfig,
+    hasher: impl Fn(&InlayHint) -> u64,
+) -> Option<InlayHint> {
+    let _p = tracing::info_span!("inlay_hints_resolve").entered();
+    let sema = Semantics::new(db);
+    let file = sema.parse(file_id);
+    let file = file.syntax();
+
+    let scope = sema.scope(file)?;
+    let famous_defs = FamousDefs(&sema, scope.krate());
+    let mut acc = Vec::new();
+
+    let hints = |node| hints(&mut acc, &famous_defs, config, file_id, node);
+    let token = file.token_at_offset(position).left_biased()?;
+    if let Some(parent_block) = token.parent_ancestors().find_map(ast::BlockExpr::cast) {
+        parent_block.syntax().descendants().for_each(hints)
+    } else if let Some(parent_item) = token.parent_ancestors().find_map(ast::Item::cast) {
+        parent_item.syntax().descendants().for_each(hints)
+    } else {
+        return None;
+    }
+
+    acc.into_iter().find(|hint| hasher(hint) == hash)
 }
 
 fn hints(

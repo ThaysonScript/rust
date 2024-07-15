@@ -1,7 +1,7 @@
-use crate::ops::{Deref, DerefMut};
+use crate::ops::{Deref, DerefMut, DerefPure};
 use crate::ptr;
 
-/// A wrapper to inhibit compiler from automatically calling `T`’s destructor.
+/// A wrapper to inhibit the compiler from automatically calling `T`’s destructor.
 /// This wrapper is 0-cost.
 ///
 /// `ManuallyDrop<T>` is guaranteed to have the same layout and bit validity as
@@ -62,6 +62,9 @@ impl<T> ManuallyDrop<T> {
     /// x.truncate(5); // You can still safely operate on the value
     /// assert_eq!(*x, "Hello");
     /// // But `Drop` will not be run here
+    /// # // FIXME(https://github.com/rust-lang/miri/issues/3670):
+    /// # // use -Zmiri-disable-leak-check instead of unleaking in tests meant to leak.
+    /// # let _ = ManuallyDrop::into_inner(x);
     /// ```
     #[must_use = "if you don't need the wrapper, you can use `mem::forget` instead"]
     #[stable(feature = "manually_drop", since = "1.20.0")]
@@ -161,3 +164,6 @@ impl<T: ?Sized> DerefMut for ManuallyDrop<T> {
         &mut self.value
     }
 }
+
+#[unstable(feature = "deref_pure_trait", issue = "87121")]
+unsafe impl<T: ?Sized> DerefPure for ManuallyDrop<T> {}

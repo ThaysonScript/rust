@@ -1,8 +1,8 @@
 use crate::code_stats::CodeStats;
 pub use crate::code_stats::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
 use crate::config::{
-    self, CrateType, FunctionReturn, InstrumentCoverage, OptLevel, OutFileName, OutputType,
-    RemapPathScopeComponents, SwitchWithOptPath,
+    self, CoverageLevel, CrateType, FunctionReturn, InstrumentCoverage, OptLevel, OutFileName,
+    OutputType, RemapPathScopeComponents, SwitchWithOptPath,
 };
 use crate::config::{ErrorOutputType, Input};
 use crate::errors;
@@ -18,18 +18,19 @@ use rustc_data_structures::sync::{
     AtomicU64, DynSend, DynSync, Lock, Lrc, MappedReadGuard, ReadGuard, RwLock,
 };
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
-use rustc_errors::emitter::{DynEmitter, HumanEmitter, HumanReadableErrorType};
+use rustc_errors::emitter::{stderr_destination, DynEmitter, HumanEmitter, HumanReadableErrorType};
 use rustc_errors::json::JsonEmitter;
 use rustc_errors::registry::Registry;
 use rustc_errors::{
-    codes::*, fallback_fluent_bundle, DiagCtxt, DiagnosticBuilder, DiagnosticMessage,
-    ErrorGuaranteed, FatalAbort, FluentBundle, IntoDiagnostic, LazyFallbackBundle, TerminalUrl,
+    codes::*, fallback_fluent_bundle, Diag, DiagCtxt, DiagCtxtHandle, DiagMessage, Diagnostic,
+    ErrorGuaranteed, FatalAbort, FluentBundle, LazyFallbackBundle, TerminalUrl,
 };
 use rustc_macros::HashStable_Generic;
 pub use rustc_span::def_id::StableCrateId;
 use rustc_span::edition::Edition;
-use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMap};
-use rustc_span::{SourceFileHashAlgorithm, Span, Symbol};
+use rustc_span::source_map::{FilePathMapping, SourceMap};
+use rustc_span::{FileNameDisplayPreference, RealFileName};
+use rustc_span::{Span, Symbol};
 use rustc_target::asm::InlineAsmArch;
 use rustc_target::spec::{CodeModel, PanicStrategy, RelocModel, RelroLevel};
 use rustc_target::spec::{
@@ -39,6 +40,7 @@ use rustc_target::spec::{
 use std::any::Any;
 use std::env;
 use std::fmt;
+use std::io;
 use std::ops::{Div, Mul};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -110,9 +112,9 @@ impl Mul<usize> for Limit {
     }
 }
 
-impl rustc_errors::IntoDiagnosticArg for Limit {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
-        self.to_string().into_diagnostic_arg()
+impl rustc_errors::IntoDiagArg for Limit {
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+        self.to_string().into_diag_arg()
     }
 }
 
@@ -145,7 +147,7 @@ pub struct Session {
     pub opts: config::Options,
     pub host_tlib_path: Lrc<SearchPath>,
     pub target_tlib_path: Lrc<SearchPath>,
-    pub parse_sess: ParseSess,
+    pub psess: ParseSess,
     pub sysroot: PathBuf,
     /// Input, input file path and output file path to this compilation process.
     pub io: CompilerIO,
@@ -249,13 +251,8 @@ impl Session {
         self.miri_unleashed_features.lock().push((span, feature_gate));
     }
 
-    pub fn local_crate_source_file(&self) -> Option<PathBuf> {
-        let path = self.io.input.opt_path()?;
-        if self.should_prefer_remapped_for_codegen() {
-            Some(self.opts.file_path_mapping().map_prefix(path).0.into_owned())
-        } else {
-            Some(path.to_path_buf())
-        }
+    pub fn local_crate_source_file(&self) -> Option<RealFileName> {
+        Some(self.source_map().path_mapping().to_real_filename(self.io.input.opt_path()?))
     }
 
     fn check_miri_unleashed_features(&self) -> Option<ErrorGuaranteed> {
@@ -304,13 +301,10 @@ impl Session {
     }
 
     #[track_caller]
-    pub fn create_feature_err<'a>(
-        &'a self,
-        err: impl IntoDiagnostic<'a>,
-        feature: Symbol,
-    ) -> DiagnosticBuilder<'a> {
+    pub fn create_feature_err<'a>(&'a self, err: impl Diagnostic<'a>, feature: Symbol) -> Diag<'a> {
         let mut err = self.dcx().create_err(err);
         if err.code.is_none() {
+            #[allow(rustc::diagnostic_outside_of_impl)]
             err.code(E0658);
         }
         add_feature_diagnostics(&mut err, self, feature);
@@ -334,13 +328,13 @@ impl Session {
     }
 
     #[inline]
-    pub fn dcx(&self) -> &DiagCtxt {
-        &self.parse_sess.dcx
+    pub fn dcx(&self) -> DiagCtxtHandle<'_> {
+        self.psess.dcx()
     }
 
     #[inline]
     pub fn source_map(&self) -> &SourceMap {
-        self.parse_sess.source_map()
+        self.psess.source_map()
     }
 
     /// Returns `true` if internal lints should be added to the lint store - i.e. if
@@ -351,19 +345,27 @@ impl Session {
     }
 
     pub fn instrument_coverage(&self) -> bool {
-        self.opts.cg.instrument_coverage() != InstrumentCoverage::Off
+        self.opts.cg.instrument_coverage() != InstrumentCoverage::No
     }
 
     pub fn instrument_coverage_branch(&self) -> bool {
-        self.opts.cg.instrument_coverage() == InstrumentCoverage::Branch
+        self.instrument_coverage()
+            && self.opts.unstable_opts.coverage_options.level >= CoverageLevel::Branch
     }
 
-    pub fn instrument_coverage_except_unused_generics(&self) -> bool {
-        self.opts.cg.instrument_coverage() == InstrumentCoverage::ExceptUnusedGenerics
+    pub fn instrument_coverage_condition(&self) -> bool {
+        self.instrument_coverage()
+            && self.opts.unstable_opts.coverage_options.level >= CoverageLevel::Condition
     }
 
-    pub fn instrument_coverage_except_unused_functions(&self) -> bool {
-        self.opts.cg.instrument_coverage() == InstrumentCoverage::ExceptUnusedFunctions
+    pub fn instrument_coverage_mcdc(&self) -> bool {
+        self.instrument_coverage()
+            && self.opts.unstable_opts.coverage_options.level >= CoverageLevel::Mcdc
+    }
+
+    /// True if `-Zcoverage-options=no-mir-spans` was passed.
+    pub fn coverage_no_mir_spans(&self) -> bool {
+        self.opts.unstable_opts.coverage_options.no_mir_spans
     }
 
     pub fn is_sanitizer_cfi_enabled(&self) -> bool {
@@ -457,15 +459,24 @@ impl Session {
         )
     }
 
-    /// Returns a list of directories where target-specific tool binaries are located.
+    /// Returns a list of directories where target-specific tool binaries are located. Some fallback
+    /// directories are also returned, for example if `--sysroot` is used but tools are missing
+    /// (#125246): we also add the bin directories to the sysroot where rustc is located.
     pub fn get_tools_search_paths(&self, self_contained: bool) -> Vec<PathBuf> {
-        let rustlib_path = rustc_target::target_rustlib_path(&self.sysroot, config::host_triple());
-        let p = PathBuf::from_iter([
-            Path::new(&self.sysroot),
-            Path::new(&rustlib_path),
-            Path::new("bin"),
-        ]);
-        if self_contained { vec![p.clone(), p.join("self-contained")] } else { vec![p] }
+        let bin_path = filesearch::make_target_bin_path(&self.sysroot, config::host_triple());
+        let fallback_sysroot_paths = filesearch::sysroot_candidates()
+            .into_iter()
+            .map(|sysroot| filesearch::make_target_bin_path(&sysroot, config::host_triple()));
+        let search_paths = std::iter::once(bin_path).chain(fallback_sysroot_paths);
+
+        if self_contained {
+            // The self-contained tools are expected to be e.g. in `bin/self-contained` in the
+            // sysroot's `rustlib` path, so we add such a subfolder to the bin path, and the
+            // fallback paths.
+            search_paths.flat_map(|path| [path.clone(), path.join("self-contained")]).collect()
+        } else {
+            search_paths.collect()
+        }
     }
 
     pub fn init_incr_comp_session(&self, session_dir: PathBuf, lock_file: flock::Lock) {
@@ -587,7 +598,7 @@ impl Session {
 
         let dbg_opts = &self.opts.unstable_opts;
 
-        let relro_level = dbg_opts.relro_level.unwrap_or(self.target.relro_level);
+        let relro_level = self.opts.cg.relro_level.unwrap_or(self.target.relro_level);
 
         // Only enable this optimization by default if full relro is also enabled.
         // In this case, lazy binding was already unavailable, so nothing is lost.
@@ -749,6 +760,10 @@ impl Session {
         self.opts.cg.overflow_checks.unwrap_or(self.opts.debug_assertions)
     }
 
+    pub fn ub_checks(&self) -> bool {
+        self.opts.unstable_opts.ub_checks.unwrap_or(self.opts.debug_assertions)
+    }
+
     pub fn relocation_model(&self) -> RelocModel {
         self.opts.cg.relocation_model.unwrap_or(self.target.relocation_model)
     }
@@ -896,51 +911,19 @@ impl Session {
         self.opts.cg.link_dead_code.unwrap_or(false)
     }
 
-    pub fn should_prefer_remapped_for_codegen(&self) -> bool {
-        // bail out, if any of the requested crate types aren't:
-        // "compiled executables or libraries"
-        for crate_type in &self.opts.crate_types {
-            match crate_type {
-                CrateType::Executable
-                | CrateType::Dylib
-                | CrateType::Rlib
-                | CrateType::Staticlib
-                | CrateType::Cdylib => continue,
-                CrateType::ProcMacro => return false,
-            }
+    pub fn filename_display_preference(
+        &self,
+        scope: RemapPathScopeComponents,
+    ) -> FileNameDisplayPreference {
+        assert!(
+            scope.bits().count_ones() == 1,
+            "one and only one scope should be passed to `Session::filename_display_preference`"
+        );
+        if self.opts.unstable_opts.remap_path_scope.contains(scope) {
+            FileNameDisplayPreference::Remapped
+        } else {
+            FileNameDisplayPreference::Local
         }
-
-        let has_split_debuginfo = match self.split_debuginfo() {
-            SplitDebuginfo::Off => false,
-            SplitDebuginfo::Packed => true,
-            SplitDebuginfo::Unpacked => true,
-        };
-
-        let remap_path_scopes = &self.opts.unstable_opts.remap_path_scope;
-        let mut prefer_remapped = false;
-
-        if remap_path_scopes.contains(RemapPathScopeComponents::UNSPLIT_DEBUGINFO) {
-            prefer_remapped |= !has_split_debuginfo;
-        }
-
-        if remap_path_scopes.contains(RemapPathScopeComponents::SPLIT_DEBUGINFO) {
-            prefer_remapped |= has_split_debuginfo;
-        }
-
-        prefer_remapped
-    }
-
-    pub fn should_prefer_remapped_for_split_debuginfo_paths(&self) -> bool {
-        let has_split_debuginfo = match self.split_debuginfo() {
-            SplitDebuginfo::Off => false,
-            SplitDebuginfo::Packed | SplitDebuginfo::Unpacked => true,
-        };
-
-        self.opts
-            .unstable_opts
-            .remap_path_scope
-            .contains(RemapPathScopeComponents::SPLIT_DEBUGINFO_PATH)
-            && has_split_debuginfo
     }
 }
 
@@ -982,7 +965,7 @@ fn default_emitter(
                 );
                 Box::new(emitter.ui_testing(sopts.unstable_opts.ui_testing))
             } else {
-                let emitter = HumanEmitter::stderr(color_config, fallback_bundle)
+                let emitter = HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
                     .fluent_bundle(bundle)
                     .sm(Some(source_map))
                     .short_message(short)
@@ -998,28 +981,30 @@ fn default_emitter(
             }
         }
         config::ErrorOutputType::Json { pretty, json_rendered } => Box::new(
-            JsonEmitter::stderr(
-                Some(registry),
+            JsonEmitter::new(
+                Box::new(io::BufWriter::new(io::stderr())),
                 source_map,
-                bundle,
                 fallback_bundle,
                 pretty,
                 json_rendered,
-                sopts.diagnostic_width,
-                macro_backtrace,
-                track_diagnostics,
-                terminal_url,
             )
+            .registry(Some(registry))
+            .fluent_bundle(bundle)
             .ui_testing(sopts.unstable_opts.ui_testing)
             .ignored_directories_in_source_blocks(
                 sopts.unstable_opts.ignore_directory_in_diagnostics_source_blocks.clone(),
-            ),
+            )
+            .diagnostic_width(sopts.diagnostic_width)
+            .macro_backtrace(macro_backtrace)
+            .track_diagnostics(track_diagnostics)
+            .terminal_url(terminal_url),
         ),
     }
 }
 
 // JUSTIFICATION: literally session construction
 #[allow(rustc::bad_opt_access)]
+#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 pub fn build_session(
     early_dcx: EarlyDiagCtxt,
     sopts: config::Options,
@@ -1028,8 +1013,8 @@ pub fn build_session(
     registry: rustc_errors::registry::Registry,
     fluent_resources: Vec<&'static str>,
     driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
-    file_loader: Option<Box<dyn FileLoader + Send + Sync + 'static>>,
-    target_override: Option<Target>,
+    target: Target,
+    sysroot: PathBuf,
     cfg_version: &'static str,
     ice_file: Option<PathBuf>,
     using_internal_features: Arc<AtomicBool>,
@@ -1046,12 +1031,6 @@ pub fn build_session(
     let cap_lints_allow = sopts.lint_cap.is_some_and(|cap| cap == lint::Allow);
     let can_emit_warnings = !(warnings_allow || cap_lints_allow);
 
-    let sysroot = match &sopts.maybe_sysroot {
-        Some(sysroot) => sysroot.clone(),
-        None => filesearch::get_or_default_sysroot().expect("Failed finding sysroot"),
-    };
-
-    let target_cfg = config::build_target_config(&early_dcx, &sopts, target_override, &sysroot);
     let host_triple = TargetTriple::from_triple(config::host_triple());
     let (host, target_warnings) = Target::search(&host_triple, &sysroot).unwrap_or_else(|e| {
         early_dcx.early_fatal(format!("Error loading host specification: {e}"))
@@ -1060,28 +1039,15 @@ pub fn build_session(
         early_dcx.early_warn(warning)
     }
 
-    let loader = file_loader.unwrap_or_else(|| Box::new(RealFileLoader));
-    let hash_kind = sopts.unstable_opts.src_hash_algorithm.unwrap_or_else(|| {
-        if target_cfg.is_like_msvc {
-            SourceFileHashAlgorithm::Sha256
-        } else {
-            SourceFileHashAlgorithm::Md5
-        }
-    });
-    let source_map = Lrc::new(SourceMap::with_file_loader_and_hash_kind(
-        loader,
-        sopts.file_path_mapping(),
-        hash_kind,
-    ));
-
     let fallback_bundle = fallback_fluent_bundle(
         fluent_resources,
         sopts.unstable_opts.translate_directionality_markers,
     );
+    let source_map = rustc_span::source_map::get_source_map().unwrap();
     let emitter = default_emitter(&sopts, registry, source_map.clone(), bundle, fallback_bundle);
 
-    let mut dcx = DiagCtxt::with_emitter(emitter)
-        .with_flags(sopts.unstable_opts.dcx_flags(can_emit_warnings));
+    let mut dcx =
+        DiagCtxt::new(emitter).with_flags(sopts.unstable_opts.dcx_flags(can_emit_warnings));
     if let Some(ice_file) = ice_file {
         dcx = dcx.with_ice_file(ice_file);
     }
@@ -1104,7 +1070,7 @@ pub fn build_session(
         match profiler {
             Ok(profiler) => Some(Arc::new(profiler)),
             Err(e) => {
-                dcx.emit_warn(errors::FailedToCreateProfiler { err: e.to_string() });
+                dcx.handle().emit_warn(errors::FailedToCreateProfiler { err: e.to_string() });
                 None
             }
         }
@@ -1112,8 +1078,8 @@ pub fn build_session(
         None
     };
 
-    let mut parse_sess = ParseSess::with_dcx(dcx, source_map);
-    parse_sess.assume_incomplete_release = sopts.unstable_opts.assume_incomplete_release;
+    let mut psess = ParseSess::with_dcx(dcx, source_map);
+    psess.assume_incomplete_release = sopts.unstable_opts.assume_incomplete_release;
 
     let host_triple = config::host_triple();
     let target_triple = sopts.target_triple.triple();
@@ -1143,16 +1109,15 @@ pub fn build_session(
         _ => CtfeBacktrace::Disabled,
     });
 
-    let asm_arch =
-        if target_cfg.allow_asm { InlineAsmArch::from_str(&target_cfg.arch).ok() } else { None };
+    let asm_arch = if target.allow_asm { InlineAsmArch::from_str(&target.arch).ok() } else { None };
 
     let sess = Session {
-        target: target_cfg,
+        target,
         host,
         opts: sopts,
         host_tlib_path,
         target_tlib_path,
-        parse_sess,
+        psess,
         sysroot,
         io,
         incr_comp_session: RwLock::new(IncrCompSession::NotInitialized),
@@ -1237,9 +1202,9 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
             });
         }
     }
-    // Cannot mix and match sanitizers.
-    let mut sanitizer_iter = sess.opts.unstable_opts.sanitizer.into_iter();
-    if let (Some(first), Some(second)) = (sanitizer_iter.next(), sanitizer_iter.next()) {
+
+    // Cannot mix and match mutually-exclusive sanitizers.
+    if let Some((first, second)) = sess.opts.unstable_opts.sanitizer.mutually_exclusive() {
         sess.dcx().emit_err(errors::CannotMixAndMatchSanitizers {
             first: first.to_string(),
             second: second.to_string(),
@@ -1261,20 +1226,17 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         sess.dcx().emit_err(errors::SanitizerCfiRequiresLto);
     }
 
+    // KCFI requires panic=abort
+    if sess.is_sanitizer_kcfi_enabled() && sess.panic_strategy() != PanicStrategy::Abort {
+        sess.dcx().emit_err(errors::SanitizerKcfiRequiresPanicAbort);
+    }
+
     // LLVM CFI using rustc LTO requires a single codegen unit.
     if sess.is_sanitizer_cfi_enabled()
         && sess.lto() == config::Lto::Fat
         && (sess.codegen_units().as_usize() != 1)
     {
         sess.dcx().emit_err(errors::SanitizerCfiRequiresSingleCodegenUnit);
-    }
-
-    // LLVM CFI is incompatible with LLVM KCFI.
-    if sess.is_sanitizer_cfi_enabled() && sess.is_sanitizer_kcfi_enabled() {
-        sess.dcx().emit_err(errors::CannotMixAndMatchSanitizers {
-            first: "cfi".to_string(),
-            second: "kcfi".to_string(),
-        });
     }
 
     // Canonical jump tables requires CFI.
@@ -1402,69 +1364,60 @@ pub struct EarlyDiagCtxt {
 impl EarlyDiagCtxt {
     pub fn new(output: ErrorOutputType) -> Self {
         let emitter = mk_emitter(output);
-        Self { dcx: DiagCtxt::with_emitter(emitter) }
+        Self { dcx: DiagCtxt::new(emitter) }
     }
 
     /// Swap out the underlying dcx once we acquire the user's preference on error emission
     /// format. Any errors prior to that will cause an abort and all stashed diagnostics of the
     /// previous dcx will be emitted.
     pub fn abort_if_error_and_set_error_format(&mut self, output: ErrorOutputType) {
-        self.dcx.abort_if_errors();
+        self.dcx.handle().abort_if_errors();
 
         let emitter = mk_emitter(output);
-        self.dcx = DiagCtxt::with_emitter(emitter);
+        self.dcx = DiagCtxt::new(emitter);
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
-    pub fn early_note(&self, msg: impl Into<DiagnosticMessage>) {
-        self.dcx.note(msg)
+    pub fn early_note(&self, msg: impl Into<DiagMessage>) {
+        self.dcx.handle().note(msg)
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
-    pub fn early_help(&self, msg: impl Into<DiagnosticMessage>) {
-        self.dcx.struct_help(msg).emit()
+    pub fn early_help(&self, msg: impl Into<DiagMessage>) {
+        self.dcx.handle().struct_help(msg).emit()
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     #[must_use = "ErrorGuaranteed must be returned from `run_compiler` in order to exit with a non-zero status code"]
-    pub fn early_err(&self, msg: impl Into<DiagnosticMessage>) -> ErrorGuaranteed {
-        self.dcx.err(msg)
+    pub fn early_err(&self, msg: impl Into<DiagMessage>) -> ErrorGuaranteed {
+        self.dcx.handle().err(msg)
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
-    pub fn early_fatal(&self, msg: impl Into<DiagnosticMessage>) -> ! {
-        self.dcx.fatal(msg)
+    pub fn early_fatal(&self, msg: impl Into<DiagMessage>) -> ! {
+        self.dcx.handle().fatal(msg)
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
-    pub fn early_struct_fatal(
-        &self,
-        msg: impl Into<DiagnosticMessage>,
-    ) -> DiagnosticBuilder<'_, FatalAbort> {
-        self.dcx.struct_fatal(msg)
+    pub fn early_struct_fatal(&self, msg: impl Into<DiagMessage>) -> Diag<'_, FatalAbort> {
+        self.dcx.handle().struct_fatal(msg)
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
-    pub fn early_warn(&self, msg: impl Into<DiagnosticMessage>) {
-        self.dcx.warn(msg)
+    pub fn early_warn(&self, msg: impl Into<DiagMessage>) {
+        self.dcx.handle().warn(msg)
     }
 
-    pub fn initialize_checked_jobserver(&self) {
-        // initialize jobserver before getting `jobserver::client` and `build_session`.
-        jobserver::initialize_checked(|err| {
-            #[allow(rustc::untranslatable_diagnostic)]
-            #[allow(rustc::diagnostic_outside_of_impl)]
-            self.dcx
-                .struct_warn(err)
-                .with_note("the build environment is likely misconfigured")
-                .emit()
-        });
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn early_struct_warn(&self, msg: impl Into<DiagMessage>) -> Diag<'_, ()> {
+        self.dcx.handle().struct_warn(msg)
     }
 }
 
@@ -1476,17 +1429,17 @@ fn mk_emitter(output: ErrorOutputType) -> Box<DynEmitter> {
     let emitter: Box<DynEmitter> = match output {
         config::ErrorOutputType::HumanReadable(kind) => {
             let (short, color_config) = kind.unzip();
-            Box::new(HumanEmitter::stderr(color_config, fallback_bundle).short_message(short))
+            Box::new(
+                HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
+                    .short_message(short),
+            )
         }
-        config::ErrorOutputType::Json { pretty, json_rendered } => Box::new(JsonEmitter::basic(
+        config::ErrorOutputType::Json { pretty, json_rendered } => Box::new(JsonEmitter::new(
+            Box::new(io::BufWriter::new(io::stderr())),
+            Lrc::new(SourceMap::new(FilePathMapping::empty())),
+            fallback_bundle,
             pretty,
             json_rendered,
-            None,
-            fallback_bundle,
-            None,
-            false,
-            false,
-            TerminalUrl::No,
         )),
     };
     emitter
@@ -1499,12 +1452,8 @@ pub trait RemapFileNameExt {
 
     /// Returns a possibly remapped filename based on the passed scope and remap cli options.
     ///
-    /// One and only one scope should be passed to this method. For anything related to
-    /// "codegen" see the [`RemapFileNameExt::for_codegen`] method.
+    /// One and only one scope should be passed to this method, it will panic otherwise.
     fn for_scope(&self, sess: &Session, scope: RemapPathScopeComponents) -> Self::Output<'_>;
-
-    /// Return a possibly remapped filename, to be used in "codegen" related parts.
-    fn for_codegen(&self, sess: &Session) -> Self::Output<'_>;
 }
 
 impl RemapFileNameExt for rustc_span::FileName {
@@ -1521,14 +1470,6 @@ impl RemapFileNameExt for rustc_span::FileName {
             self.prefer_local()
         }
     }
-
-    fn for_codegen(&self, sess: &Session) -> Self::Output<'_> {
-        if sess.should_prefer_remapped_for_codegen() {
-            self.prefer_remapped_unconditionaly()
-        } else {
-            self.prefer_local()
-        }
-    }
 }
 
 impl RemapFileNameExt for rustc_span::RealFileName {
@@ -1540,14 +1481,6 @@ impl RemapFileNameExt for rustc_span::RealFileName {
             "one and only one scope should be passed to for_scope"
         );
         if sess.opts.unstable_opts.remap_path_scope.contains(scope) {
-            self.remapped_path_if_available()
-        } else {
-            self.local_path_if_available()
-        }
-    }
-
-    fn for_codegen(&self, sess: &Session) -> Self::Output<'_> {
-        if sess.should_prefer_remapped_for_codegen() {
             self.remapped_path_if_available()
         } else {
             self.local_path_if_available()

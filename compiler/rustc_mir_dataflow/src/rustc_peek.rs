@@ -18,6 +18,7 @@ use rustc_middle::mir::{self, Body, Local, Location};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
+use tracing::{debug, info};
 
 pub struct SanityCheck;
 
@@ -202,7 +203,7 @@ impl PeekCall {
             &terminator.kind
         {
             if let ty::FnDef(def_id, fn_args) = *func.const_.ty().kind() {
-                if tcx.intrinsic(def_id)? != sym::rustc_peek {
+                if tcx.intrinsic(def_id)?.name != sym::rustc_peek {
                     return None;
                 }
 

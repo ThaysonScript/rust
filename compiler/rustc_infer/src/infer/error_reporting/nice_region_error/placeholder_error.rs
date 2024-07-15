@@ -8,11 +8,12 @@ use crate::infer::ValuePairs;
 use crate::infer::{SubregionOrigin, TypeTrace};
 use crate::traits::{ObligationCause, ObligationCauseCode};
 use rustc_data_structures::intern::Interned;
-use rustc_errors::{DiagnosticBuilder, IntoDiagnosticArg};
+use rustc_errors::{Diag, IntoDiagArg};
 use rustc_hir::def::Namespace;
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, CRATE_DEF_ID};
+use rustc_middle::bug;
 use rustc_middle::ty::error::ExpectedFound;
-use rustc_middle::ty::print::{FmtPrinter, Print, RegionHighlightMode};
+use rustc_middle::ty::print::{FmtPrinter, Print, PrintTraitRefExt as _, RegionHighlightMode};
 use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, RePlaceholder, Region, TyCtxt};
 
@@ -26,12 +27,12 @@ pub struct Highlighted<'tcx, T> {
     value: T,
 }
 
-impl<'tcx, T> IntoDiagnosticArg for Highlighted<'tcx, T>
+impl<'tcx, T> IntoDiagArg for Highlighted<'tcx, T>
 where
     T: for<'a> Print<'tcx, FmtPrinter<'a, 'tcx>>,
 {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
-        rustc_errors::DiagnosticArgValue::Str(self.to_string().into())
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+        rustc_errors::DiagArgValue::Str(self.to_string().into())
     }
 }
 
@@ -57,7 +58,7 @@ where
 impl<'tcx> NiceRegionError<'_, 'tcx> {
     /// When given a `ConcreteFailure` for a function with arguments containing a named region and
     /// an anonymous region, emit a descriptive diagnostic error.
-    pub(super) fn try_report_placeholder_conflict(&self) -> Option<DiagnosticBuilder<'tcx>> {
+    pub(super) fn try_report_placeholder_conflict(&self) -> Option<Diag<'tcx>> {
         match &self.error {
             ///////////////////////////////////////////////////////////////////////////
             // NB. The ordering of cases in this match is very
@@ -193,15 +194,15 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
         sub_placeholder: Option<Region<'tcx>>,
         sup_placeholder: Option<Region<'tcx>>,
         value_pairs: &ValuePairs<'tcx>,
-    ) -> Option<DiagnosticBuilder<'tcx>> {
+    ) -> Option<Diag<'tcx>> {
         let (expected_args, found_args, trait_def_id) = match value_pairs {
-            ValuePairs::PolyTraitRefs(ExpectedFound { expected, found })
-                if expected.def_id() == found.def_id() =>
+            ValuePairs::TraitRefs(ExpectedFound { expected, found })
+                if expected.def_id == found.def_id =>
             {
                 // It's possible that the placeholders come from a binder
                 // outside of this value pair. Use `no_bound_vars` as a
                 // simple heuristic for that.
-                (expected.no_bound_vars()?.args, found.no_bound_vars()?.args, expected.def_id())
+                (expected.args, found.args, expected.def_id)
             }
             _ => return None,
         };
@@ -236,12 +237,13 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
         trait_def_id: DefId,
         expected_args: GenericArgsRef<'tcx>,
         actual_args: GenericArgsRef<'tcx>,
-    ) -> DiagnosticBuilder<'tcx> {
+    ) -> Diag<'tcx> {
         let span = cause.span();
 
         let (leading_ellipsis, satisfy_span, where_span, dup_span, def_id) =
-            if let ObligationCauseCode::ItemObligation(def_id)
-            | ObligationCauseCode::ExprItemObligation(def_id, ..) = *cause.code()
+            if let ObligationCauseCode::WhereClause(def_id, span)
+            | ObligationCauseCode::WhereClauseInExpr(def_id, span, ..) = *cause.code()
+                && def_id != CRATE_DEF_ID.to_def_id()
             {
                 (
                     true,
@@ -254,12 +256,12 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 (false, None, None, Some(span), String::new())
             };
 
-        let expected_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new(
+        let expected_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new_from_args(
             self.cx.tcx,
             trait_def_id,
             expected_args,
         ));
-        let actual_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new(
+        let actual_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new_from_args(
             self.cx.tcx,
             trait_def_id,
             actual_args,
@@ -407,10 +409,8 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
             {
                 let closure_sig = self_ty.map(|closure| {
                     if let ty::Closure(_, args) = closure.kind() {
-                        self.tcx().signature_unclosure(
-                            args.as_closure().sig(),
-                            rustc_hir::Unsafety::Normal,
-                        )
+                        self.tcx()
+                            .signature_unclosure(args.as_closure().sig(), rustc_hir::Safety::Safe)
                     } else {
                         bug!("type is not longer closure");
                     }

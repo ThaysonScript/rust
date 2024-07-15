@@ -1,18 +1,22 @@
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
+use rustc_hir::LangItem;
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::traits::{BuiltinImplSource, CodegenObligationError};
+use rustc_middle::ty::util::AsyncDropGlueMorphology;
 use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, Instance, TyCtxt, TypeVisitableExt};
 use rustc_span::sym;
 use rustc_trait_selection::traits;
+use rustc_type_ir::ClosureKind;
+use tracing::debug;
 use traits::{translate_args, Reveal};
 
 use crate::errors::UnexpectedFnPtrAssociatedItem;
 
-fn resolve_instance<'tcx>(
+fn resolve_instance_raw<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: ty::ParamEnvAnd<'tcx, (DefId, GenericArgsRef<'tcx>)>,
 ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
@@ -28,11 +32,10 @@ fn resolve_instance<'tcx>(
             tcx.normalize_erasing_regions(param_env, args),
         )
     } else {
-        let def = if matches!(tcx.def_kind(def_id), DefKind::Fn) && tcx.intrinsic(def_id).is_some()
-        {
+        let def = if tcx.intrinsic(def_id).is_some() {
             debug!(" => intrinsic");
-            ty::InstanceDef::Intrinsic(def_id)
-        } else if Some(def_id) == tcx.lang_items().drop_in_place_fn() {
+            ty::InstanceKind::Intrinsic(def_id)
+        } else if tcx.is_lang_item(def_id, LangItem::DropInPlace) {
             let ty = args.type_at(0);
 
             if ty.needs_drop(tcx, param_env) {
@@ -50,15 +53,37 @@ fn resolve_instance<'tcx>(
                     _ => return Ok(None),
                 }
 
-                ty::InstanceDef::DropGlue(def_id, Some(ty))
+                ty::InstanceKind::DropGlue(def_id, Some(ty))
             } else {
                 debug!(" => trivial drop glue");
-                ty::InstanceDef::DropGlue(def_id, None)
+                ty::InstanceKind::DropGlue(def_id, None)
+            }
+        } else if tcx.is_lang_item(def_id, LangItem::AsyncDropInPlace) {
+            let ty = args.type_at(0);
+
+            if ty.async_drop_glue_morphology(tcx) != AsyncDropGlueMorphology::Noop {
+                match *ty.kind() {
+                    ty::Closure(..)
+                    | ty::CoroutineClosure(..)
+                    | ty::Coroutine(..)
+                    | ty::Tuple(..)
+                    | ty::Adt(..)
+                    | ty::Dynamic(..)
+                    | ty::Array(..)
+                    | ty::Slice(..) => {}
+                    // Async destructor ctor shims can only be built from ADTs.
+                    _ => return Ok(None),
+                }
+                debug!(" => nontrivial async drop glue ctor");
+                ty::InstanceKind::AsyncDropGlueCtorShim(def_id, Some(ty))
+            } else {
+                debug!(" => trivial async drop glue ctor");
+                ty::InstanceKind::AsyncDropGlueCtorShim(def_id, None)
             }
         } else {
             debug!(" => free item");
             // FIXME(effects): we may want to erase the effect param if that is present on this item.
-            ty::InstanceDef::Item(def_id)
+            ty::InstanceKind::Item(def_id)
         };
 
         Ok(Some(Instance { def, args }))
@@ -80,18 +105,11 @@ fn resolve_associated_item<'tcx>(
 
     let vtbl = match tcx.codegen_select_candidate((param_env, trait_ref)) {
         Ok(vtbl) => vtbl,
-        Err(CodegenObligationError::Ambiguity) => {
-            let reported = tcx.dcx().span_delayed_bug(
-                tcx.def_span(trait_item_id),
-                format!(
-                    "encountered ambiguity selecting `{trait_ref:?}` during codegen, presuming due to \
-                     overflow or prior type error",
-                ),
-            );
-            return Err(reported);
-        }
-        Err(CodegenObligationError::Unimplemented) => return Ok(None),
-        Err(CodegenObligationError::FulfillmentError) => return Ok(None),
+        Err(
+            CodegenObligationError::Ambiguity
+            | CodegenObligationError::Unimplemented
+            | CodegenObligationError::FulfillmentError,
+        ) => return Ok(None),
     };
 
     // Now that we know which impl is being used, we can dispatch to
@@ -195,17 +213,26 @@ fn resolve_associated_item<'tcx>(
 
             Some(ty::Instance::new(leaf_def.item.def_id, args))
         }
-        traits::ImplSource::Builtin(BuiltinImplSource::Object { vtable_base }, _) => {
-            traits::get_vtable_index_of_object_method(tcx, *vtable_base, trait_item_id).map(
-                |index| Instance {
-                    def: ty::InstanceDef::Virtual(trait_item_id, index),
+        traits::ImplSource::Builtin(BuiltinImplSource::Object(_), _) => {
+            let trait_ref = ty::TraitRef::from_method(tcx, trait_id, rcvr_args);
+            if trait_ref.has_non_region_infer() || trait_ref.has_non_region_param() {
+                // We only resolve totally substituted vtable entries.
+                None
+            } else {
+                let vtable_base = tcx.first_method_vtable_slot(trait_ref);
+                let offset = tcx
+                    .own_existential_vtable_entries(trait_id)
+                    .iter()
+                    .copied()
+                    .position(|def_id| def_id == trait_item_id);
+                offset.map(|offset| Instance {
+                    def: ty::InstanceKind::Virtual(trait_item_id, vtable_base + offset),
                     args: rcvr_args,
-                },
-            )
+                })
+            }
         }
         traits::ImplSource::Builtin(BuiltinImplSource::Misc, _) => {
-            let lang_items = tcx.lang_items();
-            if Some(trait_ref.def_id) == lang_items.clone_trait() {
+            if tcx.is_lang_item(trait_ref.def_id, LangItem::Clone) {
                 // FIXME(eddyb) use lang items for methods instead of names.
                 let name = tcx.item_name(trait_item_id);
                 if name == sym::clone {
@@ -221,7 +248,7 @@ fn resolve_associated_item<'tcx>(
                     };
 
                     Some(Instance {
-                        def: ty::InstanceDef::CloneShim(trait_item_id, self_ty),
+                        def: ty::InstanceKind::CloneShim(trait_item_id, self_ty),
                         args: rcvr_args,
                     })
                 } else {
@@ -231,14 +258,14 @@ fn resolve_associated_item<'tcx>(
                     let args = tcx.erase_regions(rcvr_args);
                     Some(ty::Instance::new(trait_item_id, args))
                 }
-            } else if Some(trait_ref.def_id) == lang_items.fn_ptr_trait() {
-                if lang_items.fn_ptr_addr() == Some(trait_item_id) {
+            } else if tcx.is_lang_item(trait_ref.def_id, LangItem::FnPtrTrait) {
+                if tcx.is_lang_item(trait_item_id, LangItem::FnPtrAddr) {
                     let self_ty = trait_ref.self_ty();
                     if !matches!(self_ty.kind(), ty::FnPtr(..)) {
                         return Ok(None);
                     }
                     Some(Instance {
-                        def: ty::InstanceDef::FnPtrAddrShim(trait_item_id, self_ty),
+                        def: ty::InstanceKind::FnPtrAddrShim(trait_item_id, self_ty),
                         args: rcvr_args,
                     })
                 } else {
@@ -256,7 +283,7 @@ fn resolve_associated_item<'tcx>(
                 {
                     // For compiler developers who'd like to add new items to `Fn`/`FnMut`/`FnOnce`,
                     // you either need to generate a shim body, or perhaps return
-                    // `InstanceDef::Item` pointing to a trait default method body if
+                    // `InstanceKind::Item` pointing to a trait default method body if
                     // it is given a default implementation by the trait.
                     bug!(
                         "no definition for `{trait_ref}::{}` for built-in callable type",
@@ -268,7 +295,7 @@ fn resolve_associated_item<'tcx>(
                         Some(Instance::resolve_closure(tcx, closure_def_id, args, target_kind))
                     }
                     ty::FnDef(..) | ty::FnPtr(..) => Some(Instance {
-                        def: ty::InstanceDef::FnPtrShim(trait_item_id, rcvr_args.type_at(0)),
+                        def: ty::InstanceKind::FnPtrShim(trait_item_id, rcvr_args.type_at(0)),
                         args: rcvr_args,
                     }),
                     ty::CoroutineClosure(coroutine_closure_def_id, args) => {
@@ -281,9 +308,9 @@ fn resolve_associated_item<'tcx>(
                             Some(Instance::new(coroutine_closure_def_id, args))
                         } else {
                             Some(Instance {
-                                def: ty::InstanceDef::ConstructCoroutineInClosureShim {
+                                def: ty::InstanceKind::ConstructCoroutineInClosureShim {
                                     coroutine_closure_def_id,
-                                    target_kind: ty::ClosureKind::FnOnce,
+                                    receiver_by_ref: target_kind != ty::ClosureKind::FnOnce,
                                 },
                                 args,
                             })
@@ -298,18 +325,15 @@ fn resolve_associated_item<'tcx>(
             {
                 match *rcvr_args.type_at(0).kind() {
                     ty::CoroutineClosure(coroutine_closure_def_id, args) => {
-                        // If we're computing `AsyncFnOnce`/`AsyncFnMut` for a by-ref closure,
-                        // or `AsyncFnOnce` for a by-mut closure, then construct a new body that
-                        // has the right return types.
-                        //
-                        // Specifically, `AsyncFnMut` for a by-ref coroutine-closure just needs
-                        // to have its input and output types fixed (`&mut self` and returning
-                        // `i16` coroutine kind).
-                        if target_kind > args.as_coroutine_closure().kind() {
+                        if target_kind == ClosureKind::FnOnce
+                            && args.as_coroutine_closure().kind() != ClosureKind::FnOnce
+                        {
+                            // If we're computing `AsyncFnOnce` for a by-ref closure then
+                            // construct a new body that has the right return types.
                             Some(Instance {
-                                def: ty::InstanceDef::ConstructCoroutineInClosureShim {
+                                def: ty::InstanceKind::ConstructCoroutineInClosureShim {
                                     coroutine_closure_def_id,
-                                    target_kind,
+                                    receiver_by_ref: false,
                                 },
                                 args,
                             })
@@ -321,7 +345,7 @@ fn resolve_associated_item<'tcx>(
                         Some(Instance::resolve_closure(tcx, closure_def_id, args, target_kind))
                     }
                     ty::FnDef(..) | ty::FnPtr(..) => Some(Instance {
-                        def: ty::InstanceDef::FnPtrShim(trait_item_id, rcvr_args.type_at(0)),
+                        def: ty::InstanceKind::FnPtrShim(trait_item_id, rcvr_args.type_at(0)),
                         args: rcvr_args,
                     }),
                     _ => bug!(
@@ -340,5 +364,5 @@ fn resolve_associated_item<'tcx>(
 }
 
 pub(crate) fn provide(providers: &mut Providers) {
-    *providers = Providers { resolve_instance, ..*providers };
+    *providers = Providers { resolve_instance_raw, ..*providers };
 }

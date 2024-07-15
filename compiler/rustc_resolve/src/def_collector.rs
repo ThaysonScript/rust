@@ -2,19 +2,23 @@ use crate::{ImplTraitContext, Resolver};
 use rustc_ast::visit::FnKind;
 use rustc_ast::*;
 use rustc_expand::expand::AstFragment;
+use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind};
 use rustc_hir::def_id::LocalDefId;
 use rustc_span::hygiene::LocalExpnId;
 use rustc_span::symbol::{kw, sym, Symbol};
 use rustc_span::Span;
+use std::mem;
+use tracing::debug;
 
 pub(crate) fn collect_definitions(
     resolver: &mut Resolver<'_, '_>,
     fragment: &AstFragment,
     expansion: LocalExpnId,
 ) {
-    let (parent_def, impl_trait_context) = resolver.invocation_parents[&expansion];
-    fragment.visit_with(&mut DefCollector { resolver, parent_def, expansion, impl_trait_context });
+    let (parent_def, impl_trait_context, in_attr) = resolver.invocation_parents[&expansion];
+    let mut visitor = DefCollector { resolver, parent_def, expansion, impl_trait_context, in_attr };
+    fragment.visit_with(&mut visitor);
 }
 
 /// Creates `DefId`s for nodes in the AST.
@@ -22,6 +26,7 @@ struct DefCollector<'a, 'b, 'tcx> {
     resolver: &'a mut Resolver<'b, 'tcx>,
     parent_def: LocalDefId,
     impl_trait_context: ImplTraitContext,
+    in_attr: bool,
     expansion: LocalExpnId,
 }
 
@@ -38,18 +43,20 @@ impl<'a, 'b, 'tcx> DefCollector<'a, 'b, 'tcx> {
             "create_def(node_id={:?}, def_kind={:?}, parent_def={:?})",
             node_id, def_kind, parent_def
         );
-        self.resolver.create_def(
-            parent_def,
-            node_id,
-            name,
-            def_kind,
-            self.expansion.to_expn_id(),
-            span.with_parent(None),
-        )
+        self.resolver
+            .create_def(
+                parent_def,
+                node_id,
+                name,
+                def_kind,
+                self.expansion.to_expn_id(),
+                span.with_parent(None),
+            )
+            .def_id()
     }
 
     fn with_parent<F: FnOnce(&mut Self)>(&mut self, parent_def: LocalDefId, f: F) {
-        let orig_parent_def = std::mem::replace(&mut self.parent_def, parent_def);
+        let orig_parent_def = mem::replace(&mut self.parent_def, parent_def);
         f(self);
         self.parent_def = orig_parent_def;
     }
@@ -59,7 +66,7 @@ impl<'a, 'b, 'tcx> DefCollector<'a, 'b, 'tcx> {
         impl_trait_context: ImplTraitContext,
         f: F,
     ) {
-        let orig_itc = std::mem::replace(&mut self.impl_trait_context, impl_trait_context);
+        let orig_itc = mem::replace(&mut self.impl_trait_context, impl_trait_context);
         f(self);
         self.impl_trait_context = orig_itc;
     }
@@ -101,8 +108,10 @@ impl<'a, 'b, 'tcx> DefCollector<'a, 'b, 'tcx> {
 
     fn visit_macro_invoc(&mut self, id: NodeId) {
         let id = id.placeholder_to_expn_id();
-        let old_parent =
-            self.resolver.invocation_parents.insert(id, (self.parent_def, self.impl_trait_context));
+        let old_parent = self
+            .resolver
+            .invocation_parents
+            .insert(id, (self.parent_def, self.impl_trait_context, self.in_attr));
         assert!(old_parent.is_none(), "parent `LocalDefId` is reset for an invocation");
     }
 }
@@ -125,7 +134,11 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
             ItemKind::Union(..) => DefKind::Union,
             ItemKind::ExternCrate(..) => DefKind::ExternCrate,
             ItemKind::TyAlias(..) => DefKind::TyAlias,
-            ItemKind::Static(s) => DefKind::Static(s.mutability),
+            ItemKind::Static(s) => DefKind::Static {
+                safety: hir::Safety::Safe,
+                mutability: s.mutability,
+                nested: false,
+            },
             ItemKind::Const(..) => DefKind::Const,
             ItemKind::Fn(..) | ItemKind::Delegation(..) => DefKind::Fn,
             ItemKind::MacroDef(..) => {
@@ -134,13 +147,10 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
                 opt_macro_data = Some(macro_data);
                 DefKind::Macro(macro_kind)
             }
-            ItemKind::MacCall(..) => {
-                visit::walk_item(self, i);
-                return self.visit_macro_invoc(i.id);
-            }
             ItemKind::GlobalAsm(..) => DefKind::GlobalAsm,
-            ItemKind::Use(..) => {
-                return visit::walk_item(self, i);
+            ItemKind::Use(..) => return visit::walk_item(self, i),
+            ItemKind::MacCall(..) | ItemKind::DelegationMac(..) => {
+                return self.visit_macro_invoc(i.id);
             }
         };
         let def_id = self.create_def(i.id, i.ident.name, def_kind, i.span);
@@ -212,7 +222,14 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
 
     fn visit_foreign_item(&mut self, fi: &'a ForeignItem) {
         let def_kind = match fi.kind {
-            ForeignItemKind::Static(_, mt, _) => DefKind::Static(mt),
+            ForeignItemKind::Static(box StaticItem { ty: _, mutability, expr: _, safety }) => {
+                let safety = match safety {
+                    ast::Safety::Unsafe(_) | ast::Safety::Default => hir::Safety::Unsafe,
+                    ast::Safety::Safe(_) => hir::Safety::Safe,
+                };
+
+                DefKind::Static { safety, mutability, nested: false }
+            }
             ForeignItemKind::Fn(_) => DefKind::Fn,
             ForeignItemKind::TyAlias(_) => DefKind::ForeignTy,
             ForeignItemKind::MacCall(_) => return self.visit_macro_invoc(fi.id),
@@ -220,7 +237,7 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
 
         let def = self.create_def(fi.id, fi.ident.name, def_kind, fi.span);
 
-        self.with_parent(def, |this| visit::walk_foreign_item(this, fi));
+        self.with_parent(def, |this| visit::walk_item(this, fi));
     }
 
     fn visit_variant(&mut self, v: &'a Variant) {
@@ -278,7 +295,9 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
             AssocItemKind::Fn(..) | AssocItemKind::Delegation(..) => DefKind::AssocFn,
             AssocItemKind::Const(..) => DefKind::AssocConst,
             AssocItemKind::Type(..) => DefKind::AssocTy,
-            AssocItemKind::MacCall(..) => return self.visit_macro_invoc(i.id),
+            AssocItemKind::MacCall(..) | AssocItemKind::DelegationMac(..) => {
+                return self.visit_macro_invoc(i.id);
+            }
         };
 
         let def = self.create_def(i.id, i.ident.name, def_kind, i.span);
@@ -320,10 +339,13 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
                     None => closure_def,
                 }
             }
-            ExprKind::Gen(_, _, _) => {
+            ExprKind::Gen(_, _, _, _) => {
                 self.create_def(expr.id, kw::Empty, DefKind::Closure, expr.span)
             }
             ExprKind::ConstBlock(ref constant) => {
+                for attr in &expr.attrs {
+                    visit::walk_attribute(self, attr);
+                }
                 let def = self.create_def(
                     constant.id,
                     kw::Empty,
@@ -395,5 +417,11 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
         } else {
             visit::walk_crate(self, krate)
         }
+    }
+
+    fn visit_attribute(&mut self, attr: &'a Attribute) -> Self::Result {
+        let orig_in_attr = mem::replace(&mut self.in_attr, true);
+        visit::walk_attribute(self, attr);
+        self.in_attr = orig_in_attr;
     }
 }

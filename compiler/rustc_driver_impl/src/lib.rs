@@ -4,45 +4,48 @@
 //!
 //! This API is completely unstable and subject to change.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
-#![allow(internal_features)]
 #![feature(decl_macro)]
 #![feature(let_chains)]
+#![feature(panic_backtrace_config)]
 #![feature(panic_update_hook)]
 #![feature(result_flattening)]
-
-#[macro_use]
-extern crate tracing;
+#![feature(rustdoc_internals)]
+// tidy-alphabetical-end
 
 use rustc_ast as ast;
 use rustc_codegen_ssa::{traits::CodegenBackend, CodegenErrors, CodegenResults};
+use rustc_const_eval::CTRL_C_RECEIVED;
 use rustc_data_structures::profiling::{
     get_resident_set_size, print_time_passes_entry, TimePassesFormat,
 };
+use rustc_errors::emitter::stderr_destination;
 use rustc_errors::registry::Registry;
 use rustc_errors::{
     markdown, ColorConfig, DiagCtxt, ErrCode, ErrorGuaranteed, FatalError, PResult,
 };
 use rustc_feature::find_gated_cfg;
-use rustc_interface::util::{self, collect_crate_types, get_codegen_backend};
-use rustc_interface::{interface, Queries};
+use rustc_interface::util::{self, get_codegen_backend};
+use rustc_interface::{interface, passes, Linker, Queries};
 use rustc_lint::unerased_lint_store;
 use rustc_metadata::creader::MetadataLoader;
 use rustc_metadata::locator;
+use rustc_parse::{new_parser_from_file, new_parser_from_source_str, unwrap_or_emit_fatal};
 use rustc_session::config::{nightly_options, CG_OPTIONS, Z_OPTIONS};
 use rustc_session::config::{ErrorOutputType, Input, OutFileName, OutputType};
 use rustc_session::getopts::{self, Matches};
 use rustc_session::lint::{Lint, LintId};
-use rustc_session::{config, EarlyDiagCtxt, Session};
-use rustc_span::def_id::LOCAL_CRATE;
+use rustc_session::output::collect_crate_types;
+use rustc_session::{config, filesearch, EarlyDiagCtxt, Session};
 use rustc_span::source_map::FileLoader;
 use rustc_span::symbol::sym;
 use rustc_span::FileName;
 use rustc_target::json::ToJson;
 use rustc_target::spec::{Target, TargetTriple};
-
 use std::cmp::max;
 use std::collections::BTreeMap;
 use std::env;
@@ -50,14 +53,15 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
-use std::panic::{self, catch_unwind, PanicInfo};
+use std::panic::{self, catch_unwind, PanicHookInfo};
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
+use tracing::trace;
 
 #[allow(unused_macros)]
 macro do_not_use_print($($t:tt)*) {
@@ -94,7 +98,7 @@ mod signal_handler {
 
 use crate::session_diagnostics::{
     RLinkEmptyVersionNumber, RLinkEncodingVersionMismatch, RLinkRustcVersionMismatch,
-    RLinkWrongFileType, RlinkNotAFile, RlinkUnableToRead,
+    RLinkWrongFileType, RlinkCorruptFile, RlinkNotAFile, RlinkUnableToRead,
 };
 
 rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
@@ -290,7 +294,7 @@ fn run_compiler(
     // the compiler with @empty_file as argv[0] and no more arguments.
     let at_args = at_args.get(1..).unwrap_or_default();
 
-    let args = args::arg_expand_all(&default_early_dcx, at_args);
+    let args = args::arg_expand_all(&default_early_dcx, at_args)?;
 
     let Some(matches) = handle_options(&default_early_dcx, &args) else { return Ok(()) };
 
@@ -313,7 +317,7 @@ fn run_compiler(
         file_loader,
         locale_resources: DEFAULT_LOCALE_RESOURCES,
         lint_caps: Default::default(),
-        parse_sess_created: None,
+        psess_created: None,
         hash_untracked_state: None,
         register_lints: None,
         override_queries: None,
@@ -362,18 +366,17 @@ fn run_compiler(
             return early_exit();
         }
 
-        let early_dcx = EarlyDiagCtxt::new(sess.opts.error_format);
-
-        if print_crate_info(&early_dcx, codegen_backend, sess, has_input) == Compilation::Stop {
+        if print_crate_info(codegen_backend, sess, has_input) == Compilation::Stop {
             return early_exit();
         }
 
         if !has_input {
-            early_dcx.early_fatal("no input filename given"); // this is fatal
+            #[allow(rustc::diagnostic_outside_of_impl)]
+            sess.dcx().fatal("no input filename given"); // this is fatal
         }
 
         if !sess.opts.unstable_opts.ls.is_empty() {
-            list_metadata(&early_dcx, sess, &*codegen_backend.metadata_loader());
+            list_metadata(sess, &*codegen_backend.metadata_loader());
             return early_exit();
         }
 
@@ -394,7 +397,9 @@ fn run_compiler(
                         Ok(())
                     })?;
 
-                    queries.write_dep_info()?;
+                    queries.global_ctxt()?.enter(|tcx| {
+                        passes::write_dep_info(tcx);
+                    });
                 } else {
                     let krate = queries.parse()?;
                     pretty::print(
@@ -416,13 +421,15 @@ fn run_compiler(
             }
 
             // Make sure name resolution and macro expansion is run.
-            queries.global_ctxt()?.enter(|tcx| tcx.resolver_for_lowering(()));
+            queries.global_ctxt()?.enter(|tcx| tcx.resolver_for_lowering());
 
             if callbacks.after_expansion(compiler, queries) == Compilation::Stop {
                 return early_exit();
             }
 
-            queries.write_dep_info()?;
+            queries.global_ctxt()?.enter(|tcx| {
+                passes::write_dep_info(tcx);
+            });
 
             if sess.opts.output_types.contains_key(&OutputType::DepInfo)
                 && sess.opts.output_types.len() == 1
@@ -440,21 +447,9 @@ fn run_compiler(
                 return early_exit();
             }
 
-            let linker = queries.codegen_and_build_linker()?;
-
-            // This must run after monomorphization so that all generic types
-            // have been instantiated.
-            if sess.opts.unstable_opts.print_type_sizes {
-                sess.code_stats.print_type_sizes();
-            }
-
-            if sess.opts.unstable_opts.print_vtable_sizes {
-                let crate_name = queries.global_ctxt()?.enter(|tcx| tcx.crate_name(LOCAL_CRATE));
-
-                sess.code_stats.print_vtable_sizes(crate_name);
-            }
-
-            Ok(Some(linker))
+            queries.global_ctxt()?.enter(|tcx| {
+                Ok(Some(Linker::codegen_and_build_linker(tcx, &*compiler.codegen_backend)?))
+            })
         })?;
 
         // Linking is done outside the `compiler.enter()` so that the
@@ -643,14 +638,16 @@ fn process_rlink(sess: &Session, compiler: &interface::Compiler) {
                 match err {
                     CodegenErrors::WrongFileType => dcx.emit_fatal(RLinkWrongFileType),
                     CodegenErrors::EmptyVersionNumber => dcx.emit_fatal(RLinkEmptyVersionNumber),
-                    CodegenErrors::EncodingVersionMismatch { version_array, rlink_version } => sess
-                        .dcx()
+                    CodegenErrors::EncodingVersionMismatch { version_array, rlink_version } => dcx
                         .emit_fatal(RLinkEncodingVersionMismatch { version_array, rlink_version }),
                     CodegenErrors::RustcVersionMismatch { rustc_version } => {
                         dcx.emit_fatal(RLinkRustcVersionMismatch {
                             rustc_version,
                             current_version: sess.cfg_version,
                         })
+                    }
+                    CodegenErrors::CorruptFile => {
+                        dcx.emit_fatal(RlinkCorruptFile { file });
                     }
                 };
             }
@@ -663,7 +660,7 @@ fn process_rlink(sess: &Session, compiler: &interface::Compiler) {
     }
 }
 
-fn list_metadata(early_dcx: &EarlyDiagCtxt, sess: &Session, metadata_loader: &dyn MetadataLoader) {
+fn list_metadata(sess: &Session, metadata_loader: &dyn MetadataLoader) {
     match sess.io.input {
         Input::File(ref ifile) => {
             let path = &(*ifile);
@@ -674,18 +671,19 @@ fn list_metadata(early_dcx: &EarlyDiagCtxt, sess: &Session, metadata_loader: &dy
                 metadata_loader,
                 &mut v,
                 &sess.opts.unstable_opts.ls,
+                sess.cfg_version,
             )
             .unwrap();
             safe_println!("{}", String::from_utf8(v).unwrap());
         }
         Input::Str { .. } => {
-            early_dcx.early_fatal("cannot list metadata for stdin");
+            #[allow(rustc::diagnostic_outside_of_impl)]
+            sess.dcx().fatal("cannot list metadata for stdin");
         }
     }
 }
 
 fn print_crate_info(
-    early_dcx: &EarlyDiagCtxt,
     codegen_backend: &dyn CodegenBackend,
     sess: &Session,
     parse_attrs: bool,
@@ -767,7 +765,7 @@ fn print_crate_info(
             }
             Cfg => {
                 let mut cfgs = sess
-                    .parse_sess
+                    .psess
                     .config
                     .iter()
                     .filter_map(|&(name, value)| {
@@ -797,6 +795,43 @@ fn print_crate_info(
                 cfgs.sort();
                 for cfg in cfgs {
                     println_info!("{cfg}");
+                }
+            }
+            CheckCfg => {
+                let mut check_cfgs: Vec<String> = Vec::with_capacity(410);
+
+                // INSTABILITY: We are sorting the output below.
+                #[allow(rustc::potential_query_instability)]
+                for (name, expected_values) in &sess.psess.check_config.expecteds {
+                    use crate::config::ExpectedValues;
+                    match expected_values {
+                        ExpectedValues::Any => check_cfgs.push(format!("{name}=any()")),
+                        ExpectedValues::Some(values) => {
+                            if !values.is_empty() {
+                                check_cfgs.extend(values.iter().map(|value| {
+                                    if let Some(value) = value {
+                                        format!("{name}=\"{value}\"")
+                                    } else {
+                                        name.to_string()
+                                    }
+                                }))
+                            } else {
+                                check_cfgs.push(format!("{name}="))
+                            }
+                        }
+                    }
+                }
+
+                check_cfgs.sort_unstable();
+                if !sess.psess.check_config.exhaustive_names {
+                    if !sess.psess.check_config.exhaustive_values {
+                        println_info!("any()=any()");
+                    } else {
+                        println_info!("any()");
+                    }
+                }
+                for check_cfg in check_cfgs {
+                    println_info!("{check_cfg}");
                 }
             }
             CallingConventions => {
@@ -832,8 +867,8 @@ fn print_crate_info(
                         .expect("unknown Apple target OS");
                     println_info!("deployment_target={}", format!("{major}.{minor}"))
                 } else {
-                    early_dcx
-                        .early_fatal("only Apple targets currently support deployment version info")
+                    #[allow(rustc::diagnostic_outside_of_impl)]
+                    sess.dcx().fatal("only Apple targets currently support deployment version info")
                 }
             }
         }
@@ -884,7 +919,11 @@ pub fn version_at_macro_invocation(
 
         let debug_flags = matches.opt_strs("Z");
         let backend_name = debug_flags.iter().find_map(|x| x.strip_prefix("codegen-backend="));
-        get_codegen_backend(early_dcx, &None, backend_name).print_version();
+        let opts = config::Options::default();
+        let sysroot = filesearch::materialize_sysroot(opts.maybe_sysroot.clone());
+        let target = config::build_target_config(early_dcx, &opts, &sysroot);
+
+        get_codegen_backend(early_dcx, &sysroot, backend_name, &target).print_version();
     }
 }
 
@@ -962,7 +1001,7 @@ Available lint options:
 
     let lint_store = unerased_lint_store(sess);
     let (loaded, builtin): (Vec<_>, _) =
-        lint_store.get_lints().iter().cloned().partition(|&lint| lint.is_loaded);
+        lint_store.get_lints().iter().cloned().partition(|&lint| lint.is_externally_loaded);
     let loaded = sort_lints(sess, loaded);
     let builtin = sort_lints(sess, builtin);
 
@@ -1084,12 +1123,21 @@ pub fn describe_flag_categories(early_dcx: &EarlyDiagCtxt, matches: &Matches) ->
     }
 
     if cg_flags.iter().any(|x| *x == "no-stack-check") {
-        early_dcx.early_warn("the --no-stack-check flag is deprecated and does nothing");
+        early_dcx.early_warn("the `-Cno-stack-check` flag is deprecated and does nothing");
+    }
+
+    if cg_flags.iter().any(|x| x.starts_with("inline-threshold")) {
+        early_dcx.early_warn("the `-Cinline-threshold` flag is deprecated and does nothing (consider using `-Cllvm-args=--inline-threshold=...`)");
     }
 
     if cg_flags.iter().any(|x| *x == "passes=list") {
         let backend_name = debug_flags.iter().find_map(|x| x.strip_prefix("codegen-backend="));
-        get_codegen_backend(early_dcx, &None, backend_name).print_passes();
+
+        let opts = config::Options::default();
+        let sysroot = filesearch::materialize_sysroot(opts.maybe_sysroot.clone());
+        let target = config::build_target_config(early_dcx, &opts, &sysroot);
+
+        get_codegen_backend(early_dcx, &sysroot, backend_name, &target).print_passes();
         return true;
     }
 
@@ -1213,14 +1261,13 @@ pub fn handle_options(early_dcx: &EarlyDiagCtxt, args: &[String]) -> Option<geto
 }
 
 fn parse_crate_attrs<'a>(sess: &'a Session) -> PResult<'a, ast::AttrVec> {
-    match &sess.io.input {
-        Input::File(ifile) => rustc_parse::parse_crate_attrs_from_file(ifile, &sess.parse_sess),
-        Input::Str { name, input } => rustc_parse::parse_crate_attrs_from_source_str(
-            name.clone(),
-            input.clone(),
-            &sess.parse_sess,
-        ),
-    }
+    let mut parser = unwrap_or_emit_fatal(match &sess.io.input {
+        Input::File(file) => new_parser_from_file(&sess.psess, file, None),
+        Input::Str { name, input } => {
+            new_parser_from_source_str(&sess.psess, name.clone(), input.clone())
+        }
+    });
+    parser.parse_inner_attributes()
 }
 
 /// Runs a closure and catches unwinds triggered by fatal errors.
@@ -1308,15 +1355,17 @@ pub fn install_ice_hook(
     // by the user. Compiler developers and other rustc users can
     // opt in to less-verbose backtraces by manually setting "RUST_BACKTRACE"
     // (e.g. `RUST_BACKTRACE=1`)
-    if std::env::var_os("RUST_BACKTRACE").is_none() {
-        std::env::set_var("RUST_BACKTRACE", "full");
+    if env::var_os("RUST_BACKTRACE").is_none() {
+        panic::set_backtrace_style(panic::BacktraceStyle::Full);
     }
 
     let using_internal_features = Arc::new(std::sync::atomic::AtomicBool::default());
     let using_internal_features_hook = using_internal_features.clone();
     panic::update_hook(Box::new(
-        move |default_hook: &(dyn Fn(&PanicInfo<'_>) + Send + Sync + 'static),
-              info: &PanicInfo<'_>| {
+        move |default_hook: &(dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static),
+              info: &PanicHookInfo<'_>| {
+            // Lock stderr to prevent interleaving of concurrent panics.
+            let _guard = io::stderr().lock();
             // If the error was caused by a broken pipe then this is not a bug.
             // Write the error and return immediately. See #98700.
             #[cfg(windows)]
@@ -1377,18 +1426,19 @@ pub fn install_ice_hook(
 /// When `install_ice_hook` is called, this function will be called as the panic
 /// hook.
 fn report_ice(
-    info: &panic::PanicInfo<'_>,
+    info: &panic::PanicHookInfo<'_>,
     bug_report_url: &str,
     extra_info: fn(&DiagCtxt),
     using_internal_features: &AtomicBool,
 ) {
     let fallback_bundle =
         rustc_errors::fallback_fluent_bundle(crate::DEFAULT_LOCALE_RESOURCES.to_vec(), false);
-    let emitter = Box::new(rustc_errors::emitter::HumanEmitter::stderr(
-        rustc_errors::ColorConfig::Auto,
+    let emitter = Box::new(rustc_errors::emitter::HumanEmitter::new(
+        stderr_destination(rustc_errors::ColorConfig::Auto),
         fallback_bundle,
     ));
-    let dcx = rustc_errors::DiagCtxt::with_emitter(emitter);
+    let dcx = rustc_errors::DiagCtxt::new(emitter);
+    let dcx = dcx.handle();
 
     // a .span_bug or .bug call has already printed what
     // it wants to print.
@@ -1402,6 +1452,11 @@ fn report_ice(
         dcx.emit_note(session_diagnostics::IceBugReportInternalFeature);
     } else {
         dcx.emit_note(session_diagnostics::IceBugReport { bug_report_url });
+
+        // Only emit update nightly hint for users on nightly builds.
+        if rustc_feature::UnstableFeatures::from_environment(None).is_nightly_build() {
+            dcx.emit_note(session_diagnostics::UpdateNightlyNote);
+        }
     }
 
     let version = util::version_str!().unwrap_or("unknown_version");
@@ -1449,7 +1504,7 @@ fn report_ice(
 
     let num_frames = if backtrace { None } else { Some(2) };
 
-    interface::try_print_query_stack(&dcx, num_frames, file);
+    interface::try_print_query_stack(dcx, num_frames, file);
 
     // We don't trust this callback not to panic itself, so run it at the end after we're sure we've
     // printed all the relevant info.
@@ -1477,6 +1532,22 @@ pub fn init_logger(early_dcx: &EarlyDiagCtxt, cfg: rustc_log::LoggerConfig) {
     }
 }
 
+/// Install our usual `ctrlc` handler, which sets [`rustc_const_eval::CTRL_C_RECEIVED`].
+/// Making this handler optional lets tools can install a different handler, if they wish.
+pub fn install_ctrlc_handler() {
+    #[cfg(not(target_family = "wasm"))]
+    ctrlc::set_handler(move || {
+        // Indicate that we have been signaled to stop, then give the rest of the compiler a bit of
+        // time to check CTRL_C_RECEIVED and run its own shutdown logic, but after a short amount
+        // of time exit the process. This sleep+exit ensures that even if nobody is checking
+        // CTRL_C_RECEIVED, the compiler exits reasonably promptly.
+        CTRL_C_RECEIVED.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(100));
+        std::process::exit(1);
+    })
+    .expect("Unable to install ctrlc handler");
+}
+
 pub fn main() -> ! {
     let start_time = Instant::now();
     let start_rss = get_resident_set_size();
@@ -1487,16 +1558,10 @@ pub fn main() -> ! {
     signal_handler::install();
     let mut callbacks = TimePassesCallbacks::default();
     let using_internal_features = install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
+    install_ctrlc_handler();
+
     let exit_code = catch_with_exit_code(|| {
-        let args = env::args_os()
-            .enumerate()
-            .map(|(i, arg)| {
-                arg.into_string().unwrap_or_else(|arg| {
-                    early_dcx.early_fatal(format!("argument {i} is not valid Unicode: {arg:?}"))
-                })
-            })
-            .collect::<Vec<_>>();
-        RunCompiler::new(&args, &mut callbacks)
+        RunCompiler::new(&args::raw_args(&early_dcx)?, &mut callbacks)
             .set_using_internal_features(using_internal_features)
             .run()
     });

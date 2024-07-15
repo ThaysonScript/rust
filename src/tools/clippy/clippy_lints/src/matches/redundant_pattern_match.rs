@@ -3,7 +3,7 @@ use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::source::{snippet, walk_span_to_context};
 use clippy_utils::sugg::{make_unop, Sugg};
 use clippy_utils::ty::{is_type_diagnostic_item, needs_ordered_drop};
-use clippy_utils::visitors::{any_temporaries_need_ordered_drop, for_each_expr};
+use clippy_utils::visitors::{any_temporaries_need_ordered_drop, for_each_expr_without_closures};
 use clippy_utils::{higher, is_expn_of, is_trait_method};
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
@@ -72,7 +72,7 @@ fn find_match_true<'tcx>(
     pat: &'tcx Pat<'_>,
     scrutinee: &'tcx Expr<'_>,
     span: Span,
-    message: &str,
+    message: &'static str,
 ) {
     if let PatKind::Lit(lit) = pat.kind
         && let ExprKind::Lit(lit) = lit.kind
@@ -98,7 +98,7 @@ fn find_match_true<'tcx>(
             span,
             message,
             "consider using the condition directly",
-            sugg.to_string(),
+            sugg.into_string(),
             applicability,
         );
     }
@@ -227,7 +227,7 @@ fn find_method_sugg_for_if_let<'tcx>(
         cx,
         REDUNDANT_PATTERN_MATCHING,
         let_pat.span,
-        &format!("redundant pattern matching, consider using `{good_method}`"),
+        format!("redundant pattern matching, consider using `{good_method}`"),
         |diag| {
             // if/while let ... = ... { ... }
             // ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -283,7 +283,7 @@ pub(super) fn check_match<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, op
                 // to see that there aren't any let chains anywhere in the guard, as that would break
                 // if we suggest `t.is_none() && (let X = y && z)` for:
                 // `match t { None if let X = y && z => true, _ => false }`
-                let has_nested_let_chain = for_each_expr(guard, |expr| {
+                let has_nested_let_chain = for_each_expr_without_closures(guard, |expr| {
                     if matches!(expr.kind, ExprKind::Let(..)) {
                         ControlFlow::Break(())
                     } else {
@@ -304,7 +304,7 @@ pub(super) fn check_match<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, op
                 cx,
                 REDUNDANT_PATTERN_MATCHING,
                 span,
-                &format!("redundant pattern matching, consider using `{good_method}`"),
+                format!("redundant pattern matching, consider using `{good_method}`"),
                 "try",
                 sugg,
                 Applicability::MachineApplicable,

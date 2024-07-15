@@ -1,5 +1,6 @@
 // We want to control preemption here.
-//@compile-flags: -Zmiri-preemption-rate=0
+// Avoid accidental synchronization via address reuse.
+//@compile-flags: -Zmiri-preemption-rate=0 -Zmiri-address-reuse-cross-thread-rate=0
 
 use std::sync::atomic::Ordering::*;
 use std::sync::atomic::{AtomicU16, AtomicU32};
@@ -29,7 +30,7 @@ pub fn main() {
         let x_split = split_u32_ptr(x_ptr);
         unsafe {
             let hi = x_split as *const u16 as *const AtomicU16;
-            (*hi).load(Relaxed); //~ ERROR: (1) 4-byte atomic load on thread `<unnamed>` and (2) 2-byte atomic load
+            (*hi).load(Relaxed); //~ ERROR: (1) 4-byte atomic load on thread `unnamed-1` and (2) 2-byte atomic load
         }
     });
 

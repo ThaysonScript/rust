@@ -10,8 +10,8 @@
 //!
 //! `ReachedFixedPoint` signals about this.
 
-use base_db::Edition;
 use hir_expand::{name::Name, Lookup};
+use span::Edition;
 use triomphe::Arc;
 
 use crate::{
@@ -22,7 +22,7 @@ use crate::{
     path::{ModPath, PathKind},
     per_ns::PerNs,
     visibility::{RawVisibility, Visibility},
-    AdtId, CrateId, LocalModuleId, ModuleDefId,
+    AdtId, LocalModuleId, ModuleDefId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,21 +42,21 @@ pub(super) struct ResolvePathResult {
     pub(super) resolved_def: PerNs,
     pub(super) segment_index: Option<usize>,
     pub(super) reached_fixedpoint: ReachedFixedPoint,
-    pub(super) krate: Option<CrateId>,
+    pub(super) from_differing_crate: bool,
 }
 
 impl ResolvePathResult {
     fn empty(reached_fixedpoint: ReachedFixedPoint) -> ResolvePathResult {
-        ResolvePathResult::with(PerNs::none(), reached_fixedpoint, None, None)
+        ResolvePathResult::new(PerNs::none(), reached_fixedpoint, None, false)
     }
 
-    fn with(
+    fn new(
         resolved_def: PerNs,
         reached_fixedpoint: ReachedFixedPoint,
         segment_index: Option<usize>,
-        krate: Option<CrateId>,
+        from_differing_crate: bool,
     ) -> ResolvePathResult {
-        ResolvePathResult { resolved_def, segment_index, reached_fixedpoint, krate }
+        ResolvePathResult { resolved_def, segment_index, reached_fixedpoint, from_differing_crate }
     }
 }
 
@@ -134,7 +134,19 @@ impl DefMap {
         // resolving them to. Pass `None` otherwise, e.g. when we're resolving import paths.
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
-        let mut result = ResolvePathResult::empty(ReachedFixedPoint::No);
+        let mut result = self.resolve_path_fp_with_macro_single(
+            db,
+            mode,
+            original_module,
+            path,
+            shadow,
+            expected_macro_subns,
+        );
+
+        if self.block.is_none() {
+            // If we're in the root `DefMap`, we can resolve the path directly.
+            return result;
+        }
 
         let mut arc;
         let mut current_map = self;
@@ -153,8 +165,7 @@ impl DefMap {
             if result.reached_fixedpoint == ReachedFixedPoint::No {
                 result.reached_fixedpoint = new.reached_fixedpoint;
             }
-            // FIXME: this doesn't seem right; what if the different namespace resolutions come from different crates?
-            result.krate = result.krate.or(new.krate);
+            result.from_differing_crate |= new.from_differing_crate;
             result.segment_index = match (result.segment_index, new.segment_index) {
                 (Some(idx), None) => Some(idx),
                 (Some(old), Some(new)) => Some(old.max(new)),
@@ -210,7 +221,7 @@ impl DefMap {
                     None => return ResolvePathResult::empty(ReachedFixedPoint::Yes),
                 };
                 tracing::debug!("resolving {:?} in crate root (+ extern prelude)", segment);
-                self.resolve_name_in_crate_root_or_extern_prelude(db, segment)
+                self.resolve_name_in_crate_root_or_extern_prelude(db, original_module, segment)
             }
             PathKind::Plain => {
                 let (_, segment) = match segments.next() {
@@ -272,7 +283,7 @@ impl DefMap {
                     // If we have a different `DefMap` from `self` (the original `DefMap` we started
                     // with), resolve the remaining path segments in that `DefMap`.
                     let path =
-                        ModPath::from_segments(PathKind::Super(0), path.segments().iter().cloned());
+                        ModPath::from_segments(PathKind::SELF, path.segments().iter().cloned());
                     return def_map.resolve_path_fp_with_macro(
                         db,
                         mode,
@@ -322,7 +333,7 @@ impl DefMap {
                 ModuleDefId::ModuleId(module) => {
                     if module.krate != self.krate {
                         let path = ModPath::from_segments(
-                            PathKind::Super(0),
+                            PathKind::SELF,
                             path.segments()[i..].iter().cloned(),
                         );
                         tracing::debug!("resolving {:?} in other crate", path);
@@ -333,11 +344,11 @@ impl DefMap {
                         // expectation is discarded.
                         let (def, s) =
                             defp_map.resolve_path(db, module.local_id, &path, shadow, None);
-                        return ResolvePathResult::with(
+                        return ResolvePathResult::new(
                             def,
                             ReachedFixedPoint::Yes,
                             s.map(|s| s + i),
-                            Some(module.krate),
+                            true,
                         );
                     }
 
@@ -385,11 +396,11 @@ impl DefMap {
                     match res {
                         Some(res) => res,
                         None => {
-                            return ResolvePathResult::with(
+                            return ResolvePathResult::new(
                                 PerNs::types(e.into(), vis, imp),
                                 ReachedFixedPoint::Yes,
                                 Some(i),
-                                Some(self.krate),
+                                false,
                             )
                         }
                     }
@@ -403,11 +414,11 @@ impl DefMap {
                         curr,
                     );
 
-                    return ResolvePathResult::with(
+                    return ResolvePathResult::new(
                         PerNs::types(s, vis, imp),
                         ReachedFixedPoint::Yes,
                         Some(i),
-                        Some(self.krate),
+                        false,
                     );
                 }
             };
@@ -416,7 +427,7 @@ impl DefMap {
                 .filter_visibility(|vis| vis.is_visible_from_def_map(db, self, original_module));
         }
 
-        ResolvePathResult::with(curr_per_ns, ReachedFixedPoint::Yes, None, Some(self.krate))
+        ResolvePathResult::new(curr_per_ns, ReachedFixedPoint::Yes, None, false)
     }
 
     fn resolve_name_in_module(
@@ -459,9 +470,9 @@ impl DefMap {
         };
 
         let extern_prelude = || {
-            if self.block.is_some() {
-                // Don't resolve extern prelude in block `DefMap`s, defer it to the crate def map so
-                // that blocks can properly shadow them
+            if self.block.is_some() && module == DefMap::ROOT {
+                // Don't resolve extern prelude in pseudo-modules of blocks, because
+                // they might been shadowed by local names.
                 return PerNs::none();
             }
             self.data.extern_prelude.get(name).map_or(PerNs::none(), |&(it, extern_crate)| {
@@ -482,7 +493,12 @@ impl DefMap {
                 )
             })
         };
-        let prelude = || self.resolve_in_prelude(db, name);
+        let prelude = || {
+            if self.block.is_some() && module == DefMap::ROOT {
+                return PerNs::none();
+            }
+            self.resolve_in_prelude(db, name)
+        };
 
         from_legacy_macro
             .or(from_scope_or_builtin)
@@ -494,6 +510,7 @@ impl DefMap {
     fn resolve_name_in_crate_root_or_extern_prelude(
         &self,
         db: &dyn DefDatabase,
+        module: LocalModuleId,
         name: &Name,
     ) -> PerNs {
         let from_crate_root = match self.block {
@@ -504,8 +521,8 @@ impl DefMap {
             None => self[Self::ROOT].scope.get(name),
         };
         let from_extern_prelude = || {
-            if self.block.is_some() {
-                // Don't resolve extern prelude in block `DefMap`s.
+            if self.block.is_some() && module == DefMap::ROOT {
+                // Don't resolve extern prelude in pseudo-module of a block.
                 return PerNs::none();
             }
             self.data.extern_prelude.get(name).copied().map_or(

@@ -1,9 +1,11 @@
 use crate::traits::*;
 
+use rustc_middle::bug;
 use rustc_middle::ty::{self, GenericArgKind, Ty};
 use rustc_session::config::Lto;
 use rustc_symbol_mangling::typeid_for_trait_ref;
 use rustc_target::abi::call::FnAbi;
+use tracing::{debug, instrument};
 
 #[derive(Copy, Clone, Debug)]
 pub struct VirtualIndex(u64);
@@ -13,16 +15,21 @@ impl<'a, 'tcx> VirtualIndex {
         VirtualIndex(index as u64)
     }
 
-    pub fn get_fn<Bx: BuilderMethods<'a, 'tcx>>(
+    fn get_fn_inner<Bx: BuilderMethods<'a, 'tcx>>(
         self,
         bx: &mut Bx,
         llvtable: Bx::Value,
         ty: Ty<'tcx>,
         fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
+        nonnull: bool,
     ) -> Bx::Value {
-        // Load the data pointer from the object.
+        // Load the function pointer from the object.
         debug!("get_fn({llvtable:?}, {ty:?}, {self:?})");
+
         let llty = bx.fn_ptr_backend_type(fn_abi);
+        let ptr_size = bx.data_layout().pointer_size;
+        let ptr_align = bx.data_layout().pointer_align.abi;
+        let vtable_byte_offset = self.0 * ptr_size.bytes();
 
         if bx.cx().sess().opts.unstable_opts.virtual_function_elimination
             && bx.cx().sess().lto() == Lto::Fat
@@ -30,18 +37,38 @@ impl<'a, 'tcx> VirtualIndex {
             let typeid = bx
                 .typeid_metadata(typeid_for_trait_ref(bx.tcx(), expect_dyn_trait_in_self(ty)))
                 .unwrap();
-            let vtable_byte_offset = self.0 * bx.data_layout().pointer_size.bytes();
             let func = bx.type_checked_load(llvtable, vtable_byte_offset, typeid);
             func
         } else {
-            let ptr_align = bx.tcx().data_layout.pointer_align.abi;
-            let gep = bx.inbounds_gep(llty, llvtable, &[bx.const_usize(self.0)]);
+            let gep = bx.inbounds_ptradd(llvtable, bx.const_usize(vtable_byte_offset));
             let ptr = bx.load(llty, gep, ptr_align);
-            bx.nonnull_metadata(ptr);
             // VTable loads are invariant.
             bx.set_invariant_load(ptr);
+            if nonnull {
+                bx.nonnull_metadata(ptr);
+            }
             ptr
         }
+    }
+
+    pub fn get_optional_fn<Bx: BuilderMethods<'a, 'tcx>>(
+        self,
+        bx: &mut Bx,
+        llvtable: Bx::Value,
+        ty: Ty<'tcx>,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
+    ) -> Bx::Value {
+        self.get_fn_inner(bx, llvtable, ty, fn_abi, false)
+    }
+
+    pub fn get_fn<Bx: BuilderMethods<'a, 'tcx>>(
+        self,
+        bx: &mut Bx,
+        llvtable: Bx::Value,
+        ty: Ty<'tcx>,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
+    ) -> Bx::Value {
+        self.get_fn_inner(bx, llvtable, ty, fn_abi, true)
     }
 
     pub fn get_usize<Bx: BuilderMethods<'a, 'tcx>>(
@@ -53,9 +80,12 @@ impl<'a, 'tcx> VirtualIndex {
         debug!("get_int({:?}, {:?})", llvtable, self);
 
         let llty = bx.type_isize();
-        let usize_align = bx.tcx().data_layout.pointer_align.abi;
-        let gep = bx.inbounds_gep(llty, llvtable, &[bx.const_usize(self.0)]);
-        let ptr = bx.load(llty, gep, usize_align);
+        let ptr_size = bx.data_layout().pointer_size;
+        let ptr_align = bx.data_layout().pointer_align.abi;
+        let vtable_byte_offset = self.0 * ptr_size.bytes();
+
+        let gep = bx.inbounds_ptradd(llvtable, bx.const_usize(vtable_byte_offset));
+        let ptr = bx.load(llty, gep, ptr_align);
         // VTable loads are invariant.
         bx.set_invariant_load(ptr);
         ptr
@@ -103,6 +133,7 @@ pub fn get_vtable<'tcx, Cx: CodegenMethods<'tcx>>(
     let align = cx.data_layout().pointer_align.abi;
     let vtable = cx.static_addr_of(vtable_const, align, Some("vtable"));
 
+    cx.apply_vcall_visibility_metadata(ty, trait_ref, vtable);
     cx.create_vtable_debuginfo(ty, trait_ref, vtable);
     cx.vtables().borrow_mut().insert((ty, trait_ref), vtable);
     vtable

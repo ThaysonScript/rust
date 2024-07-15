@@ -2,12 +2,12 @@
 // before 4.0, formerly backported to the Rust LLVM fork.
 
 //@ ignore-windows
-//@ ignore-macos
+//@ ignore-apple
+//@ ignore-wasi
 
 //@ compile-flags: -g -C no-prepopulate-passes
 
 // CHECK-LABEL: @main
 // CHECK: {{.*}}DISubprogram{{.*}}name: "main",{{.*}}DI{{(SP)?}}FlagMainSubprogram{{.*}}
 
-pub fn main() {
-}
+pub fn main() {}

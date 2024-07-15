@@ -54,13 +54,13 @@ use core::ops::Add;
 use core::ops::AddAssign;
 #[cfg(not(no_global_oom_handling))]
 use core::ops::Bound::{Excluded, Included, Unbounded};
-use core::ops::{self, Index, IndexMut, Range, RangeBounds};
+use core::ops::{self, Range, RangeBounds};
 use core::ptr;
 use core::slice;
 use core::str::pattern::Pattern;
-#[cfg(not(no_global_oom_handling))]
-use core::str::Utf8Chunks;
 
+#[cfg(not(no_global_oom_handling))]
+use crate::alloc::Allocator;
 #[cfg(not(no_global_oom_handling))]
 use crate::borrow::{Cow, ToOwned};
 use crate::boxed::Box;
@@ -72,9 +72,9 @@ use crate::vec::Vec;
 
 /// A UTF-8–encoded, growable string.
 ///
-/// The `String` type is the most common string type that has ownership over the
-/// contents of the string. It has a close relationship with its borrowed
-/// counterpart, the primitive [`str`].
+/// `String` is the most common string type. It has ownership over the contents
+/// of the string, stored in a heap-allocated buffer (see [Representation](#representation)).
+/// It is closely related to its borrowed counterpart, the primitive [`str`].
 ///
 /// # Examples
 ///
@@ -260,7 +260,7 @@ use crate::vec::Vec;
 /// # Representation
 ///
 /// A `String` is made up of three components: a pointer to some bytes, a
-/// length, and a capacity. The pointer points to an internal buffer `String`
+/// length, and a capacity. The pointer points to the internal buffer which `String`
 /// uses to store its data. The length is the number of bytes currently stored
 /// in the buffer, and the capacity is the size of the buffer in bytes. As such,
 /// the length will always be less than or equal to the capacity.
@@ -492,6 +492,19 @@ impl String {
         String { vec: Vec::with_capacity(capacity) }
     }
 
+    /// Creates a new empty `String` with at least the specified capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Err`] if the capacity exceeds `isize::MAX` bytes,
+    /// or if the memory allocator reports failure.
+    ///
+    #[inline]
+    #[unstable(feature = "try_with_capacity", issue = "91913")]
+    pub fn try_with_capacity(capacity: usize) -> Result<String, TryReserveError> {
+        Ok(String { vec: Vec::try_with_capacity(capacity)? })
+    }
+
     // HACK(japaric): with cfg(test) the inherent `[T]::to_vec` method, which is
     // required for this method definition, is not available. Since we don't
     // require this method for testing purposes, I'll just stub it
@@ -620,7 +633,7 @@ impl String {
     #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn from_utf8_lossy(v: &[u8]) -> Cow<'_, str> {
-        let mut iter = Utf8Chunks::new(v);
+        let mut iter = v.utf8_chunks();
 
         let first_valid = if let Some(chunk) = iter.next() {
             let valid = chunk.valid();
@@ -864,7 +877,7 @@ impl String {
         }
     }
 
-    /// Decomposes a `String` into its raw components.
+    /// Decomposes a `String` into its raw components: `(pointer, length, capacity)`.
     ///
     /// Returns the raw pointer to the underlying data, the length of
     /// the string (in bytes), and the allocated capacity of the data
@@ -896,7 +909,7 @@ impl String {
         self.vec.into_raw_parts()
     }
 
-    /// Creates a new `String` from a length, capacity, and pointer.
+    /// Creates a new `String` from a pointer, a length and a capacity.
     ///
     /// # Safety
     ///
@@ -1371,7 +1384,7 @@ impl String {
 
     /// Shortens this `String` to the specified length.
     ///
-    /// If `new_len` is greater than the string's current length, this has no
+    /// If `new_len` is greater than or equal to the string's current length, this has no
     /// effect.
     ///
     /// Note that this method has no effect on the allocated capacity
@@ -1929,8 +1942,10 @@ impl String {
 
     /// Converts this `String` into a <code>[Box]<[str]></code>.
     ///
-    /// This will drop any excess capacity.
+    /// Before doing the conversion, this method discards excess capacity like [`shrink_to_fit`].
+    /// Note that this call may reallocate and copy the bytes of the string.
     ///
+    /// [`shrink_to_fit`]: String::shrink_to_fit
     /// [str]: prim@str "str"
     ///
     /// # Examples
@@ -1956,10 +1971,10 @@ impl String {
     /// this function is ideally used for data that lives for the remainder of the program's life,
     /// as dropping the returned reference will cause a memory leak.
     ///
-    /// It does not reallocate or shrink the `String`,
-    /// so the leaked allocation may include unused capacity that is not part
-    /// of the returned slice. If you don't want that, call [`into_boxed_str`],
-    /// and then [`Box::leak`].
+    /// It does not reallocate or shrink the `String`, so the leaked allocation may include unused
+    /// capacity that is not part of the returned slice. If you want to discard excess capacity,
+    /// call [`into_boxed_str`], and then [`Box::leak`] instead. However, keep in mind that
+    /// trimming the capacity may result in a reallocation and copy.
     ///
     /// [`into_boxed_str`]: Self::into_boxed_str
     ///
@@ -1969,6 +1984,9 @@ impl String {
     /// let x = String::from("bucket");
     /// let static_ref: &'static mut str = x.leak();
     /// assert_eq!(static_ref, "bucket");
+    /// # // FIXME(https://github.com/rust-lang/miri/issues/3670):
+    /// # // use -Zmiri-disable-leak-check instead of unleaking in tests meant to leak.
+    /// # drop(unsafe { Box::from_raw(static_ref) });
     /// ```
     #[stable(feature = "string_leak", since = "1.72.0")]
     #[inline]
@@ -2084,6 +2102,10 @@ impl Clone for String {
         String { vec: self.vec.clone() }
     }
 
+    /// Clones the contents of `source` into `self`.
+    ///
+    /// This method is preferred over simply assigning `source.clone()` to `self`,
+    /// as it avoids reallocation if possible.
     fn clone_from(&mut self, source: &Self) {
         self.vec.clone_from(&source.vec);
     }
@@ -2140,8 +2162,8 @@ impl FromIterator<String> for String {
 
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "box_str2", since = "1.45.0")]
-impl FromIterator<Box<str>> for String {
-    fn from_iter<I: IntoIterator<Item = Box<str>>>(iter: I) -> String {
+impl<A: Allocator> FromIterator<Box<str, A>> for String {
+    fn from_iter<I: IntoIterator<Item = Box<str, A>>>(iter: I) -> String {
         let mut buf = String::new();
         buf.extend(iter);
         buf
@@ -2222,8 +2244,8 @@ impl<'a> Extend<&'a str> for String {
 
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "box_str2", since = "1.45.0")]
-impl Extend<Box<str>> for String {
-    fn extend<I: IntoIterator<Item = Box<str>>>(&mut self, iter: I) {
+impl<A: Allocator> Extend<Box<str, A>> for String {
+    fn extend<I: IntoIterator<Item = Box<str, A>>>(&mut self, iter: I) {
         iter.into_iter().for_each(move |s| self.push_str(&s));
     }
 }
@@ -2433,100 +2455,26 @@ impl AddAssign<&str> for String {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl ops::Index<ops::Range<usize>> for String {
-    type Output = str;
+impl<I> ops::Index<I> for String
+where
+    I: slice::SliceIndex<str>,
+{
+    type Output = I::Output;
 
     #[inline]
-    fn index(&self, index: ops::Range<usize>) -> &str {
-        &self[..][index]
+    fn index(&self, index: I) -> &I::Output {
+        index.index(self.as_str())
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
-impl ops::Index<ops::RangeTo<usize>> for String {
-    type Output = str;
-
+impl<I> ops::IndexMut<I> for String
+where
+    I: slice::SliceIndex<str>,
+{
     #[inline]
-    fn index(&self, index: ops::RangeTo<usize>) -> &str {
-        &self[..][index]
-    }
-}
-#[stable(feature = "rust1", since = "1.0.0")]
-impl ops::Index<ops::RangeFrom<usize>> for String {
-    type Output = str;
-
-    #[inline]
-    fn index(&self, index: ops::RangeFrom<usize>) -> &str {
-        &self[..][index]
-    }
-}
-#[stable(feature = "rust1", since = "1.0.0")]
-impl ops::Index<ops::RangeFull> for String {
-    type Output = str;
-
-    #[inline]
-    fn index(&self, _index: ops::RangeFull) -> &str {
-        unsafe { str::from_utf8_unchecked(&self.vec) }
-    }
-}
-#[stable(feature = "inclusive_range", since = "1.26.0")]
-impl ops::Index<ops::RangeInclusive<usize>> for String {
-    type Output = str;
-
-    #[inline]
-    fn index(&self, index: ops::RangeInclusive<usize>) -> &str {
-        Index::index(&**self, index)
-    }
-}
-#[stable(feature = "inclusive_range", since = "1.26.0")]
-impl ops::Index<ops::RangeToInclusive<usize>> for String {
-    type Output = str;
-
-    #[inline]
-    fn index(&self, index: ops::RangeToInclusive<usize>) -> &str {
-        Index::index(&**self, index)
-    }
-}
-
-#[stable(feature = "derefmut_for_string", since = "1.3.0")]
-impl ops::IndexMut<ops::Range<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::Range<usize>) -> &mut str {
-        &mut self[..][index]
-    }
-}
-#[stable(feature = "derefmut_for_string", since = "1.3.0")]
-impl ops::IndexMut<ops::RangeTo<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::RangeTo<usize>) -> &mut str {
-        &mut self[..][index]
-    }
-}
-#[stable(feature = "derefmut_for_string", since = "1.3.0")]
-impl ops::IndexMut<ops::RangeFrom<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::RangeFrom<usize>) -> &mut str {
-        &mut self[..][index]
-    }
-}
-#[stable(feature = "derefmut_for_string", since = "1.3.0")]
-impl ops::IndexMut<ops::RangeFull> for String {
-    #[inline]
-    fn index_mut(&mut self, _index: ops::RangeFull) -> &mut str {
-        unsafe { str::from_utf8_unchecked_mut(&mut *self.vec) }
-    }
-}
-#[stable(feature = "inclusive_range", since = "1.26.0")]
-impl ops::IndexMut<ops::RangeInclusive<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::RangeInclusive<usize>) -> &mut str {
-        IndexMut::index_mut(&mut **self, index)
-    }
-}
-#[stable(feature = "inclusive_range", since = "1.26.0")]
-impl ops::IndexMut<ops::RangeToInclusive<usize>> for String {
-    #[inline]
-    fn index_mut(&mut self, index: ops::RangeToInclusive<usize>) -> &mut str {
-        IndexMut::index_mut(&mut **self, index)
+    fn index_mut(&mut self, index: I) -> &mut I::Output {
+        index.index_mut(self.as_mut_str())
     }
 }
 
@@ -2539,6 +2487,9 @@ impl ops::Deref for String {
         unsafe { str::from_utf8_unchecked(&self.vec) }
     }
 }
+
+#[unstable(feature = "deref_pure_trait", issue = "87121")]
+unsafe impl ops::DerefPure for String {}
 
 #[stable(feature = "derefmut_for_string", since = "1.3.0")]
 impl ops::DerefMut for String {

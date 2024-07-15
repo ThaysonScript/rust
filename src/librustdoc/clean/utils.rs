@@ -1,10 +1,11 @@
-use crate::clean::auto_trait::AutoTraitFinder;
-use crate::clean::blanket_impl::BlanketImplFinder;
+use crate::clean::auto_trait::synthesize_auto_trait_impls;
+use crate::clean::blanket_impl::synthesize_blanket_impls;
 use crate::clean::render_macro_matchers::render_macro_matcher;
 use crate::clean::{
-    clean_doc_module, clean_middle_const, clean_middle_region, clean_middle_ty, inline, Crate,
-    ExternalCrate, Generic, GenericArg, GenericArgs, ImportSource, Item, ItemKind, Lifetime, Path,
-    PathSegment, Primitive, PrimitiveType, Term, Type, TypeBinding, TypeBindingKind,
+    clean_doc_module, clean_middle_const, clean_middle_region, clean_middle_ty, inline,
+    AssocItemConstraint, AssocItemConstraintKind, Crate, ExternalCrate, Generic, GenericArg,
+    GenericArgs, ImportSource, Item, ItemKind, Lifetime, Path, PathSegment, Primitive,
+    PrimitiveType, Term, Type,
 };
 use crate::core::DocContext;
 use crate::html::format::visibility_to_src_with_space;
@@ -200,11 +201,11 @@ fn can_elide_generic_arg<'tcx>(
     actual.skip_binder() == default.skip_binder()
 }
 
-fn clean_middle_generic_args_with_bindings<'tcx>(
+fn clean_middle_generic_args_with_constraints<'tcx>(
     cx: &mut DocContext<'tcx>,
     did: DefId,
     has_self: bool,
-    bindings: ThinVec<TypeBinding>,
+    constraints: ThinVec<AssocItemConstraint>,
     ty_args: ty::Binder<'tcx, GenericArgsRef<'tcx>>,
 ) -> GenericArgs {
     let args = clean_middle_generic_args(cx, ty_args.map_bound(|args| &args[..]), has_self, did);
@@ -219,17 +220,19 @@ fn clean_middle_generic_args_with_bindings<'tcx>(
             // The trait's first substitution is the one after self, if there is one.
             match ty.skip_binder().kind() {
                 ty::Tuple(tys) => tys.iter().map(|t| clean_middle_ty(ty.rebind(t), cx, None, None)).collect::<Vec<_>>().into(),
-                _ => return GenericArgs::AngleBracketed { args: args.into(), bindings },
+                _ => return GenericArgs::AngleBracketed { args: args.into(), constraints },
             };
-        let output = bindings.into_iter().next().and_then(|binding| match binding.kind {
-            TypeBindingKind::Equality { term: Term::Type(ty) } if ty != Type::Tuple(Vec::new()) => {
+        let output = constraints.into_iter().next().and_then(|binding| match binding.kind {
+            AssocItemConstraintKind::Equality { term: Term::Type(ty) }
+                if ty != Type::Tuple(Vec::new()) =>
+            {
                 Some(Box::new(ty))
             }
             _ => None,
         });
         GenericArgs::Parenthesized { inputs, output }
     } else {
-        GenericArgs::AngleBracketed { args: args.into(), bindings }
+        GenericArgs::AngleBracketed { args: args.into(), constraints }
     }
 }
 
@@ -237,7 +240,7 @@ pub(super) fn clean_middle_path<'tcx>(
     cx: &mut DocContext<'tcx>,
     did: DefId,
     has_self: bool,
-    bindings: ThinVec<TypeBinding>,
+    constraints: ThinVec<AssocItemConstraint>,
     args: ty::Binder<'tcx, GenericArgsRef<'tcx>>,
 ) -> Path {
     let def_kind = cx.tcx.def_kind(did);
@@ -246,18 +249,9 @@ pub(super) fn clean_middle_path<'tcx>(
         res: Res::Def(def_kind, did),
         segments: thin_vec![PathSegment {
             name,
-            args: clean_middle_generic_args_with_bindings(cx, did, has_self, bindings, args),
+            args: clean_middle_generic_args_with_constraints(cx, did, has_self, constraints, args),
         }],
     }
-}
-
-/// Remove the generic arguments from a path.
-pub(crate) fn strip_path_generics(mut path: Path) -> Path {
-    for ps in path.segments.iter_mut() {
-        ps.args = GenericArgs::AngleBracketed { args: Default::default(), bindings: ThinVec::new() }
-    }
-
-    path
 }
 
 pub(crate) fn qpath_to_string(p: &hir::QPath<'_>) -> String {
@@ -329,6 +323,7 @@ pub(crate) fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
             elts.iter().map(|p| name_from_pat(p).to_string()).collect::<Vec<String>>().join(", ")
         ),
         PatKind::Box(p) => return name_from_pat(&*p),
+        PatKind::Deref(p) => format!("deref!({})", name_from_pat(&*p)),
         PatKind::Ref(p, _) => return name_from_pat(&*p),
         PatKind::Lit(..) => {
             warn!(
@@ -350,7 +345,7 @@ pub(crate) fn print_const(cx: &DocContext<'_>, n: ty::Const<'_>) -> String {
     match n.kind() {
         ty::ConstKind::Unevaluated(ty::UnevaluatedConst { def, args: _ }) => {
             let s = if let Some(def) = def.as_local() {
-                rendered_const(cx.tcx, cx.tcx.hir().body_owned_by(def))
+                rendered_const(cx.tcx, &cx.tcx.hir().body_owned_by(def), def)
             } else {
                 inline::print_inlined_const(cx.tcx, def)
             };
@@ -358,8 +353,8 @@ pub(crate) fn print_const(cx: &DocContext<'_>, n: ty::Const<'_>) -> String {
             s
         }
         // array lengths are obviously usize
-        ty::ConstKind::Value(ty::ValTree::Leaf(scalar))
-            if *n.ty().kind() == ty::Uint(ty::UintTy::Usize) =>
+        ty::ConstKind::Value(ty, ty::ValTree::Leaf(scalar))
+            if *ty.kind() == ty::Uint(ty::UintTy::Usize) =>
         {
             scalar.to_string()
         }
@@ -436,8 +431,7 @@ fn print_const_with_custom_print_scalar<'tcx>(
         (mir::Const::Val(mir::ConstValue::Scalar(int), _), ty::Int(i)) => {
             let ty = ct.ty();
             let size = tcx.layout_of(ty::ParamEnv::empty().and(ty)).unwrap().size;
-            let data = int.assert_bits(size);
-            let sign_extended_data = size.sign_extend(data) as i128;
+            let sign_extended_data = int.assert_scalar_int().to_int(size);
             let mut output = if with_underscores {
                 format_integer_with_underscore_sep(&sign_extended_data.to_string())
             } else {
@@ -485,20 +479,20 @@ pub(crate) fn resolve_type(cx: &mut DocContext<'_>, path: Path) -> Type {
     }
 }
 
-pub(crate) fn get_auto_trait_and_blanket_impls(
+pub(crate) fn synthesize_auto_trait_and_blanket_impls(
     cx: &mut DocContext<'_>,
     item_def_id: DefId,
 ) -> impl Iterator<Item = Item> {
     let auto_impls = cx
         .sess()
         .prof
-        .generic_activity("get_auto_trait_impls")
-        .run(|| AutoTraitFinder::new(cx).get_auto_trait_impls(item_def_id));
+        .generic_activity("synthesize_auto_trait_impls")
+        .run(|| synthesize_auto_trait_impls(cx, item_def_id));
     let blanket_impls = cx
         .sess()
         .prof
-        .generic_activity("get_blanket_impls")
-        .run(|| BlanketImplFinder { cx }.get_blanket_impls(item_def_id));
+        .generic_activity("synthesize_blanket_impls")
+        .run(|| synthesize_blanket_impls(cx, item_def_id));
     auto_impls.into_iter().chain(blanket_impls)
 }
 
@@ -526,7 +520,7 @@ pub(crate) fn register_res(cx: &mut DocContext<'_>, res: Res) -> DefId {
             | Mod
             | ForeignTy
             | Const
-            | Static(_)
+            | Static { .. }
             | Macro(..)
             | TraitAlias),
             did,
@@ -588,7 +582,14 @@ pub(crate) fn find_nearest_parent_module(tcx: TyCtxt<'_>, def_id: DefId) -> Opti
 /// This function exists because it runs on `hir::Attributes` whereas the other is a
 /// `clean::Attributes` method.
 pub(crate) fn has_doc_flag(tcx: TyCtxt<'_>, did: DefId, flag: Symbol) -> bool {
-    tcx.get_attrs(did, sym::doc)
+    attrs_have_doc_flag(tcx.get_attrs(did, sym::doc), flag)
+}
+
+pub(crate) fn attrs_have_doc_flag<'a>(
+    mut attrs: impl Iterator<Item = &'a ast::Attribute>,
+    flag: Symbol,
+) -> bool {
+    attrs
         .any(|attr| attr.meta_item_list().is_some_and(|l| rustc_attr::list_contains_name(&l, flag)))
 }
 
@@ -598,7 +599,7 @@ pub(crate) fn has_doc_flag(tcx: TyCtxt<'_>, did: DefId, flag: Symbol) -> bool {
 /// Set by `bootstrap::Builder::doc_rust_lang_org_channel` in order to keep tests passing on beta/stable.
 pub(crate) const DOC_RUST_LANG_ORG_CHANNEL: &str = env!("DOC_RUST_LANG_ORG_CHANNEL");
 pub(crate) static DOC_CHANNEL: Lazy<&'static str> =
-    Lazy::new(|| DOC_RUST_LANG_ORG_CHANNEL.rsplit('/').filter(|c| !c.is_empty()).next().unwrap());
+    Lazy::new(|| DOC_RUST_LANG_ORG_CHANNEL.rsplit('/').find(|c| !c.is_empty()).unwrap());
 
 /// Render a sequence of macro arms in a format suitable for displaying to the user
 /// as part of an item declaration.
@@ -625,6 +626,7 @@ pub(super) fn display_macro_source(
     def: &ast::MacroDef,
     def_id: DefId,
     vis: ty::Visibility<DefId>,
+    is_doc_hidden: bool,
 ) -> String {
     // Extract the spans of all matchers. They represent the "interface" of the macro.
     let matchers = def.body.tokens.chunks(4).map(|arm| &arm[0]);
@@ -635,7 +637,7 @@ pub(super) fn display_macro_source(
         if matchers.len() <= 1 {
             format!(
                 "{vis}macro {name}{matchers} {{\n    ...\n}}",
-                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id),
+                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id, is_doc_hidden),
                 matchers = matchers
                     .map(|matcher| render_macro_matcher(cx.tcx, matcher))
                     .collect::<String>(),
@@ -643,7 +645,7 @@ pub(super) fn display_macro_source(
         } else {
             format!(
                 "{vis}macro {name} {{\n{arms}}}",
-                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id),
+                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id, is_doc_hidden),
                 arms = render_macro_arms(cx.tcx, matchers, ","),
             )
         }
@@ -664,9 +666,10 @@ pub(crate) fn inherits_doc_hidden(
         def_id = id;
         if tcx.is_doc_hidden(def_id.to_def_id()) {
             return true;
-        } else if let Some(node) = tcx.opt_hir_node_by_def_id(def_id)
-            && matches!(node, hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(_), .. }),)
-        {
+        } else if matches!(
+            tcx.hir_node_by_def_id(def_id),
+            hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(_), .. })
+        ) {
             // `impl` blocks stand a bit on their own: unless they have `#[doc(hidden)]` directly
             // on them, they don't inherit it from the parent context.
             return false;

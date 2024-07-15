@@ -79,6 +79,7 @@ fn analyze_operand(operand: &Expr<'_>, cx: &LateContext<'_>, expr: &Expr<'_>) ->
             },
             _ => {},
         },
+        // FIXME(f16_f128): add when casting is available on all platforms
         Some(Constant::F32(f)) => {
             return Some(floating_point_operand_info(&f));
         },
@@ -113,7 +114,7 @@ fn check_const_operands<'tcx>(
             cx,
             MODULO_ARITHMETIC,
             expr.span,
-            &format!(
+            format!(
                 "you are using modulo operator on constants with different signs: `{} % {}`",
                 lhs_operand.string_representation.as_ref().unwrap(),
                 rhs_operand.string_representation.as_ref().unwrap()

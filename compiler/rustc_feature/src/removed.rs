@@ -32,6 +32,12 @@ declare_features! (
     // feature-group-start: removed features
     // -------------------------------------------------------------------------
 
+    // Note that the version indicates when it got *removed*.
+    // When moving an unstable feature here, set the version number to
+    // `CURRENT RUSTC VERSION` with ` ` replaced by `_`.
+    // (But not all features below do this properly; many indicate the
+    // version they got originally added in.)
+
     /// Allows using the `amdgpu-kernel` ABI.
     (removed, abi_amdgpu_kernel, "1.77.0", Some(51575), None),
     (removed, advanced_slice_patterns, "1.0.0", Some(62254),
@@ -98,7 +104,7 @@ declare_features! (
     (removed, external_doc, "1.54.0", Some(44732),
      Some("use #[doc = include_str!(\"filename\")] instead, which handles macro invocations")),
     /// Allows using `#[ffi_returns_twice]` on foreign functions.
-    (removed, ffi_returns_twice, "CURRENT_RUSTC_VERSION", Some(58314),
+    (removed, ffi_returns_twice, "1.78.0", Some(58314),
      Some("being investigated by the ffi-unwind project group")),
     /// Allows generators to be cloned.
     (removed, generator_clone, "1.65.0", Some(95360), Some("renamed to `coroutine_clone`")),
@@ -128,6 +134,8 @@ declare_features! (
     /// Allows the use of type alias impl trait in function return positions
     (removed, min_type_alias_impl_trait, "1.56.0", Some(63063),
      Some("removed in favor of full type_alias_impl_trait")),
+    /// Make `mut` not reset the binding mode on edition >= 2024.
+    (removed, mut_preserve_binding_mode_2024, "1.79.0", Some(123076), Some("superseded by `ref_pat_eat_one_layer_2024`")),
     (removed, needs_allocator, "1.4.0", Some(27389),
      Some("subsumed by `#![feature(allocator_internals)]`")),
     /// Allows use of unary negate on unsigned integers, e.g., -e for e: u8
@@ -156,6 +164,9 @@ declare_features! (
      Some("removed in favor of `#![feature(marker_trait_attr)]`")),
     (removed, panic_implementation, "1.28.0", Some(44489),
      Some("subsumed by `#[panic_handler]`")),
+    /// Allows `extern "platform-intrinsic" { ... }`.
+    (removed, platform_intrinsics, "1.4.0", Some(27731),
+     Some("SIMD intrinsics use the regular intrinsics ABI now")),
     /// Allows using `#![plugin(myplugin)]`.
     (removed, plugin, "1.75.0", Some(29597),
      Some("plugins are no longer supported")),
@@ -178,6 +189,7 @@ declare_features! (
     (removed, pushpop_unsafe, "1.2.0", None, None),
     (removed, quad_precision_float, "1.0.0", None, None),
     (removed, quote, "1.33.0", Some(29601), None),
+    (removed, ref_pat_everywhere, "1.79.0", Some(123076), Some("superseded by `ref_pat_eat_one_layer_2024")),
     (removed, reflect, "1.0.0", Some(27749), None),
     /// Allows using the `#[register_attr]` attribute.
     (removed, register_attr, "1.65.0", Some(66080),
@@ -209,6 +221,9 @@ declare_features! (
     /// Permits specifying whether a function should permit unwinding or abort on unwind.
     (removed, unwind_attributes, "1.56.0", Some(58760), Some("use the C-unwind ABI instead")),
     (removed, visible_private_types, "1.0.0", None, None),
+    /// Allows `extern "wasm" fn`
+    (removed, wasm_abi, "CURRENT_RUSTC_VERSION", Some(83788),
+     Some("non-standard wasm ABI is no longer supported")),
     // !!!!    !!!!    !!!!    !!!!   !!!!    !!!!    !!!!    !!!!    !!!!    !!!!    !!!!
     // Features are listed in alphabetical order. Tidy will fail if you don't keep it this way.
     // !!!!    !!!!    !!!!    !!!!   !!!!    !!!!    !!!!    !!!!    !!!!    !!!!    !!!!

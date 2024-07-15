@@ -16,18 +16,14 @@
 //!
 //! The goal is to eventually be published on
 //! [crates.io](https://crates.io).
-#[macro_use]
-extern crate scoped_tls;
 
 use std::fmt;
 use std::fmt::Debug;
 use std::io;
 
 use crate::compiler_interface::with;
-pub use crate::crate_def::CrateDef;
-pub use crate::crate_def::DefId;
+pub use crate::crate_def::{CrateDef, CrateDefType, DefId};
 pub use crate::error::*;
-use crate::mir::pretty::function_name;
 use crate::mir::Body;
 use crate::mir::Mutability;
 use crate::ty::{ForeignModuleDef, ImplDef, IndexedVal, Span, TraitDef, Ty};
@@ -118,12 +114,15 @@ pub enum CtorKind {
 
 pub type Filename = String;
 
-crate_def! {
+crate_def_with_ty! {
     /// Holds information about an item in a crate.
     pub CrateItem;
 }
 
 impl CrateItem {
+    /// This will return the body of an item.
+    ///
+    /// This will panic if no body is available.
     pub fn body(&self) -> mir::Body {
         with(|cx| cx.mir_body(self.0))
     }
@@ -148,9 +147,8 @@ impl CrateItem {
         with(|cx| cx.is_foreign_item(self.0))
     }
 
-    pub fn dump<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
-        writeln!(w, "{}", function_name(*self))?;
-        self.body().dump(w)
+    pub fn emit_mir<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
+        self.body().dump(w, &self.name())
     }
 }
 

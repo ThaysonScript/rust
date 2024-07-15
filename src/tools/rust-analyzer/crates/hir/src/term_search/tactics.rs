@@ -4,6 +4,8 @@
 //! * `ctx` - Context for the term search
 //! * `defs` - Set of items in scope at term search target location
 //! * `lookup` - Lookup table for types
+//! * `should_continue` - Function that indicates when to stop iterating
+//!
 //! And they return iterator that yields type trees that unify with the `goal` type.
 
 use std::iter;
@@ -78,7 +80,10 @@ pub(super) fn trivial<'a, DB: HirDatabase>(
         lookup.insert(ty.clone(), std::iter::once(expr.clone()));
 
         // Don't suggest local references as they are not valid for return
-        if matches!(expr, Expr::Local(_)) && ty.contains_reference(db) {
+        if matches!(expr, Expr::Local(_))
+            && ty.contains_reference(db)
+            && ctx.config.enable_borrowcheck
+        {
             return None;
         }
 
@@ -86,9 +91,55 @@ pub(super) fn trivial<'a, DB: HirDatabase>(
     })
 }
 
-/// # Type constructor tactic
+/// # Associated constant tactic
 ///
-/// Attempts different type constructors for enums and structs in scope
+/// Attempts to fulfill the goal by trying constants defined as associated items.
+/// Only considers them on types that are in scope.
+///
+/// # Arguments
+/// * `ctx` - Context for the term search
+/// * `defs` - Set of items in scope at term search target location
+/// * `lookup` - Lookup table for types
+///
+/// Returns iterator that yields elements that unify with `goal`.
+///
+/// _Note that there is no use of calling this tactic in every iteration as the output does not
+/// depend on the current state of `lookup`_
+pub(super) fn assoc_const<'a, DB: HirDatabase>(
+    ctx: &'a TermSearchCtx<'a, DB>,
+    defs: &'a FxHashSet<ScopeDef>,
+    lookup: &'a mut LookupTable,
+) -> impl Iterator<Item = Expr> + 'a {
+    let db = ctx.sema.db;
+    let module = ctx.scope.module();
+
+    defs.iter()
+        .filter_map(|def| match def {
+            ScopeDef::ModuleDef(ModuleDef::Adt(it)) => Some(it),
+            _ => None,
+        })
+        .flat_map(|it| Impl::all_for_type(db, it.ty(db)))
+        .filter(|it| !it.is_unsafe(db))
+        .flat_map(|it| it.items(db))
+        .filter(move |it| it.is_visible_from(db, module))
+        .filter_map(AssocItem::as_const)
+        .filter_map(|it| {
+            let expr = Expr::Const(it);
+            let ty = it.ty(db);
+
+            if ty.contains_unknown() {
+                return None;
+            }
+
+            lookup.insert(ty.clone(), std::iter::once(expr.clone()));
+
+            ty.could_unify_with_deeply(db, &ctx.goal).then_some(expr)
+        })
+}
+
+/// # Data constructor tactic
+///
+/// Attempts different data constructors for enums and structs in scope
 ///
 /// Updates lookup by new types reached and returns iterator that yields
 /// elements that unify with `goal`.
@@ -97,19 +148,21 @@ pub(super) fn trivial<'a, DB: HirDatabase>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
-pub(super) fn type_constructor<'a, DB: HirDatabase>(
+/// * `should_continue` - Function that indicates when to stop iterating
+pub(super) fn data_constructor<'a, DB: HirDatabase>(
     ctx: &'a TermSearchCtx<'a, DB>,
     defs: &'a FxHashSet<ScopeDef>,
     lookup: &'a mut LookupTable,
+    should_continue: &'a dyn std::ops::Fn() -> bool,
 ) -> impl Iterator<Item = Expr> + 'a {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
     fn variant_helper(
         db: &dyn HirDatabase,
         lookup: &mut LookupTable,
+        should_continue: &dyn std::ops::Fn() -> bool,
         parent_enum: Enum,
         variant: Variant,
-        goal: &Type,
         config: &TermSearchConfig,
     ) -> Vec<(Type, Vec<Expr>)> {
         // Ignore unstable
@@ -143,28 +196,26 @@ pub(super) fn type_constructor<'a, DB: HirDatabase>(
         let non_default_type_params_len =
             type_params.iter().filter(|it| it.default(db).is_none()).count();
 
+        let enum_ty_shallow = Adt::from(parent_enum).ty(db);
         let generic_params = lookup
-            .iter_types()
-            .collect::<Vec<_>>() // Force take ownership
+            .types_wishlist()
+            .clone()
             .into_iter()
-            .permutations(non_default_type_params_len);
+            .filter(|ty| ty.could_unify_with(db, &enum_ty_shallow))
+            .map(|it| it.type_arguments().collect::<Vec<Type>>())
+            .chain((non_default_type_params_len == 0).then_some(Vec::new()));
 
         generic_params
+            .filter(|_| should_continue())
             .filter_map(move |generics| {
                 // Insert default type params
                 let mut g = generics.into_iter();
                 let generics: Vec<_> = type_params
                     .iter()
-                    .map(|it| it.default(db).unwrap_or_else(|| g.next().expect("No generic")))
-                    .collect();
+                    .map(|it| it.default(db).or_else(|| g.next()))
+                    .collect::<Option<_>>()?;
 
                 let enum_ty = Adt::from(parent_enum).ty_with_args(db, generics.iter().cloned());
-
-                // Allow types with generics only if they take us straight to goal for
-                // performance reasons
-                if !generics.is_empty() && !enum_ty.could_unify_with_deeply(db, goal) {
-                    return None;
-                }
 
                 // Ignore types that have something to do with lifetimes
                 if config.enable_borrowcheck && enum_ty.contains_reference(db) {
@@ -181,7 +232,7 @@ pub(super) fn type_constructor<'a, DB: HirDatabase>(
                 // Note that we need special case for 0 param constructors because of multi cartesian
                 // product
                 let variant_exprs: Vec<Expr> = if param_exprs.is_empty() {
-                    vec![Expr::Variant { variant, generics: generics.clone(), params: Vec::new() }]
+                    vec![Expr::Variant { variant, generics, params: Vec::new() }]
                 } else {
                     param_exprs
                         .into_iter()
@@ -198,22 +249,46 @@ pub(super) fn type_constructor<'a, DB: HirDatabase>(
     defs.iter()
         .filter_map(move |def| match def {
             ScopeDef::ModuleDef(ModuleDef::Variant(it)) => {
-                let variant_exprs =
-                    variant_helper(db, lookup, it.parent_enum(db), *it, &ctx.goal, &ctx.config);
+                let variant_exprs = variant_helper(
+                    db,
+                    lookup,
+                    should_continue,
+                    it.parent_enum(db),
+                    *it,
+                    &ctx.config,
+                );
                 if variant_exprs.is_empty() {
                     return None;
                 }
-                lookup.mark_fulfilled(ScopeDef::ModuleDef(ModuleDef::Variant(*it)));
+                if GenericDef::from(it.parent_enum(db))
+                    .type_or_const_params(db)
+                    .into_iter()
+                    .filter_map(|it| it.as_type_param(db))
+                    .all(|it| it.default(db).is_some())
+                {
+                    lookup.mark_fulfilled(ScopeDef::ModuleDef(ModuleDef::Variant(*it)));
+                }
                 Some(variant_exprs)
             }
             ScopeDef::ModuleDef(ModuleDef::Adt(Adt::Enum(enum_))) => {
                 let exprs: Vec<(Type, Vec<Expr>)> = enum_
                     .variants(db)
                     .into_iter()
-                    .flat_map(|it| variant_helper(db, lookup, *enum_, it, &ctx.goal, &ctx.config))
+                    .flat_map(|it| {
+                        variant_helper(db, lookup, should_continue, *enum_, it, &ctx.config)
+                    })
                     .collect();
 
-                if !exprs.is_empty() {
+                if exprs.is_empty() {
+                    return None;
+                }
+
+                if GenericDef::from(*enum_)
+                    .type_or_const_params(db)
+                    .into_iter()
+                    .filter_map(|it| it.as_type_param(db))
+                    .all(|it| it.default(db).is_some())
+                {
                     lookup.mark_fulfilled(ScopeDef::ModuleDef(ModuleDef::Adt(Adt::Enum(*enum_))));
                 }
 
@@ -249,33 +324,26 @@ pub(super) fn type_constructor<'a, DB: HirDatabase>(
                 let non_default_type_params_len =
                     type_params.iter().filter(|it| it.default(db).is_none()).count();
 
+                let struct_ty_shallow = Adt::from(*it).ty(db);
                 let generic_params = lookup
-                    .iter_types()
-                    .collect::<Vec<_>>() // Force take ownership
+                    .types_wishlist()
+                    .clone()
                     .into_iter()
-                    .permutations(non_default_type_params_len);
+                    .filter(|ty| ty.could_unify_with(db, &struct_ty_shallow))
+                    .map(|it| it.type_arguments().collect::<Vec<Type>>())
+                    .chain((non_default_type_params_len == 0).then_some(Vec::new()));
 
                 let exprs = generic_params
+                    .filter(|_| should_continue())
                     .filter_map(|generics| {
                         // Insert default type params
                         let mut g = generics.into_iter();
                         let generics: Vec<_> = type_params
                             .iter()
-                            .map(|it| {
-                                it.default(db)
-                                    .unwrap_or_else(|| g.next().expect("Missing type param"))
-                            })
-                            .collect();
+                            .map(|it| it.default(db).or_else(|| g.next()))
+                            .collect::<Option<_>>()?;
 
                         let struct_ty = Adt::from(*it).ty_with_args(db, generics.iter().cloned());
-
-                        // Allow types with generics only if they take us straight to goal for
-                        // performance reasons
-                        if non_default_type_params_len != 0
-                            && struct_ty.could_unify_with_deeply(db, &ctx.goal)
-                        {
-                            return None;
-                        }
 
                         // Ignore types that have something to do with lifetimes
                         if ctx.config.enable_borrowcheck && struct_ty.contains_reference(db) {
@@ -290,7 +358,9 @@ pub(super) fn type_constructor<'a, DB: HirDatabase>(
                         // Early exit if some param cannot be filled from lookup
                         let param_exprs: Vec<Vec<Expr>> = fields
                             .into_iter()
-                            .map(|field| lookup.find(db, &field.ty(db)))
+                            .map(|field| {
+                                lookup.find(db, &field.ty_with_args(db, generics.iter().cloned()))
+                            })
                             .collect::<Option<_>>()?;
 
                         // Note that we need special case for 0 param constructors because of multi cartesian
@@ -309,8 +379,12 @@ pub(super) fn type_constructor<'a, DB: HirDatabase>(
                                 .collect()
                         };
 
-                        lookup
-                            .mark_fulfilled(ScopeDef::ModuleDef(ModuleDef::Adt(Adt::Struct(*it))));
+                        if non_default_type_params_len == 0 {
+                            // Fulfilled only if there are no generic parameters
+                            lookup.mark_fulfilled(ScopeDef::ModuleDef(ModuleDef::Adt(
+                                Adt::Struct(*it),
+                            )));
+                        }
                         lookup.insert(struct_ty.clone(), struct_exprs.iter().cloned());
 
                         Some((struct_ty, struct_exprs))
@@ -337,10 +411,12 @@ pub(super) fn type_constructor<'a, DB: HirDatabase>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
+/// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn free_function<'a, DB: HirDatabase>(
     ctx: &'a TermSearchCtx<'a, DB>,
     defs: &'a FxHashSet<ScopeDef>,
     lookup: &'a mut LookupTable,
+    should_continue: &'a dyn std::ops::Fn() -> bool,
 ) -> impl Iterator<Item = Expr> + 'a {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
@@ -382,6 +458,7 @@ pub(super) fn free_function<'a, DB: HirDatabase>(
                     .permutations(non_default_type_params_len);
 
                 let exprs: Vec<_> = generic_params
+                    .filter(|_| should_continue())
                     .filter_map(|generics| {
                         // Insert default type params
                         let mut g = generics.into_iter();
@@ -454,7 +531,7 @@ pub(super) fn free_function<'a, DB: HirDatabase>(
 
 /// # Impl method tactic
 ///
-/// Attempts to to call methods on types from lookup table.
+/// Attempts to call methods on types from lookup table.
 /// This includes both functions from direct impl blocks as well as functions from traits.
 /// Methods defined in impl blocks that are generic and methods that are themselves have
 /// generics are ignored for performance reasons.
@@ -466,10 +543,12 @@ pub(super) fn free_function<'a, DB: HirDatabase>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
+/// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn impl_method<'a, DB: HirDatabase>(
     ctx: &'a TermSearchCtx<'a, DB>,
     _defs: &'a FxHashSet<ScopeDef>,
     lookup: &'a mut LookupTable,
+    should_continue: &'a dyn std::ops::Fn() -> bool,
 ) -> impl Iterator<Item = Expr> + 'a {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
@@ -525,14 +604,17 @@ pub(super) fn impl_method<'a, DB: HirDatabase>(
                 return None;
             }
 
-            let non_default_type_params_len = imp_type_params
-                .iter()
-                .chain(fn_type_params.iter())
-                .filter(|it| it.default(db).is_none())
-                .count();
+            // Double check that we have fully known type
+            if ty.type_arguments().any(|it| it.contains_unknown()) {
+                return None;
+            }
 
-            // Ignore bigger number of generics for now as they kill the performance
-            if non_default_type_params_len > 0 {
+            let non_default_fn_type_params_len =
+                fn_type_params.iter().filter(|it| it.default(db).is_none()).count();
+
+            // Ignore functions with generics for now as they kill the performance
+            // Also checking bounds for generics is problematic
+            if non_default_fn_type_params_len > 0 {
                 return None;
             }
 
@@ -540,23 +622,24 @@ pub(super) fn impl_method<'a, DB: HirDatabase>(
                 .iter_types()
                 .collect::<Vec<_>>() // Force take ownership
                 .into_iter()
-                .permutations(non_default_type_params_len);
+                .permutations(non_default_fn_type_params_len);
 
             let exprs: Vec<_> = generic_params
+                .filter(|_| should_continue())
                 .filter_map(|generics| {
                     // Insert default type params
                     let mut g = generics.into_iter();
-                    let generics: Vec<_> = imp_type_params
-                        .iter()
-                        .chain(fn_type_params.iter())
-                        .map(|it| match it.default(db) {
+                    let generics: Vec<_> = ty
+                        .type_arguments()
+                        .map(Some)
+                        .chain(fn_type_params.iter().map(|it| match it.default(db) {
                             Some(ty) => Some(ty),
                             None => {
                                 let generic = g.next().expect("Missing type param");
                                 // Filter out generics that do not unify due to trait bounds
                                 it.ty(db).could_unify_with(db, &generic).then_some(generic)
                             }
-                        })
+                        }))
                         .collect::<Option<_>>()?;
 
                     let ret_ty = it.ret_type_with_args(
@@ -634,10 +717,12 @@ pub(super) fn impl_method<'a, DB: HirDatabase>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
+/// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn struct_projection<'a, DB: HirDatabase>(
     ctx: &'a TermSearchCtx<'a, DB>,
     _defs: &'a FxHashSet<ScopeDef>,
     lookup: &'a mut LookupTable,
+    should_continue: &'a dyn std::ops::Fn() -> bool,
 ) -> impl Iterator<Item = Expr> + 'a {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
@@ -645,6 +730,7 @@ pub(super) fn struct_projection<'a, DB: HirDatabase>(
         .new_types(NewTypesKey::StructProjection)
         .into_iter()
         .map(|ty| (ty.clone(), lookup.find(db, &ty).expect("Expr not in lookup")))
+        .filter(|_| should_continue())
         .flat_map(move |(ty, targets)| {
             ty.fields(db).into_iter().filter_map(move |(field, filed_ty)| {
                 if !field.is_visible_from(db, module) {
@@ -705,17 +791,21 @@ pub(super) fn famous_types<'a, DB: HirDatabase>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
+/// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn impl_static_method<'a, DB: HirDatabase>(
     ctx: &'a TermSearchCtx<'a, DB>,
     _defs: &'a FxHashSet<ScopeDef>,
     lookup: &'a mut LookupTable,
+    should_continue: &'a dyn std::ops::Fn() -> bool,
 ) -> impl Iterator<Item = Expr> + 'a {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
     lookup
-        .take_types_wishlist()
+        .types_wishlist()
+        .clone()
         .into_iter()
         .chain(iter::once(ctx.goal.clone()))
+        .filter(|_| should_continue())
         .flat_map(|ty| {
             Impl::all_for_type(db, ty.clone()).into_iter().map(move |imp| (ty.clone(), imp))
         })
@@ -768,14 +858,17 @@ pub(super) fn impl_static_method<'a, DB: HirDatabase>(
                 return None;
             }
 
-            let non_default_type_params_len = imp_type_params
-                .iter()
-                .chain(fn_type_params.iter())
-                .filter(|it| it.default(db).is_none())
-                .count();
+            // Double check that we have fully known type
+            if ty.type_arguments().any(|it| it.contains_unknown()) {
+                return None;
+            }
 
-            // Ignore bigger number of generics for now as they kill the performance
-            if non_default_type_params_len > 1 {
+            let non_default_fn_type_params_len =
+                fn_type_params.iter().filter(|it| it.default(db).is_none()).count();
+
+            // Ignore functions with generics for now as they kill the performance
+            // Also checking bounds for generics is problematic
+            if non_default_fn_type_params_len > 0 {
                 return None;
             }
 
@@ -783,16 +876,17 @@ pub(super) fn impl_static_method<'a, DB: HirDatabase>(
                 .iter_types()
                 .collect::<Vec<_>>() // Force take ownership
                 .into_iter()
-                .permutations(non_default_type_params_len);
+                .permutations(non_default_fn_type_params_len);
 
             let exprs: Vec<_> = generic_params
+                .filter(|_| should_continue())
                 .filter_map(|generics| {
                     // Insert default type params
                     let mut g = generics.into_iter();
-                    let generics: Vec<_> = imp_type_params
-                        .iter()
-                        .chain(fn_type_params.iter())
-                        .map(|it| match it.default(db) {
+                    let generics: Vec<_> = ty
+                        .type_arguments()
+                        .map(Some)
+                        .chain(fn_type_params.iter().map(|it| match it.default(db) {
                             Some(ty) => Some(ty),
                             None => {
                                 let generic = g.next().expect("Missing type param");
@@ -802,7 +896,7 @@ pub(super) fn impl_static_method<'a, DB: HirDatabase>(
                                 // Filter out generics that do not unify due to trait bounds
                                 it.ty(db).could_unify_with(db, &generic).then_some(generic)
                             }
-                        })
+                        }))
                         .collect::<Option<_>>()?;
 
                     let ret_ty = it.ret_type_with_args(
@@ -856,4 +950,66 @@ pub(super) fn impl_static_method<'a, DB: HirDatabase>(
         .flatten()
         .filter_map(|(ty, exprs)| ty.could_unify_with_deeply(db, &ctx.goal).then_some(exprs))
         .flatten()
+}
+
+/// # Make tuple tactic
+///
+/// Attempts to create tuple types if any are listed in types wishlist
+///
+/// Updates lookup by new types reached and returns iterator that yields
+/// elements that unify with `goal`.
+///
+/// # Arguments
+/// * `ctx` - Context for the term search
+/// * `defs` - Set of items in scope at term search target location
+/// * `lookup` - Lookup table for types
+/// * `should_continue` - Function that indicates when to stop iterating
+pub(super) fn make_tuple<'a, DB: HirDatabase>(
+    ctx: &'a TermSearchCtx<'a, DB>,
+    _defs: &'a FxHashSet<ScopeDef>,
+    lookup: &'a mut LookupTable,
+    should_continue: &'a dyn std::ops::Fn() -> bool,
+) -> impl Iterator<Item = Expr> + 'a {
+    let db = ctx.sema.db;
+    let module = ctx.scope.module();
+
+    lookup
+        .types_wishlist()
+        .clone()
+        .into_iter()
+        .filter(|_| should_continue())
+        .filter(|ty| ty.is_tuple())
+        .filter_map(move |ty| {
+            // Double check to not contain unknown
+            if ty.contains_unknown() {
+                return None;
+            }
+
+            // Ignore types that have something to do with lifetimes
+            if ctx.config.enable_borrowcheck && ty.contains_reference(db) {
+                return None;
+            }
+
+            // Early exit if some param cannot be filled from lookup
+            let param_exprs: Vec<Vec<Expr>> =
+                ty.type_arguments().map(|field| lookup.find(db, &field)).collect::<Option<_>>()?;
+
+            let exprs: Vec<Expr> = param_exprs
+                .into_iter()
+                .multi_cartesian_product()
+                .filter(|_| should_continue())
+                .map(|params| {
+                    let tys: Vec<Type> = params.iter().map(|it| it.ty(db)).collect();
+                    let tuple_ty = Type::new_tuple(module.krate().into(), &tys);
+
+                    let expr = Expr::Tuple { ty: tuple_ty.clone(), params };
+                    lookup.insert(tuple_ty, iter::once(expr.clone()));
+                    expr
+                })
+                .collect();
+
+            Some(exprs)
+        })
+        .flatten()
+        .filter_map(|expr| expr.ty(db).could_unify_with_deeply(db, &ctx.goal).then_some(expr))
 }

@@ -3,7 +3,9 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::common::{Config, Debugger, Mode};
-use crate::header::{parse_normalization_string, EarlyProps, HeadersCache};
+use crate::header::{parse_normalize_rule, EarlyProps, HeadersCache};
+
+use super::iter_header;
 
 fn make_test_description<R: Read>(
     config: &Config,
@@ -30,35 +32,33 @@ fn make_test_description<R: Read>(
 }
 
 #[test]
-fn test_parse_normalization_string() {
-    let mut s = "normalize-stderr-32bit: \"something (32 bits)\" -> \"something ($WORD bits)\".";
-    let first = parse_normalization_string(&mut s);
-    assert_eq!(first, Some("something (32 bits)".to_owned()));
-    assert_eq!(s, " -> \"something ($WORD bits)\".");
+fn test_parse_normalize_rule() {
+    let good_data = &[(
+        r#"normalize-stderr-32bit: "something (32 bits)" -> "something ($WORD bits)""#,
+        "something (32 bits)",
+        "something ($WORD bits)",
+    )];
 
-    // Nothing to normalize (No quotes)
-    let mut s = "normalize-stderr-32bit: something (32 bits) -> something ($WORD bits).";
-    let first = parse_normalization_string(&mut s);
-    assert_eq!(first, None);
-    assert_eq!(s, r#"normalize-stderr-32bit: something (32 bits) -> something ($WORD bits)."#);
+    for &(input, expected_regex, expected_replacement) in good_data {
+        let parsed = parse_normalize_rule(input);
+        let parsed =
+            parsed.as_ref().map(|(regex, replacement)| (regex.as_str(), replacement.as_str()));
+        assert_eq!(parsed, Some((expected_regex, expected_replacement)));
+    }
 
-    // Nothing to normalize (Only a single quote)
-    let mut s = "normalize-stderr-32bit: \"something (32 bits) -> something ($WORD bits).";
-    let first = parse_normalization_string(&mut s);
-    assert_eq!(first, None);
-    assert_eq!(s, "normalize-stderr-32bit: \"something (32 bits) -> something ($WORD bits).");
+    let bad_data = &[
+        r#"normalize-stderr-32bit "something (32 bits)" -> "something ($WORD bits)""#,
+        r#"normalize-stderr-16bit: something (16 bits) -> something ($WORD bits)"#,
+        r#"normalize-stderr-32bit: something (32 bits) -> something ($WORD bits)"#,
+        r#"normalize-stderr-32bit: "something (32 bits) -> something ($WORD bits)"#,
+        r#"normalize-stderr-32bit: "something (32 bits)" -> "something ($WORD bits)"#,
+        r#"normalize-stderr-32bit: "something (32 bits)" -> "something ($WORD bits)"."#,
+    ];
 
-    // Nothing to normalize (Three quotes)
-    let mut s = "normalize-stderr-32bit: \"something (32 bits)\" -> \"something ($WORD bits).";
-    let first = parse_normalization_string(&mut s);
-    assert_eq!(first, Some("something (32 bits)".to_owned()));
-    assert_eq!(s, " -> \"something ($WORD bits).");
-
-    // Nothing to normalize (No quotes, 16-bit)
-    let mut s = "normalize-stderr-16bit: something (16 bits) -> something ($WORD bits).";
-    let first = parse_normalization_string(&mut s);
-    assert_eq!(first, None);
-    assert_eq!(s, r#"normalize-stderr-16bit: something (16 bits) -> something ($WORD bits)."#);
+    for &input in bad_data {
+        let parsed = parse_normalize_rule(input);
+        assert_eq!(parsed, None);
+    }
 }
 
 #[derive(Default)]
@@ -283,6 +283,7 @@ fn ignore_target() {
     assert!(check_ignore(&config, "//@ ignore-x86_64-unknown-linux-gnu"));
     assert!(check_ignore(&config, "//@ ignore-x86_64"));
     assert!(check_ignore(&config, "//@ ignore-linux"));
+    assert!(check_ignore(&config, "//@ ignore-unix"));
     assert!(check_ignore(&config, "//@ ignore-gnu"));
     assert!(check_ignore(&config, "//@ ignore-64bit"));
 
@@ -298,6 +299,7 @@ fn only_target() {
 
     assert!(check_ignore(&config, "//@ only-x86"));
     assert!(check_ignore(&config, "//@ only-linux"));
+    assert!(check_ignore(&config, "//@ only-unix"));
     assert!(check_ignore(&config, "//@ only-msvc"));
     assert!(check_ignore(&config, "//@ only-32bit"));
 
@@ -533,6 +535,10 @@ fn wasm_special() {
         ("wasm32-wasi", "wasm32", true),
         ("wasm32-wasi", "wasm32-bare", false),
         ("wasm32-wasi", "wasi", true),
+        ("wasm32-wasip1", "emscripten", false),
+        ("wasm32-wasip1", "wasm32", true),
+        ("wasm32-wasip1", "wasm32-bare", false),
+        ("wasm32-wasip1", "wasi", true),
         ("wasm64-unknown-unknown", "emscripten", false),
         ("wasm64-unknown-unknown", "wasm32", false),
         ("wasm64-unknown-unknown", "wasm32-bare", false),
@@ -581,4 +587,102 @@ fn ignore_mode() {
         assert!(check_ignore(&config, &format!("//@ ignore-mode-{mode}")));
         assert!(!check_ignore(&config, &format!("//@ ignore-mode-{other}")));
     }
+}
+
+#[test]
+fn threads_support() {
+    let threads = [
+        ("x86_64-unknown-linux-gnu", true),
+        ("aarch64-apple-darwin", true),
+        ("wasm32-unknown-unknown", false),
+        ("wasm64-unknown-unknown", false),
+        ("wasm32-wasip1", false),
+        ("wasm32-wasip1-threads", true),
+    ];
+    for (target, has_threads) in threads {
+        let config = cfg().target(target).build();
+        assert_eq!(config.has_threads(), has_threads);
+        assert_eq!(check_ignore(&config, "//@ needs-threads"), !has_threads)
+    }
+}
+
+fn run_path(poisoned: &mut bool, path: &Path, buf: &[u8]) {
+    let rdr = std::io::Cursor::new(&buf);
+    iter_header(Mode::Ui, "ui", poisoned, path, rdr, &mut |_| {});
+}
+
+#[test]
+fn test_unknown_directive_check() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.rs"),
+        include_bytes!("./test-auxillary/unknown_directive.rs"),
+    );
+    assert!(poisoned);
+}
+
+#[test]
+fn test_known_legacy_directive_check() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.rs"),
+        include_bytes!("./test-auxillary/known_legacy_directive.rs"),
+    );
+    assert!(poisoned);
+}
+
+#[test]
+fn test_known_directive_check_no_error() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.rs"),
+        include_bytes!("./test-auxillary/known_directive.rs"),
+    );
+    assert!(!poisoned);
+}
+
+#[test]
+fn test_error_annotation_no_error() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.rs"),
+        include_bytes!("./test-auxillary/error_annotation.rs"),
+    );
+    assert!(!poisoned);
+}
+
+#[test]
+fn test_non_rs_unknown_directive_not_checked() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.Makefile"),
+        include_bytes!("./test-auxillary/not_rs.Makefile"),
+    );
+    assert!(!poisoned);
+}
+
+#[test]
+fn test_trailing_directive() {
+    let mut poisoned = false;
+    run_path(&mut poisoned, Path::new("a.rs"), b"//@ only-x86 only-arm");
+    assert!(poisoned);
+}
+
+#[test]
+fn test_trailing_directive_with_comment() {
+    let mut poisoned = false;
+    run_path(&mut poisoned, Path::new("a.rs"), b"//@ only-x86   only-arm with comment");
+    assert!(poisoned);
+}
+
+#[test]
+fn test_not_trailing_directive() {
+    let mut poisoned = false;
+    run_path(&mut poisoned, Path::new("a.rs"), b"//@ revisions: incremental");
+    assert!(!poisoned);
 }

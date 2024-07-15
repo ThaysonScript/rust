@@ -1,8 +1,9 @@
 //! Look up accessible paths for items.
 
 use hir::{
-    AsAssocItem, AssocItem, AssocItemContainer, Crate, ItemInNs, ModPath, Module, ModuleDef, Name,
-    PathResolution, PrefixKind, ScopeDef, Semantics, SemanticsScope, Type,
+    db::HirDatabase, AsAssocItem, AssocItem, AssocItemContainer, Crate, HasCrate, ImportPathConfig,
+    ItemInNs, ModPath, Module, ModuleDef, Name, PathResolution, PrefixKind, ScopeDef, Semantics,
+    SemanticsScope, Trait, TyFingerprint, Type,
 };
 use itertools::{EitherOrBoth, Itertools};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -204,25 +205,21 @@ impl ImportAssets {
     pub fn search_for_imports(
         &self,
         sema: &Semantics<'_, RootDatabase>,
+        cfg: ImportPathConfig,
         prefix_kind: PrefixKind,
-        prefer_no_std: bool,
-        prefer_prelude: bool,
     ) -> impl Iterator<Item = LocatedImport> {
-        let _p =
-            tracing::span!(tracing::Level::INFO, "import_assets::search_for_imports").entered();
-        self.search_for(sema, Some(prefix_kind), prefer_no_std, prefer_prelude)
+        let _p = tracing::info_span!("ImportAssets::search_for_imports").entered();
+        self.search_for(sema, Some(prefix_kind), cfg)
     }
 
     /// This may return non-absolute paths if a part of the returned path is already imported into scope.
     pub fn search_for_relative_paths(
         &self,
         sema: &Semantics<'_, RootDatabase>,
-        prefer_no_std: bool,
-        prefer_prelude: bool,
+        cfg: ImportPathConfig,
     ) -> impl Iterator<Item = LocatedImport> {
-        let _p = tracing::span!(tracing::Level::INFO, "import_assets::search_for_relative_paths")
-            .entered();
-        self.search_for(sema, None, prefer_no_std, prefer_prelude)
+        let _p = tracing::info_span!("ImportAssets::search_for_relative_paths").entered();
+        self.search_for(sema, None, cfg)
     }
 
     /// Requires imports to by prefix instead of fuzzily.
@@ -259,10 +256,9 @@ impl ImportAssets {
         &self,
         sema: &Semantics<'_, RootDatabase>,
         prefixed: Option<PrefixKind>,
-        prefer_no_std: bool,
-        prefer_prelude: bool,
+        cfg: ImportPathConfig,
     ) -> impl Iterator<Item = LocatedImport> {
-        let _p = tracing::span!(tracing::Level::INFO, "import_assets::search_for").entered();
+        let _p = tracing::info_span!("ImportAssets::search_for").entered();
 
         let scope = match sema.scope(&self.candidate_node) {
             Some(it) => it,
@@ -277,8 +273,7 @@ impl ImportAssets {
                 item_for_path_search(sema.db, item)?,
                 &self.module_with_candidate,
                 prefixed,
-                prefer_no_std,
-                prefer_prelude,
+                cfg,
             )
             .filter(|path| path.len() > 1)
         };
@@ -307,7 +302,7 @@ impl ImportAssets {
     }
 
     fn scope_definitions(&self, sema: &Semantics<'_, RootDatabase>) -> FxHashSet<ScopeDef> {
-        let _p = tracing::span!(tracing::Level::INFO, "import_assets::scope_definitions").entered();
+        let _p = tracing::info_span!("ImportAssets::scope_definitions").entered();
         let mut scope_definitions = FxHashSet::default();
         if let Some(scope) = sema.scope(&self.candidate_node) {
             scope.process_all_names(&mut |_, scope_def| {
@@ -325,8 +320,7 @@ fn path_applicable_imports(
     mod_path: impl Fn(ItemInNs) -> Option<ModPath> + Copy,
     scope_filter: impl Fn(ItemInNs) -> bool + Copy,
 ) -> FxHashSet<LocatedImport> {
-    let _p =
-        tracing::span!(tracing::Level::INFO, "import_assets::path_applicable_imports").entered();
+    let _p = tracing::info_span!("ImportAssets::path_applicable_imports").entered();
 
     match &path_candidate.qualifier {
         None => {
@@ -373,7 +367,7 @@ fn import_for_item(
     original_item: ItemInNs,
     scope_filter: impl Fn(ItemInNs) -> bool,
 ) -> Option<LocatedImport> {
-    let _p = tracing::span!(tracing::Level::INFO, "import_assets::import_for_item").entered();
+    let _p = tracing::info_span!("ImportAssets::import_for_item").entered();
     let [first_segment, ..] = unresolved_qualifier else { return None };
 
     let item_as_assoc = item_as_assoc(db, original_item);
@@ -507,8 +501,7 @@ fn trait_applicable_items(
     mod_path: impl Fn(ItemInNs) -> Option<ModPath>,
     scope_filter: impl Fn(hir::Trait) -> bool,
 ) -> FxHashSet<LocatedImport> {
-    let _p =
-        tracing::span!(tracing::Level::INFO, "import_assets::trait_applicable_items").entered();
+    let _p = tracing::info_span!("ImportAssets::trait_applicable_items").entered();
 
     let db = sema.db;
 
@@ -517,7 +510,7 @@ fn trait_applicable_items(
     let related_traits = inherent_traits.chain(env_traits).collect::<FxHashSet<_>>();
 
     let mut required_assoc_items = FxHashSet::default();
-    let trait_candidates: FxHashSet<_> = items_locator::items_with_name(
+    let mut trait_candidates: FxHashSet<_> = items_locator::items_with_name(
         sema,
         current_crate,
         trait_candidate.assoc_item_name.clone(),
@@ -537,6 +530,41 @@ fn trait_applicable_items(
         Some(assoc_item_trait.into())
     })
     .collect();
+
+    trait_candidates.retain(|&candidate_trait_id| {
+        // we care about the following cases:
+        // 1. Trait's definition crate
+        // 2. Definition crates for all trait's generic arguments
+        //     a. This is recursive for fundamental types: `Into<Box<A>> for ()`` is OK, but
+        //        `Into<Vec<A>> for ()`` is *not*.
+        // 3. Receiver type definition crate
+        //    a. This is recursive for fundamental types
+        let defining_crate_for_trait = Trait::from(candidate_trait_id).krate(db);
+        let Some(receiver) = trait_candidate.receiver_ty.fingerprint_for_trait_impl() else {
+            return false;
+        };
+
+        // in order to handle implied bounds through an associated type, keep any
+        // method receiver that matches `TyFingerprint::Unnameable`. this receiver
+        // won't be in `TraitImpls` anyways, as `TraitImpls` only contains actual
+        // implementations.
+        if matches!(receiver, TyFingerprint::Unnameable) {
+            return true;
+        }
+
+        let definitions_exist_in_trait_crate = db
+            .trait_impls_in_crate(defining_crate_for_trait.into())
+            .has_impls_for_trait_and_self_ty(candidate_trait_id, receiver);
+
+        // this is a closure for laziness: if `definitions_exist_in_trait_crate` is true,
+        // we can avoid a second db lookup.
+        let definitions_exist_in_receiver_crate = || {
+            db.trait_impls_in_crate(trait_candidate.receiver_ty.krate(db).into())
+                .has_impls_for_trait_and_self_ty(candidate_trait_id, receiver)
+        };
+
+        definitions_exist_in_trait_crate || definitions_exist_in_receiver_crate()
+    });
 
     let mut located_imports = FxHashSet::default();
     let mut trait_import_paths = FxHashMap::default();
@@ -609,19 +637,12 @@ fn get_mod_path(
     item_to_search: ItemInNs,
     module_with_candidate: &Module,
     prefixed: Option<PrefixKind>,
-    prefer_no_std: bool,
-    prefer_prelude: bool,
+    cfg: ImportPathConfig,
 ) -> Option<ModPath> {
     if let Some(prefix_kind) = prefixed {
-        module_with_candidate.find_use_path_prefixed(
-            db,
-            item_to_search,
-            prefix_kind,
-            prefer_no_std,
-            prefer_prelude,
-        )
+        module_with_candidate.find_use_path(db, item_to_search, prefix_kind, cfg)
     } else {
-        module_with_candidate.find_use_path(db, item_to_search, prefer_no_std, prefer_prelude)
+        module_with_candidate.find_path(db, item_to_search, cfg)
     }
 }
 

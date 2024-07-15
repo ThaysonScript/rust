@@ -1,17 +1,19 @@
+//! The expansion from a test function to the appropriate test struct for libtest
+//! Ideally, this code would be in libtest but for efficiency and error messages it lives here.
+
 use crate::errors;
-/// The expansion from a test function to the appropriate test struct for libtest
-/// Ideally, this code would be in libtest but for efficiency and error messages it lives here.
 use crate::util::{check_builtin_macro_attribute, warn_on_duplicate_attribute};
 use rustc_ast::ptr::P;
 use rustc_ast::{self as ast, attr, GenericParamKind};
 use rustc_ast_pretty::pprust;
-use rustc_errors::{Applicability, DiagnosticBuilder, Level};
+use rustc_errors::{Applicability, Diag, Level};
 use rustc_expand::base::*;
 use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::{ErrorGuaranteed, FileNameDisplayPreference, Span};
 use std::assert_matches::assert_matches;
 use std::iter;
 use thin_vec::{thin_vec, ThinVec};
+use tracing::debug;
 
 /// #[test_case] is used by custom test authors to mark tests
 /// When building for test, it needs to make the item public and gensym the name
@@ -20,7 +22,7 @@ use thin_vec::{thin_vec, ThinVec};
 ///
 /// We mark item with an inert attribute "rustc_test_marker" which the test generation
 /// logic will pick up on.
-pub fn expand_test_case(
+pub(crate) fn expand_test_case(
     ecx: &mut ExtCtxt<'_>,
     attr_sp: Span,
     meta_item: &ast::MetaItem,
@@ -73,7 +75,7 @@ pub fn expand_test_case(
     vec![ret]
 }
 
-pub fn expand_test(
+pub(crate) fn expand_test(
     cx: &mut ExtCtxt<'_>,
     attr_sp: Span,
     meta_item: &ast::MetaItem,
@@ -84,7 +86,7 @@ pub fn expand_test(
     expand_test_or_bench(cx, attr_sp, item, false)
 }
 
-pub fn expand_bench(
+pub(crate) fn expand_bench(
     cx: &mut ExtCtxt<'_>,
     attr_sp: Span,
     meta_item: &ast::MetaItem,
@@ -95,8 +97,8 @@ pub fn expand_bench(
     expand_test_or_bench(cx, attr_sp, item, true)
 }
 
-pub fn expand_test_or_bench(
-    cx: &mut ExtCtxt<'_>,
+pub(crate) fn expand_test_or_bench(
+    cx: &ExtCtxt<'_>,
     attr_sp: Span,
     item: Annotatable,
     is_bench: bool,
@@ -410,7 +412,7 @@ fn not_testable_error(cx: &ExtCtxt<'_>, attr_sp: Span, item: Option<&ast::Item>)
         Some(ast::ItemKind::MacCall(_)) => Level::Warning,
         _ => Level::Error,
     };
-    let mut err = DiagnosticBuilder::<()>::new(dcx, level, msg);
+    let mut err = Diag::<()>::new(dcx, level, msg);
     err.span(attr_sp);
     if let Some(item) = item {
         err.span_label(
@@ -548,7 +550,7 @@ fn check_test_signature(
     let has_should_panic_attr = attr::contains_name(&i.attrs, sym::should_panic);
     let dcx = cx.dcx();
 
-    if let ast::Unsafe::Yes(span) = f.sig.header.unsafety {
+    if let ast::Safety::Unsafe(span) = f.sig.header.safety {
         return Err(dcx.emit_err(errors::TestBadFn { span: i.span, cause: span, kind: "unsafe" }));
     }
 

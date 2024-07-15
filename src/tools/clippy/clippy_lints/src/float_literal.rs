@@ -38,9 +38,9 @@ declare_clippy_lint! {
     /// Checks for whole number float literals that
     /// cannot be represented as the underlying type without loss.
     ///
-    /// ### Why is this bad?
-    /// Rust will silently lose precision during
-    /// conversion to a float.
+    /// ### Why restrict this?
+    /// If the value was intended to be exact, it will not be.
+    /// This may be especially surprising when the lost precision is to the left of the decimal point.
     ///
     /// ### Example
     /// ```no_run
@@ -76,11 +76,17 @@ impl<'tcx> LateLintPass<'tcx> for FloatLiteral {
             let digits = count_digits(sym_str);
             let max = max_digits(fty);
             let type_suffix = match lit_float_ty {
+                LitFloatType::Suffixed(ast::FloatTy::F16) => Some("f16"),
                 LitFloatType::Suffixed(ast::FloatTy::F32) => Some("f32"),
                 LitFloatType::Suffixed(ast::FloatTy::F64) => Some("f64"),
+                LitFloatType::Suffixed(ast::FloatTy::F128) => Some("f128"),
                 LitFloatType::Unsuffixed => None,
             };
             let (is_whole, is_inf, mut float_str) = match fty {
+                FloatTy::F16 | FloatTy::F128 => {
+                    // FIXME(f16_f128): do a check like the others when parsing is available
+                    return;
+                },
                 FloatTy::F32 => {
                     let value = sym_str.parse::<f32>().unwrap();
 
@@ -97,7 +103,7 @@ impl<'tcx> LateLintPass<'tcx> for FloatLiteral {
                 return;
             }
 
-            if is_whole && !sym_str.contains(|c| c == 'e' || c == 'E') {
+            if is_whole && !sym_str.contains(['e', 'E']) {
                 // Normalize the literal by stripping the fractional portion
                 if sym_str.split('.').next().unwrap() != float_str {
                     // If the type suffix is missing the suggestion would be
@@ -135,15 +141,17 @@ impl<'tcx> LateLintPass<'tcx> for FloatLiteral {
 #[must_use]
 fn max_digits(fty: FloatTy) -> u32 {
     match fty {
+        FloatTy::F16 => f16::DIGITS,
         FloatTy::F32 => f32::DIGITS,
         FloatTy::F64 => f64::DIGITS,
+        FloatTy::F128 => f128::DIGITS,
     }
 }
 
 /// Counts the digits excluding leading zeros
 #[must_use]
 fn count_digits(s: &str) -> usize {
-    // Note that s does not contain the f32/64 suffix, and underscores have been stripped
+    // Note that s does not contain the `f{16,32,64,128}` suffix, and underscores have been stripped
     s.chars()
         .filter(|c| *c != '-' && *c != '.')
         .take_while(|c| *c != 'e' && *c != 'E')

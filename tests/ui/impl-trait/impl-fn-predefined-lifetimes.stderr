@@ -1,14 +1,11 @@
-error: concrete type differs from previous defining opaque type use
-  --> $DIR/impl-fn-predefined-lifetimes.rs:7:9
+error[E0792]: expected generic lifetime parameter, found `'_`
+  --> $DIR/impl-fn-predefined-lifetimes.rs:6:9
    |
+LL | fn a<'a>() -> impl Fn(&'a u8) -> (impl Debug + '_) {
+   |                                                -- this generic parameter must be used with a generic lifetime parameter
+LL |
 LL |     |x| x
-   |         ^ expected `impl Debug + '_`, got `&u8`
-   |
-note: previous use here
-  --> $DIR/impl-fn-predefined-lifetimes.rs:7:5
-   |
-LL |     |x| x
-   |     ^^^^^
+   |         ^
 
 error[E0720]: cannot resolve opaque type
   --> $DIR/impl-fn-predefined-lifetimes.rs:4:35
@@ -18,4 +15,5 @@ LL | fn a<'a>() -> impl Fn(&'a u8) -> (impl Debug + '_) {
 
 error: aborting due to 2 previous errors
 
-For more information about this error, try `rustc --explain E0720`.
+Some errors have detailed explanations: E0720, E0792.
+For more information about an error, try `rustc --explain E0720`.

@@ -17,7 +17,7 @@ extern crate rustc_macros;
 extern crate rustc_session;
 extern crate rustc_span;
 
-use rustc_errors::{Applicability, DiagnosticMessage, SubdiagnosticMessage};
+use rustc_errors::{Applicability, DiagMessage, SubdiagMessage};
 use rustc_macros::Subdiagnostic;
 use rustc_span::Span;
 
@@ -826,4 +826,14 @@ struct PrimarySpanOnVec {
     //~^ ERROR `#[primary_span]` is not a valid attribute
     //~| NOTE there must be exactly one primary span
     sub: Vec<Span>,
+}
+
+#[derive(Subdiagnostic)]
+struct NestedParent {
+    #[subdiagnostic]
+    single_sub: A,
+    #[subdiagnostic]
+    option_sub: Option<A>,
+    #[subdiagnostic]
+    vec_sub: Vec<A>,
 }

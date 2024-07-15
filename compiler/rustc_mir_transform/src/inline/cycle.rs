@@ -3,8 +3,9 @@ use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty::TypeVisitableExt;
-use rustc_middle::ty::{self, GenericArgsRef, InstanceDef, TyCtxt};
+use rustc_middle::ty::{self, GenericArgsRef, InstanceKind, TyCtxt};
 use rustc_session::Limit;
+use rustc_span::sym;
 
 // FIXME: check whether it is cheaper to precompute the entire call graph instead of invoking
 // this query ridiculously often.
@@ -21,7 +22,7 @@ pub(crate) fn mir_callgraph_reachable<'tcx>(
         "you should not call `mir_callgraph_reachable` on immediate self recursion"
     );
     assert!(
-        matches!(root.def, InstanceDef::Item(_)),
+        matches!(root.def, InstanceKind::Item(_)),
         "you should not call `mir_callgraph_reachable` on shims"
     );
     assert!(
@@ -52,7 +53,7 @@ pub(crate) fn mir_callgraph_reachable<'tcx>(
                 trace!(?caller, ?param_env, ?args, "cannot normalize, skipping");
                 continue;
             };
-            let Ok(Some(callee)) = ty::Instance::resolve(tcx, param_env, callee, args) else {
+            let Ok(Some(callee)) = ty::Instance::try_resolve(tcx, param_env, callee, args) else {
                 trace!(?callee, "cannot resolve, skipping");
                 continue;
             };
@@ -69,7 +70,7 @@ pub(crate) fn mir_callgraph_reachable<'tcx>(
             }
 
             match callee.def {
-                InstanceDef::Item(_) => {
+                InstanceKind::Item(_) => {
                     // If there is no MIR available (either because it was not in metadata or
                     // because it has no MIR because it's an extern function), then the inliner
                     // won't cause cycles on this.
@@ -79,22 +80,24 @@ pub(crate) fn mir_callgraph_reachable<'tcx>(
                     }
                 }
                 // These have no own callable MIR.
-                InstanceDef::Intrinsic(_) | InstanceDef::Virtual(..) => continue,
+                InstanceKind::Intrinsic(_) | InstanceKind::Virtual(..) => continue,
                 // These have MIR and if that MIR is inlined, instantiated and then inlining is run
                 // again, a function item can end up getting inlined. Thus we'll be able to cause
                 // a cycle that way
-                InstanceDef::VTableShim(_)
-                | InstanceDef::ReifyShim(_)
-                | InstanceDef::FnPtrShim(..)
-                | InstanceDef::ClosureOnceShim { .. }
-                | InstanceDef::ConstructCoroutineInClosureShim { .. }
-                | InstanceDef::CoroutineKindShim { .. }
-                | InstanceDef::ThreadLocalShim { .. }
-                | InstanceDef::CloneShim(..) => {}
+                InstanceKind::VTableShim(_)
+                | InstanceKind::ReifyShim(..)
+                | InstanceKind::FnPtrShim(..)
+                | InstanceKind::ClosureOnceShim { .. }
+                | InstanceKind::ConstructCoroutineInClosureShim { .. }
+                | InstanceKind::CoroutineKindShim { .. }
+                | InstanceKind::ThreadLocalShim { .. }
+                | InstanceKind::CloneShim(..) => {}
 
                 // This shim does not call any other functions, thus there can be no recursion.
-                InstanceDef::FnPtrAddrShim(..) => continue,
-                InstanceDef::DropGlue(..) => {
+                InstanceKind::FnPtrAddrShim(..) => {
+                    continue;
+                }
+                InstanceKind::DropGlue(..) | InstanceKind::AsyncDropGlueCtorShim(..) => {
                     // FIXME: A not fully instantiated drop shim can cause ICEs if one attempts to
                     // have its MIR built. Likely oli-obk just screwed up the `ParamEnv`s, so this
                     // needs some more analysis.
@@ -148,12 +151,12 @@ pub(crate) fn mir_callgraph_reachable<'tcx>(
 
 pub(crate) fn mir_inliner_callees<'tcx>(
     tcx: TyCtxt<'tcx>,
-    instance: ty::InstanceDef<'tcx>,
+    instance: ty::InstanceKind<'tcx>,
 ) -> &'tcx [(DefId, GenericArgsRef<'tcx>)] {
     let steal;
     let guard;
     let body = match (instance, instance.def_id().as_local()) {
-        (InstanceDef::Item(_), Some(def_id)) => {
+        (InstanceKind::Item(_), Some(def_id)) => {
             steal = tcx.mir_promoted(def_id).0;
             guard = steal.borrow();
             &*guard
@@ -164,11 +167,20 @@ pub(crate) fn mir_inliner_callees<'tcx>(
     let mut calls = FxIndexSet::default();
     for bb_data in body.basic_blocks.iter() {
         let terminator = bb_data.terminator();
-        if let TerminatorKind::Call { func, .. } = &terminator.kind {
+        if let TerminatorKind::Call { func, args: call_args, .. } = &terminator.kind {
             let ty = func.ty(&body.local_decls, tcx);
-            let call = match ty.kind() {
-                ty::FnDef(def_id, args) => (*def_id, *args),
-                _ => continue,
+            let ty::FnDef(def_id, generic_args) = ty.kind() else {
+                continue;
+            };
+            let call = if tcx.is_intrinsic(*def_id, sym::const_eval_select) {
+                let func = &call_args[2].node;
+                let ty = func.ty(&body.local_decls, tcx);
+                let ty::FnDef(def_id, generic_args) = ty.kind() else {
+                    continue;
+                };
+                (*def_id, *generic_args)
+            } else {
+                (*def_id, *generic_args)
             };
             calls.insert(call);
         }

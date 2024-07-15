@@ -1,6 +1,8 @@
 //! Various extensions traits for Chalk types.
 
-use chalk_ir::{cast::Cast, FloatTy, IntTy, Mutability, Scalar, TyVariableKind, UintTy};
+use chalk_ir::{
+    cast::Cast, FloatTy, IntTy, Mutability, Scalar, TyVariableKind, TypeOutlives, UintTy,
+};
 use hir_def::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinType, BuiltinUint},
     generics::TypeOrConstParamData,
@@ -10,12 +12,10 @@ use hir_def::{
 };
 
 use crate::{
-    db::HirDatabase,
-    from_assoc_type_id, from_chalk_trait_id, from_foreign_def_id, from_placeholder_idx,
-    to_chalk_trait_id,
-    utils::{generics, ClosureSubst},
-    AdtId, AliasEq, AliasTy, Binders, CallableDefId, CallableSig, Canonical, CanonicalVarKinds,
-    ClosureId, DynTy, FnPointer, ImplTraitId, InEnvironment, Interner, Lifetime, ProjectionTy,
+    db::HirDatabase, from_assoc_type_id, from_chalk_trait_id, from_foreign_def_id,
+    from_placeholder_idx, generics::generics, to_chalk_trait_id, utils::ClosureSubst, AdtId,
+    AliasEq, AliasTy, Binders, CallableDefId, CallableSig, Canonical, CanonicalVarKinds, ClosureId,
+    DynTy, FnPointer, ImplTraitId, InEnvironment, Interner, Lifetime, ProjectionTy,
     QuantifiedWhereClause, Substitution, TraitRef, Ty, TyBuilder, TyKind, TypeFlags, WhereClause,
 };
 
@@ -25,6 +25,7 @@ pub trait TyExt {
     fn is_scalar(&self) -> bool;
     fn is_floating_point(&self) -> bool;
     fn is_never(&self) -> bool;
+    fn is_str(&self) -> bool;
     fn is_unknown(&self) -> bool;
     fn contains_unknown(&self) -> bool;
     fn is_ty_var(&self) -> bool;
@@ -83,6 +84,10 @@ impl TyExt for Ty {
 
     fn is_never(&self) -> bool {
         matches!(self.kind(Interner), TyKind::Never)
+    }
+
+    fn is_str(&self) -> bool {
+        matches!(self.kind(Interner), TyKind::Str)
     }
 
     fn is_unknown(&self) -> bool {
@@ -268,6 +273,13 @@ impl TyExt for Ty {
                             data.substitute(Interner, &subst).into_value_and_skipped_binders().0
                         })
                     }
+                    ImplTraitId::AssociatedTypeImplTrait(alias, idx) => {
+                        db.type_alias_impl_traits(alias).map(|it| {
+                            let data =
+                                (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
+                            data.substitute(Interner, &subst).into_value_and_skipped_binders().0
+                        })
+                    }
                 }
             }
             TyKind::Alias(AliasTy::Opaque(opaque_ty)) => {
@@ -275,6 +287,13 @@ impl TyExt for Ty {
                 {
                     ImplTraitId::ReturnTypeImplTrait(func, idx) => {
                         db.return_type_impl_traits(func).map(|it| {
+                            let data =
+                                (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
+                            data.substitute(Interner, &opaque_ty.substitution)
+                        })
+                    }
+                    ImplTraitId::AssociatedTypeImplTrait(alias, idx) => {
+                        db.type_alias_impl_traits(alias).map(|it| {
                             let data =
                                 (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
                             data.substitute(Interner, &opaque_ty.substitution)
@@ -298,7 +317,7 @@ impl TyExt for Ty {
                                 .generic_predicates(id.parent)
                                 .iter()
                                 .map(|pred| pred.clone().substitute(Interner, &substs))
-                                .filter(|wc| match &wc.skip_binders() {
+                                .filter(|wc| match wc.skip_binders() {
                                     WhereClause::Implemented(tr) => {
                                         &tr.self_type_parameter(Interner) == self
                                     }
@@ -306,6 +325,9 @@ impl TyExt for Ty {
                                         alias: AliasTy::Projection(proj),
                                         ty: _,
                                     }) => &proj.self_type_parameter(db) == self,
+                                    WhereClause::TypeOutlives(TypeOutlives { ty, lifetime: _ }) => {
+                                        ty == self
+                                    }
                                     _ => false,
                                 })
                                 .collect::<Vec<_>>();

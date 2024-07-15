@@ -11,12 +11,13 @@ use hir_def::{ItemContainerId, Lookup};
 use hir_expand::name;
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
-use rustc_pattern_analysis::usefulness::{compute_match_usefulness, ValidityConstraint};
+use rustc_pattern_analysis::constructor::Constructor;
 use syntax::{ast, AstNode};
 use tracing::debug;
 use triomphe::Arc;
 use typed_arena::Arena;
 
+use crate::Interner;
 use crate::{
     db::HirDatabase,
     diagnostics::match_check::{
@@ -59,12 +60,16 @@ pub enum BodyValidationDiagnostic {
 }
 
 impl BodyValidationDiagnostic {
-    pub fn collect(db: &dyn HirDatabase, owner: DefWithBodyId) -> Vec<BodyValidationDiagnostic> {
-        let _p =
-            tracing::span!(tracing::Level::INFO, "BodyValidationDiagnostic::collect").entered();
+    pub fn collect(
+        db: &dyn HirDatabase,
+        owner: DefWithBodyId,
+        validate_lints: bool,
+    ) -> Vec<BodyValidationDiagnostic> {
+        let _p = tracing::info_span!("BodyValidationDiagnostic::collect").entered();
         let infer = db.infer(owner);
         let body = db.body(owner);
-        let mut validator = ExprValidator { owner, body, infer, diagnostics: Vec::new() };
+        let mut validator =
+            ExprValidator { owner, body, infer, diagnostics: Vec::new(), validate_lints };
         validator.validate_body(db);
         validator.diagnostics
     }
@@ -75,6 +80,7 @@ struct ExprValidator {
     body: Arc<Body>,
     infer: Arc<InferenceResult>,
     diagnostics: Vec<BodyValidationDiagnostic>,
+    validate_lints: bool,
 }
 
 impl ExprValidator {
@@ -138,6 +144,9 @@ impl ExprValidator {
         expr: &Expr,
         filter_map_next_checker: &mut Option<FilterMapNextChecker>,
     ) {
+        if !self.validate_lints {
+            return;
+        }
         // Check that the number of arguments matches the number of parameters.
 
         if self.infer.expr_type_mismatches().next().is_some() {
@@ -149,17 +158,18 @@ impl ExprValidator {
                 None => return,
             };
 
-            if filter_map_next_checker
-                .get_or_insert_with(|| {
-                    FilterMapNextChecker::new(&self.owner.resolver(db.upcast()), db)
-                })
-                .check(call_id, receiver, &callee)
-                .is_some()
-            {
+            let checker = filter_map_next_checker.get_or_insert_with(|| {
+                FilterMapNextChecker::new(&self.owner.resolver(db.upcast()), db)
+            });
+
+            if checker.check(call_id, receiver, &callee).is_some() {
                 self.diagnostics.push(BodyValidationDiagnostic::ReplaceFilterMapNextWithFindMap {
                     method_call_expr: call_id,
                 });
             }
+
+            let receiver_ty = self.infer[*receiver].clone();
+            checker.prev_receiver_ty = Some(receiver_ty);
         }
     }
 
@@ -171,7 +181,7 @@ impl ExprValidator {
         db: &dyn HirDatabase,
     ) {
         let scrut_ty = &self.infer[scrutinee_expr];
-        if scrut_ty.is_unknown() {
+        if scrut_ty.contains_unknown() {
             return;
         }
 
@@ -180,55 +190,50 @@ impl ExprValidator {
         let pattern_arena = Arena::new();
         let mut m_arms = Vec::with_capacity(arms.len());
         let mut has_lowering_errors = false;
+        // Note: Skipping the entire diagnostic rather than just not including a faulty match arm is
+        // preferred to avoid the chance of false positives.
         for arm in arms {
-            if let Some(pat_ty) = self.infer.type_of_pat.get(arm.pat) {
-                // We only include patterns whose type matches the type
-                // of the scrutinee expression. If we had an InvalidMatchArmPattern
-                // diagnostic or similar we could raise that in an else
-                // block here.
-                //
-                // When comparing the types, we also have to consider that rustc
-                // will automatically de-reference the scrutinee expression type if
-                // necessary.
-                //
-                // FIXME we should use the type checker for this.
-                if (pat_ty == scrut_ty
-                    || scrut_ty
-                        .as_reference()
-                        .map(|(match_expr_ty, ..)| match_expr_ty == pat_ty)
-                        .unwrap_or(false))
-                    && types_of_subpatterns_do_match(arm.pat, &self.body, &self.infer)
-                {
-                    // If we had a NotUsefulMatchArm diagnostic, we could
-                    // check the usefulness of each pattern as we added it
-                    // to the matrix here.
-                    let pat = self.lower_pattern(&cx, arm.pat, db, &mut has_lowering_errors);
-                    let m_arm = pat_analysis::MatchArm {
-                        pat: pattern_arena.alloc(pat),
-                        has_guard: arm.guard.is_some(),
-                        arm_data: (),
-                    };
-                    m_arms.push(m_arm);
-                    if !has_lowering_errors {
-                        continue;
-                    }
+            let Some(pat_ty) = self.infer.type_of_pat.get(arm.pat) else {
+                return;
+            };
+
+            // We only include patterns whose type matches the type
+            // of the scrutinee expression. If we had an InvalidMatchArmPattern
+            // diagnostic or similar we could raise that in an else
+            // block here.
+            //
+            // When comparing the types, we also have to consider that rustc
+            // will automatically de-reference the scrutinee expression type if
+            // necessary.
+            //
+            // FIXME we should use the type checker for this.
+            if (pat_ty == scrut_ty
+                || scrut_ty
+                    .as_reference()
+                    .map(|(match_expr_ty, ..)| match_expr_ty == pat_ty)
+                    .unwrap_or(false))
+                && types_of_subpatterns_do_match(arm.pat, &self.body, &self.infer)
+            {
+                // If we had a NotUsefulMatchArm diagnostic, we could
+                // check the usefulness of each pattern as we added it
+                // to the matrix here.
+                let pat = self.lower_pattern(&cx, arm.pat, db, &mut has_lowering_errors);
+                let m_arm = pat_analysis::MatchArm {
+                    pat: pattern_arena.alloc(pat),
+                    has_guard: arm.guard.is_some(),
+                    arm_data: (),
+                };
+                m_arms.push(m_arm);
+                if !has_lowering_errors {
+                    continue;
                 }
             }
-
-            // If we can't resolve the type of a pattern, or the pattern type doesn't
-            // fit the match expression, we skip this diagnostic. Skipping the entire
-            // diagnostic rather than just not including this match arm is preferred
-            // to avoid the chance of false positives.
+            // If the pattern type doesn't fit the match expression, we skip this diagnostic.
             cov_mark::hit!(validate_match_bailed_out);
             return;
         }
 
-        let report = match compute_match_usefulness(
-            &cx,
-            m_arms.as_slice(),
-            scrut_ty.clone(),
-            ValidityConstraint::ValidOnly,
-        ) {
+        let report = match cx.compute_match_usefulness(m_arms.as_slice(), scrut_ty.clone()) {
             Ok(report) => report,
             Err(()) => return,
         };
@@ -255,24 +260,24 @@ impl ExprValidator {
             };
             let Some(initializer) = initializer else { continue };
             let ty = &self.infer[initializer];
+            if ty.contains_unknown() {
+                continue;
+            }
 
             let mut have_errors = false;
             let deconstructed_pat = self.lower_pattern(&cx, pat, db, &mut have_errors);
+
+            // optimization, wildcard trivially hold
+            if have_errors || matches!(deconstructed_pat.ctor(), Constructor::Wildcard) {
+                continue;
+            }
+
             let match_arm = rustc_pattern_analysis::MatchArm {
                 pat: pattern_arena.alloc(deconstructed_pat),
                 has_guard: false,
                 arm_data: (),
             };
-            if have_errors {
-                continue;
-            }
-
-            let report = match compute_match_usefulness(
-                &cx,
-                &[match_arm],
-                ty.clone(),
-                ValidityConstraint::ValidOnly,
-            ) {
+            let report = match cx.compute_match_usefulness(&[match_arm], ty.clone()) {
                 Ok(v) => v,
                 Err(e) => {
                     debug!(?e, "match usefulness error");
@@ -306,6 +311,9 @@ impl ExprValidator {
     }
 
     fn check_for_trailing_return(&mut self, body_expr: ExprId, body: &Body) {
+        if !self.validate_lints {
+            return;
+        }
         match &body.exprs[body_expr] {
             Expr::Block { statements, tail, .. } => {
                 let last_stmt = tail.or_else(|| match statements.last()? {
@@ -338,6 +346,9 @@ impl ExprValidator {
     }
 
     fn check_for_unnecessary_else(&mut self, id: ExprId, expr: &Expr, db: &dyn HirDatabase) {
+        if !self.validate_lints {
+            return;
+        }
         if let Expr::If { condition: _, then_branch, else_branch } = expr {
             if else_branch.is_none() {
                 return;
@@ -393,6 +404,7 @@ struct FilterMapNextChecker {
     filter_map_function_id: Option<hir_def::FunctionId>,
     next_function_id: Option<hir_def::FunctionId>,
     prev_filter_map_expr_id: Option<ExprId>,
+    prev_receiver_ty: Option<chalk_ir::Ty<Interner>>,
 }
 
 impl FilterMapNextChecker {
@@ -417,7 +429,12 @@ impl FilterMapNextChecker {
             ),
             None => (None, None),
         };
-        Self { filter_map_function_id, next_function_id, prev_filter_map_expr_id: None }
+        Self {
+            filter_map_function_id,
+            next_function_id,
+            prev_filter_map_expr_id: None,
+            prev_receiver_ty: None,
+        }
     }
 
     // check for instances of .filter_map(..).next()
@@ -434,7 +451,11 @@ impl FilterMapNextChecker {
 
         if *function_id == self.next_function_id? {
             if let Some(prev_filter_map_expr_id) = self.prev_filter_map_expr_id {
-                if *receiver_expr_id == prev_filter_map_expr_id {
+                let is_dyn_trait = self
+                    .prev_receiver_ty
+                    .as_ref()
+                    .map_or(false, |it| it.strip_references().dyn_trait().is_some());
+                if *receiver_expr_id == prev_filter_map_expr_id && !is_dyn_trait {
                     return Some(());
                 }
             }
@@ -512,8 +533,16 @@ fn types_of_subpatterns_do_match(pat: PatId, body: &Body, infer: &InferenceResul
     fn walk(pat: PatId, body: &Body, infer: &InferenceResult, has_type_mismatches: &mut bool) {
         match infer.type_mismatch_for_pat(pat) {
             Some(_) => *has_type_mismatches = true,
+            None if *has_type_mismatches => (),
             None => {
-                body[pat].walk_child_pats(|subpat| walk(subpat, body, infer, has_type_mismatches))
+                let pat = &body[pat];
+                if let Pat::ConstBlock(expr) | Pat::Lit(expr) = *pat {
+                    *has_type_mismatches |= infer.type_mismatch_for_expr(expr).is_some();
+                    if *has_type_mismatches {
+                        return;
+                    }
+                }
+                pat.walk_child_pats(|subpat| walk(subpat, body, infer, has_type_mismatches))
             }
         }
     }

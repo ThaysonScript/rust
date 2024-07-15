@@ -73,7 +73,7 @@ fn check_answer(ra_fixture: &str, check: impl FnOnce(&[u8], &MemoryMap)) {
         Ok(t) => t,
         Err(e) => {
             let err = pretty_print_err(e, db);
-            panic!("Error in evaluating goal: {}", err);
+            panic!("Error in evaluating goal: {err}");
         }
     };
     match &r.data(Interner).value {
@@ -81,7 +81,7 @@ fn check_answer(ra_fixture: &str, check: impl FnOnce(&[u8], &MemoryMap)) {
             ConstScalar::Bytes(b, mm) => {
                 check(b, mm);
             }
-            x => panic!("Expected number but found {:?}", x),
+            x => panic!("Expected number but found {x:?}"),
         },
         _ => panic!("result of const eval wasn't a concrete const"),
     }
@@ -89,7 +89,7 @@ fn check_answer(ra_fixture: &str, check: impl FnOnce(&[u8], &MemoryMap)) {
 
 fn pretty_print_err(e: ConstEvalError, db: TestDB) -> String {
     let mut err = String::new();
-    let span_formatter = |file, range| format!("{:?} {:?}", file, range);
+    let span_formatter = |file, range| format!("{file:?} {range:?}");
     match e {
         ConstEvalError::MirLowerError(e) => e.pretty_print(&mut err, &db, span_formatter),
         ConstEvalError::MirEvalError(e) => e.pretty_print(&mut err, &db, span_formatter),
@@ -2823,5 +2823,32 @@ fn unsized_local() {
     };
     "#,
         |e| matches!(e, ConstEvalError::MirLowerError(MirLowerError::UnsizedTemporary(_))),
+    );
+}
+
+#[test]
+fn recursive_adt() {
+    check_fail(
+        r#"
+        //- minicore: coerce_unsized, index, slice
+        pub enum TagTree {
+            Leaf,
+            Choice(&'static [TagTree]),
+        }
+        const GOAL: TagTree = {
+            const TAG_TREE: TagTree = TagTree::Choice(&[
+                {
+                    const VARIANT_TAG_TREE: TagTree = TagTree::Choice(
+                        &[
+                            TagTree::Leaf,
+                        ],
+                    );
+                    VARIANT_TAG_TREE
+                },
+            ]);
+            TAG_TREE
+        };
+    "#,
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::StackOverflow)),
     );
 }

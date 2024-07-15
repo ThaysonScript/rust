@@ -1,6 +1,3 @@
-#[macro_use]
-extern crate rustc_macros;
-
 pub use self::Level::*;
 use rustc_ast::node_id::NodeId;
 use rustc_ast::{AttrId, Attribute};
@@ -8,10 +5,13 @@ use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::stable_hasher::{
     HashStable, StableCompare, StableHasher, ToStableHashKey,
 };
-use rustc_error_messages::{DiagnosticMessage, MultiSpan};
+use rustc_error_messages::{DiagMessage, MultiSpan};
+use rustc_hir::def::Namespace;
 use rustc_hir::HashStableContext;
 use rustc_hir::HirId;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_span::edition::Edition;
+use rustc_span::symbol::MacroRulesNormalizedIdent;
 use rustc_span::{sym, symbol::Ident, Span, Symbol};
 use rustc_target::spec::abi::Abi;
 
@@ -69,7 +69,7 @@ pub enum Applicability {
 }
 
 /// Each lint expectation has a `LintExpectationId` assigned by the `LintLevelsBuilder`.
-/// Expected `Diagnostic`s get the lint level `Expect` which stores the `LintExpectationId`
+/// Expected diagnostics get the lint level `Expect` which stores the `LintExpectationId`
 /// to match it with the actual expectation later on.
 ///
 /// The `LintExpectationId` has to be stable between compilations, as diagnostic
@@ -323,7 +323,8 @@ pub struct Lint {
 
     pub future_incompatible: Option<FutureIncompatibleInfo>,
 
-    pub is_loaded: bool,
+    /// `true` if this lint is being loaded by another tool (e.g. Clippy).
+    pub is_externally_loaded: bool,
 
     /// `Some` if this lint is feature gated, otherwise `None`.
     pub feature_gate: Option<Symbol>,
@@ -468,7 +469,7 @@ impl Lint {
             default_level: Level::Forbid,
             desc: "",
             edition_lint_opts: None,
-            is_loaded: false,
+            is_externally_loaded: false,
             report_in_external_macro: false,
             future_incompatible: None,
             feature_gate: None,
@@ -566,19 +567,44 @@ pub struct AmbiguityErrorDiag {
     pub b2_help_msgs: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub enum DeprecatedSinceKind {
+    InEffect,
+    InFuture,
+    InVersion(String),
+}
+
 // This could be a closure, but then implementing derive trait
 // becomes hacky (and it gets allocated).
 #[derive(Debug)]
-pub enum BuiltinLintDiagnostics {
-    Normal,
+pub enum BuiltinLintDiag {
     AbsPathWithModule(Span),
-    ProcMacroDeriveResolutionFallback(Span),
+    ProcMacroDeriveResolutionFallback {
+        span: Span,
+        ns: Namespace,
+        ident: Ident,
+    },
     MacroExpandedMacroExportsAccessedByAbsolutePaths(Span),
     ElidedLifetimesInPaths(usize, Span, bool, Span),
-    UnknownCrateTypes(Span, String, String),
-    UnusedImports(String, Vec<(Span, String)>, Option<Span>),
+    UnknownCrateTypes {
+        span: Span,
+        candidate: Option<Symbol>,
+    },
+    UnusedImports {
+        remove_whole_use: bool,
+        num_to_remove: usize,
+        remove_spans: Vec<Span>,
+        test_module_span: Option<Span>,
+        span_snippets: Vec<String>,
+    },
     RedundantImport(Vec<(Span, bool)>, Ident),
-    DeprecatedMacro(Option<Symbol>, Span),
+    DeprecatedMacro {
+        suggestion: Option<Symbol>,
+        suggestion_span: Span,
+        note: Option<Symbol>,
+        path: String,
+        since_kind: DeprecatedSinceKind,
+    },
     MissingAbi(Span, Abi),
     UnusedDocComment(Span),
     UnusedBuiltinAttribute {
@@ -586,18 +612,23 @@ pub enum BuiltinLintDiagnostics {
         macro_name: String,
         invoc_span: Span,
     },
-    PatternsInFnsWithoutBody(Span, Ident),
+    PatternsInFnsWithoutBody {
+        span: Span,
+        ident: Ident,
+        is_foreign: bool,
+    },
     LegacyDeriveHelpers(Span),
-    ProcMacroBackCompat(String),
     OrPatternsBackCompat(Span, String),
-    ReservedPrefix(Span),
+    ReservedPrefix(Span, String),
     TrailingMacro(bool, Ident),
     BreakWithLabelAndLoop(Span),
-    NamedAsmLabel(String),
     UnicodeTextFlow(Span, String),
     UnexpectedCfgName((Symbol, Span), Option<(Symbol, Span)>),
     UnexpectedCfgValue((Symbol, Span), Option<(Symbol, Span)>),
-    DeprecatedWhereclauseLocation(Span, String),
+    DeprecatedWhereclauseLocation(Span, Option<(Span, String)>),
+    MissingUnsafeOnExtern {
+        suggestion: Span,
+    },
     SingleUseLifetime {
         /// Span of the parameter which declares this lifetime.
         param_span: Span,
@@ -607,6 +638,7 @@ pub enum BuiltinLintDiagnostics {
         /// Span of the single use, or None if the lifetime is never used.
         /// If true, the lifetime will be fully elided.
         use_span: Option<(Span, bool)>,
+        ident: Ident,
     },
     NamedArgumentUsedPositionally {
         /// Span where the named argument is used by position and will be replaced with the named
@@ -621,7 +653,10 @@ pub enum BuiltinLintDiagnostics {
         /// Indicates if the named argument is used as a width/precision for formatting
         is_formatting_arg: bool,
     },
-    ByteSliceInPackedStructWithDerive,
+    ByteSliceInPackedStructWithDerive {
+        // FIXME: enum of byte/string
+        ty: String,
+    },
     UnusedExternCrate {
         removal_span: Span,
     },
@@ -656,13 +691,61 @@ pub enum BuiltinLintDiagnostics {
         /// The span of the unnecessarily-qualified path to remove.
         removal_span: Span,
     },
+    UnsafeAttrOutsideUnsafe {
+        attribute_name_span: Span,
+        sugg_spans: (Span, Span),
+    },
     AssociatedConstElidedLifetime {
         elided: bool,
         span: Span,
+        lifetimes_in_scope: MultiSpan,
     },
     RedundantImportVisibility {
         span: Span,
         max_vis: String,
+        import_vis: String,
+    },
+    UnknownDiagnosticAttribute {
+        span: Span,
+        typo_name: Option<Symbol>,
+    },
+    MacroUseDeprecated,
+    UnusedMacroUse,
+    PrivateExternCrateReexport {
+        source: Ident,
+        extern_crate_span: Span,
+    },
+    UnusedLabel,
+    MacroIsPrivate(Ident),
+    UnusedMacroDefinition(Symbol),
+    MacroRuleNeverUsed(usize, Symbol),
+    UnstableFeature(DiagMessage),
+    AvoidUsingIntelSyntax,
+    AvoidUsingAttSyntax,
+    IncompleteInclude,
+    UnnameableTestItems,
+    DuplicateMacroAttribute,
+    CfgAttrNoAttributes,
+    CrateTypeInCfgAttr,
+    CrateNameInCfgAttr,
+    MissingFragmentSpecifier,
+    MetaVariableStillRepeating(MacroRulesNormalizedIdent),
+    MetaVariableWrongOperator,
+    DuplicateMatcherBinding,
+    UnknownMacroVariable(MacroRulesNormalizedIdent),
+    UnusedCrateDependency {
+        extern_crate: Symbol,
+        local_crate: Symbol,
+    },
+    WasmCAbi,
+    IllFormedAttributeInput {
+        suggestions: Vec<String>,
+    },
+    InnerAttributeUnstable {
+        is_macro: bool,
+    },
+    OutOfScopeMacroCalls {
+        path: String,
     },
 }
 
@@ -673,9 +756,6 @@ pub struct BufferedEarlyLint {
     /// The span of code that we are linting on.
     pub span: MultiSpan,
 
-    /// The lint message.
-    pub msg: DiagnosticMessage,
-
     /// The `NodeId` of the AST node that generated the lint.
     pub node_id: NodeId,
 
@@ -683,8 +763,8 @@ pub struct BufferedEarlyLint {
     /// `rustc_lint::early::EarlyContextAndPass::check_id`.
     pub lint_id: LintId,
 
-    /// Customization of the `DiagnosticBuilder<'_>` for the lint.
-    pub diagnostic: BuiltinLintDiagnostics,
+    /// Customization of the `Diag<'_>` for the lint.
+    pub diagnostic: BuiltinLintDiag,
 }
 
 #[derive(Default, Debug)]
@@ -694,21 +774,7 @@ pub struct LintBuffer {
 
 impl LintBuffer {
     pub fn add_early_lint(&mut self, early_lint: BufferedEarlyLint) {
-        let arr = self.map.entry(early_lint.node_id).or_default();
-        arr.push(early_lint);
-    }
-
-    pub fn add_lint(
-        &mut self,
-        lint: &'static Lint,
-        node_id: NodeId,
-        span: MultiSpan,
-        msg: impl Into<DiagnosticMessage>,
-        diagnostic: BuiltinLintDiagnostics,
-    ) {
-        let lint_id = LintId::of(lint);
-        let msg = msg.into();
-        self.add_early_lint(BufferedEarlyLint { lint_id, node_id, span, msg, diagnostic });
+        self.map.entry(early_lint.node_id).or_default().push(early_lint);
     }
 
     pub fn take(&mut self, id: NodeId) -> Vec<BufferedEarlyLint> {
@@ -719,22 +785,16 @@ impl LintBuffer {
     pub fn buffer_lint(
         &mut self,
         lint: &'static Lint,
-        id: NodeId,
-        sp: impl Into<MultiSpan>,
-        msg: impl Into<DiagnosticMessage>,
+        node_id: NodeId,
+        span: impl Into<MultiSpan>,
+        diagnostic: BuiltinLintDiag,
     ) {
-        self.add_lint(lint, id, sp.into(), msg, BuiltinLintDiagnostics::Normal)
-    }
-
-    pub fn buffer_lint_with_diagnostic(
-        &mut self,
-        lint: &'static Lint,
-        id: NodeId,
-        sp: impl Into<MultiSpan>,
-        msg: impl Into<DiagnosticMessage>,
-        diagnostic: BuiltinLintDiagnostics,
-    ) {
-        self.add_lint(lint, id, sp.into(), msg, diagnostic)
+        self.add_early_lint(BufferedEarlyLint {
+            lint_id: LintId::of(lint),
+            node_id,
+            span: span.into(),
+            diagnostic,
+        });
     }
 }
 
@@ -805,7 +865,7 @@ macro_rules! declare_lint {
         );
     );
     ($(#[$attr:meta])* $vis: vis $NAME: ident, $Level: ident, $desc: expr,
-     $(@feature_gate = $gate:expr;)?
+     $(@feature_gate = $gate:ident;)?
      $(@future_incompatible = FutureIncompatibleInfo {
         reason: $reason:expr,
         $($field:ident : $val:expr),* $(,)*
@@ -817,9 +877,9 @@ macro_rules! declare_lint {
             name: stringify!($NAME),
             default_level: $crate::$Level,
             desc: $desc,
-            is_loaded: false,
+            is_externally_loaded: false,
             $($v: true,)*
-            $(feature_gate: Some($gate),)?
+            $(feature_gate: Some(rustc_span::symbol::sym::$gate),)?
             $(future_incompatible: Some($crate::FutureIncompatibleInfo {
                 reason: $reason,
                 $($field: $val,)*
@@ -835,21 +895,21 @@ macro_rules! declare_lint {
 macro_rules! declare_tool_lint {
     (
         $(#[$attr:meta])* $vis:vis $tool:ident ::$NAME:ident, $Level: ident, $desc: expr
-        $(, @feature_gate = $gate:expr;)?
+        $(, @feature_gate = $gate:ident;)?
     ) => (
         $crate::declare_tool_lint!{$(#[$attr])* $vis $tool::$NAME, $Level, $desc, false $(, @feature_gate = $gate;)?}
     );
     (
         $(#[$attr:meta])* $vis:vis $tool:ident ::$NAME:ident, $Level:ident, $desc:expr,
         report_in_external_macro: $rep:expr
-        $(, @feature_gate = $gate:expr;)?
+        $(, @feature_gate = $gate:ident;)?
     ) => (
          $crate::declare_tool_lint!{$(#[$attr])* $vis $tool::$NAME, $Level, $desc, $rep $(, @feature_gate = $gate;)?}
     );
     (
         $(#[$attr:meta])* $vis:vis $tool:ident ::$NAME:ident, $Level:ident, $desc:expr,
         $external:expr
-        $(, @feature_gate = $gate:expr;)?
+        $(, @feature_gate = $gate:ident;)?
     ) => (
         $(#[$attr])*
         $vis static $NAME: &$crate::Lint = &$crate::Lint {
@@ -859,8 +919,8 @@ macro_rules! declare_tool_lint {
             edition_lint_opts: None,
             report_in_external_macro: $external,
             future_incompatible: None,
-            is_loaded: true,
-            $(feature_gate: Some($gate),)?
+            is_externally_loaded: true,
+            $(feature_gate: Some(rustc_span::symbol::sym::$gate),)?
             crate_level_only: false,
             ..$crate::Lint::default_fields_for_macro()
         };

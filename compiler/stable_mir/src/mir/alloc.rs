@@ -1,4 +1,5 @@
 //! This module provides methods to retrieve allocation information, such as static variables.
+
 use crate::mir::mono::{Instance, StaticDef};
 use crate::target::{Endian, MachineInfo};
 use crate::ty::{Allocation, Binder, ExistentialTraitRef, IndexedVal, Ty};
@@ -55,13 +56,13 @@ impl IndexedVal for AllocId {
 /// Utility function used to read an allocation data into a unassigned integer.
 pub(crate) fn read_target_uint(mut bytes: &[u8]) -> Result<u128, Error> {
     let mut buf = [0u8; std::mem::size_of::<u128>()];
-    match MachineInfo::target_endianess() {
+    match MachineInfo::target_endianness() {
         Endian::Little => {
-            bytes.read(&mut buf)?;
+            bytes.read_exact(&mut buf[..bytes.len()])?;
             Ok(u128::from_le_bytes(buf))
         }
         Endian::Big => {
-            bytes.read(&mut buf[16 - bytes.len()..])?;
+            bytes.read_exact(&mut buf[16 - bytes.len()..])?;
             Ok(u128::from_be_bytes(buf))
         }
     }
@@ -70,13 +71,13 @@ pub(crate) fn read_target_uint(mut bytes: &[u8]) -> Result<u128, Error> {
 /// Utility function used to read an allocation data into an assigned integer.
 pub(crate) fn read_target_int(mut bytes: &[u8]) -> Result<i128, Error> {
     let mut buf = [0u8; std::mem::size_of::<i128>()];
-    match MachineInfo::target_endianess() {
+    match MachineInfo::target_endianness() {
         Endian::Little => {
-            bytes.read(&mut buf)?;
+            bytes.read_exact(&mut buf[..bytes.len()])?;
             Ok(i128::from_le_bytes(buf))
         }
         Endian::Big => {
-            bytes.read(&mut buf[16 - bytes.len()..])?;
+            bytes.read_exact(&mut buf[16 - bytes.len()..])?;
             Ok(i128::from_be_bytes(buf))
         }
     }

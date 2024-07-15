@@ -131,8 +131,9 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             let idx = generic_args[2]
                 .expect_const()
-                .eval(fx.tcx, ty::ParamEnv::reveal_all(), Some(span))
+                .eval(fx.tcx, ty::ParamEnv::reveal_all(), span)
                 .unwrap()
+                .1
                 .unwrap_branch();
 
             assert_eq!(x.layout(), y.layout());
@@ -146,8 +147,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             let total_len = lane_count * 2;
 
-            let indexes =
-                idx.iter().map(|idx| idx.unwrap_leaf().try_to_u32().unwrap()).collect::<Vec<u32>>();
+            let indexes = idx.iter().map(|idx| idx.unwrap_leaf().to_u32()).collect::<Vec<u32>>();
 
             for &idx in &indexes {
                 assert!(u64::from(idx) < total_len, "idx {} out of range 0..{}", idx, total_len);
@@ -281,9 +281,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 fx.tcx.dcx().span_fatal(span, "Index argument for `simd_insert` is not a constant");
             };
 
-            let idx: u32 = idx_const
-                .try_to_u32()
-                .unwrap_or_else(|_| panic!("kind not scalar: {:?}", idx_const));
+            let idx: u32 = idx_const.to_u32();
             let (lane_count, _lane_ty) = base.layout().ty.simd_size_and_type(fx.tcx);
             if u64::from(idx) >= lane_count {
                 fx.tcx.dcx().span_fatal(
@@ -329,9 +327,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 return;
             };
 
-            let idx = idx_const
-                .try_to_u32()
-                .unwrap_or_else(|_| panic!("kind not scalar: {:?}", idx_const));
+            let idx = idx_const.to_u32();
             let (lane_count, _lane_ty) = v.layout().ty.simd_size_and_type(fx.tcx);
             if u64::from(idx) >= lane_count {
                 fx.tcx.dcx().span_fatal(
@@ -348,6 +344,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
         | sym::simd_bswap
         | sym::simd_bitreverse
         | sym::simd_ctlz
+        | sym::simd_ctpop
         | sym::simd_cttz => {
             intrinsic_args!(fx, args => (a); intrinsic);
 
@@ -367,6 +364,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 (ty::Uint(_) | ty::Int(_), sym::simd_bswap) => fx.bcx.ins().bswap(lane),
                 (ty::Uint(_) | ty::Int(_), sym::simd_bitreverse) => fx.bcx.ins().bitrev(lane),
                 (ty::Uint(_) | ty::Int(_), sym::simd_ctlz) => fx.bcx.ins().clz(lane),
+                (ty::Uint(_) | ty::Int(_), sym::simd_ctpop) => fx.bcx.ins().popcnt(lane),
                 (ty::Uint(_) | ty::Int(_), sym::simd_cttz) => fx.bcx.ins().ctz(lane),
 
                 _ => unreachable!(),
@@ -853,7 +851,13 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             };
 
             for lane in 0..lane_count {
-                let m_lane = fx.bcx.ins().ushr_imm(m, u64::from(lane) as i64);
+                // The bit order of the mask depends on the byte endianness, LSB-first for
+                // little endian and MSB-first for big endian.
+                let mask_lane = match fx.tcx.sess.target.endian {
+                    Endian::Big => lane_count - 1 - lane,
+                    Endian::Little => lane,
+                };
+                let m_lane = fx.bcx.ins().ushr_imm(m, u64::from(mask_lane) as i64);
                 let m_lane = fx.bcx.ins().band_imm(m_lane, 1);
                 let a_lane = a.value_lane(fx, lane).load_scalar(fx);
                 let b_lane = b.value_lane(fx, lane).load_scalar(fx);
@@ -959,7 +963,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             });
         }
 
-        sym::simd_expose_addr | sym::simd_from_exposed_addr | sym::simd_cast_ptr => {
+        sym::simd_expose_provenance | sym::simd_with_exposed_provenance | sym::simd_cast_ptr => {
             intrinsic_args!(fx, args => (arg); intrinsic);
             ret.write_cvalue_transmute(fx, arg);
         }
@@ -968,7 +972,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             intrinsic_args!(fx, args => (ptr, offset); intrinsic);
 
             let (lane_count, ptr_lane_ty) = ptr.layout().ty.simd_size_and_type(fx.tcx);
-            let pointee_ty = ptr_lane_ty.builtin_deref(true).unwrap().ty;
+            let pointee_ty = ptr_lane_ty.builtin_deref(true).unwrap();
             let pointee_size = fx.layout_of(pointee_ty).size.bytes();
             let (ret_lane_count, ret_lane_ty) = ret.layout().ty.simd_size_and_type(fx.tcx);
             let ret_lane_layout = fx.layout_of(ret_lane_ty);

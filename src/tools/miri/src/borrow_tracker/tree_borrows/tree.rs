@@ -24,7 +24,7 @@ use crate::borrow_tracker::tree_borrows::{
     unimap::{UniEntry, UniIndex, UniKeyMap, UniValMap},
     Permission,
 };
-use crate::borrow_tracker::{AccessKind, GlobalState, ProtectorKind};
+use crate::borrow_tracker::{GlobalState, ProtectorKind};
 use crate::*;
 
 mod tests;
@@ -42,6 +42,7 @@ pub(super) struct LocationState {
     /// protected, that is *not* the case for uninitialized locations. Instead we just have a latent
     /// "future initial permission" of `Disabled`, causing UB only if an access is ever actually
     /// performed.
+    /// Note that the tree root is also always initialized, as if the allocation was a write access.
     initialized: bool,
     /// This pointer's current permission / future initial permission.
     permission: Permission,
@@ -55,17 +56,18 @@ pub(super) struct LocationState {
 }
 
 impl LocationState {
-    /// Default initial state has never been accessed and has been subjected to no
-    /// foreign access.
-    fn new(permission: Permission) -> Self {
+    /// Constructs a new initial state. It has neither been accessed, nor been subjected
+    /// to any foreign access yet.
+    /// The permission is not allowed to be `Active`.
+    fn new_uninit(permission: Permission) -> Self {
+        assert!(permission.is_initial() || permission.is_disabled());
         Self { permission, initialized: false, latest_foreign_access: None }
     }
 
-    /// Record that this location was accessed through a child pointer by
-    /// marking it as initialized
-    fn with_access(mut self) -> Self {
-        self.initialized = true;
-        self
+    /// Constructs a new initial state. It has not yet been subjected
+    /// to any foreign access. However, it is already marked as having been accessed.
+    fn new_init(permission: Permission) -> Self {
+        Self { permission, initialized: true, latest_foreign_access: None }
     }
 
     /// Check if the location has been initialized, i.e. if it has
@@ -104,6 +106,8 @@ impl LocationState {
         let old_perm = self.permission;
         let transition = Permission::perform_access(access_kind, rel_pos, old_perm, protected)
             .ok_or(TransitionError::ChildAccessForbidden(old_perm))?;
+        self.initialized |= !rel_pos.is_foreign();
+        self.permission = transition.applied(old_perm).unwrap();
         // Why do only initialized locations cause protector errors?
         // Consider two mutable references `x`, `y` into disjoint parts of
         // the same allocation. A priori, these may actually both be used to
@@ -121,8 +125,6 @@ impl LocationState {
         if protected && self.initialized && transition.produces_disabled() {
             return Err(TransitionError::ProtectedDisabled(old_perm));
         }
-        self.permission = transition.applied(old_perm).unwrap();
-        self.initialized |= !rel_pos.is_foreign();
         Ok(transition)
     }
 
@@ -238,8 +240,10 @@ pub(super) struct Node {
     /// If the pointer was reborrowed, it has children.
     // FIXME: bench to compare this to FxHashSet and to other SmallVec sizes
     pub children: SmallVec<[UniIndex; 4]>,
-    /// Either `Reserved` or `Frozen`, the permission this tag will be lazily initialized
-    /// to on the first access.
+    /// Either `Reserved`,  `Frozen`, or `Disabled`, it is the permission this tag will
+    /// lazily be initialized to on the first access.
+    /// It is only ever `Disabled` for a tree root, since the root is initialized to `Active` by
+    /// its own separate mechanism.
     default_initial_perm: Permission,
     /// Some extra information useful only for debugging purposes
     pub debug_info: NodeDebugInfo,
@@ -444,12 +448,14 @@ impl<'tree> TreeVisitor<'tree> {
 impl Tree {
     /// Create a new tree, with only a root pointer.
     pub fn new(root_tag: BorTag, size: Size, span: Span) -> Self {
-        let root_perm = Permission::new_active();
+        // The root has `Disabled` as the default permission,
+        // so that any access out of bounds is invalid.
+        let root_default_perm = Permission::new_disabled();
         let mut tag_mapping = UniKeyMap::default();
         let root_idx = tag_mapping.insert(root_tag);
         let nodes = {
             let mut nodes = UniValMap::<Node>::default();
-            let mut debug_info = NodeDebugInfo::new(root_tag, root_perm, span);
+            let mut debug_info = NodeDebugInfo::new(root_tag, root_default_perm, span);
             // name the root so that all allocations contain one named pointer
             debug_info.add_name("root of the allocation");
             nodes.insert(
@@ -458,7 +464,7 @@ impl Tree {
                     tag: root_tag,
                     parent: None,
                     children: SmallVec::default(),
-                    default_initial_perm: root_perm,
+                    default_initial_perm: root_default_perm,
                     debug_info,
                 },
             );
@@ -466,7 +472,11 @@ impl Tree {
         };
         let rperms = {
             let mut perms = UniValMap::default();
-            perms.insert(root_idx, LocationState::new(root_perm).with_access());
+            // We manually set it to `Active` on all in-bounds positions.
+            // We also ensure that it is initialized, so that no `Active` but
+            // not yet initialized nodes exist. Essentially, we pretend there
+            // was a write that initialized these to `Active`.
+            perms.insert(root_idx, LocationState::new_init(Permission::new_active()));
             RangeMap::new(size, perms)
         };
         Self { root: root_idx, nodes, rperms, tag_mapping }
@@ -500,7 +510,7 @@ impl<'tcx> Tree {
         // Register new_tag as a child of parent_tag
         self.nodes.get_mut(parent_idx).unwrap().children.push(idx);
         // Initialize perms
-        let perm = LocationState::new(default_initial_perm).with_access();
+        let perm = LocationState::new_init(default_initial_perm);
         for (_perms_range, perms) in self.rperms.iter_mut(reborrow_range.start, reborrow_range.size)
         {
             perms.insert(idx, perm);
@@ -516,15 +526,15 @@ impl<'tcx> Tree {
         tag: BorTag,
         access_range: AllocRange,
         global: &GlobalState,
-        span: Span, // diagnostics
+        alloc_id: AllocId, // diagnostics
+        span: Span,        // diagnostics
     ) -> InterpResult<'tcx> {
         self.perform_access(
-            AccessKind::Write,
             tag,
-            Some(access_range),
+            Some((access_range, AccessKind::Write, diagnostics::AccessCause::Dealloc)),
             global,
+            alloc_id,
             span,
-            diagnostics::AccessCause::Dealloc,
         )?;
         for (perms_range, perms) in self.rperms.iter_mut(access_range.start, access_range.size) {
             TreeVisitor { nodes: &mut self.nodes, tag_mapping: &self.tag_mapping, perms }
@@ -545,6 +555,7 @@ impl<'tcx> Tree {
                         TbError {
                             conflicting_info,
                             access_cause: diagnostics::AccessCause::Dealloc,
+                            alloc_id,
                             error_offset: perms_range.start,
                             error_kind,
                             accessed_info,
@@ -557,12 +568,16 @@ impl<'tcx> Tree {
     }
 
     /// Map the per-node and per-location `LocationState::perform_access`
-    /// to each location of `access_range`, on every tag of the allocation.
+    /// to each location of the first component of `access_range_and_kind`,
+    /// on every tag of the allocation.
     ///
-    /// If `access_range` is `None`, this is interpreted as the special
+    /// If `access_range_and_kind` is `None`, this is interpreted as the special
     /// access that is applied on protector release:
     /// - the access will be applied only to initialized locations of the allocation,
-    /// - and it will not be visible to children.
+    /// - it will not be visible to children,
+    /// - it will be recorded as a `FnExit` diagnostic access
+    /// - and it will be a read except if the location is `Active`, i.e. has been written to,
+    ///   in which case it will be a write.
     ///
     /// `LocationState::perform_access` will take care of raising transition
     /// errors and updating the `initialized` status of each location,
@@ -572,12 +587,11 @@ impl<'tcx> Tree {
     /// - recording the history.
     pub fn perform_access(
         &mut self,
-        access_kind: AccessKind,
         tag: BorTag,
-        access_range: Option<AllocRange>,
+        access_range_and_kind: Option<(AllocRange, AccessKind, diagnostics::AccessCause)>,
         global: &GlobalState,
-        span: Span,                             // diagnostics
-        access_cause: diagnostics::AccessCause, // diagnostics
+        alloc_id: AllocId, // diagnostics
+        span: Span,        // diagnostics
     ) -> InterpResult<'tcx> {
         use std::ops::Range;
         // Performs the per-node work:
@@ -591,11 +605,13 @@ impl<'tcx> Tree {
         // `perms_range` is only for diagnostics (it is the range of
         // the `RangeMap` on which we are currently working).
         let node_app = |perms_range: Range<u64>,
+                        access_kind: AccessKind,
+                        access_cause: diagnostics::AccessCause,
                         args: NodeAppArgs<'_>|
          -> Result<ContinueTraversal, TransitionError> {
             let NodeAppArgs { node, mut perm, rel_pos } = args;
 
-            let old_state = perm.or_insert(LocationState::new(node.default_initial_perm));
+            let old_state = perm.or_insert(LocationState::new_uninit(node.default_initial_perm));
 
             match old_state.skip_if_known_noop(access_kind, rel_pos) {
                 ContinueTraversal::SkipChildren => return Ok(ContinueTraversal::SkipChildren),
@@ -604,14 +620,13 @@ impl<'tcx> Tree {
 
             let protected = global.borrow().protected_tags.contains_key(&node.tag);
             let transition = old_state.perform_access(access_kind, rel_pos, protected)?;
-
             // Record the event as part of the history
             if !transition.is_noop() {
                 node.debug_info.history.push(diagnostics::Event {
                     transition,
                     is_foreign: rel_pos.is_foreign(),
                     access_cause,
-                    access_range,
+                    access_range: access_range_and_kind.map(|x| x.0),
                     transition_range: perms_range,
                     span,
                 });
@@ -622,12 +637,14 @@ impl<'tcx> Tree {
         // Error handler in case `node_app` goes wrong.
         // Wraps the faulty transition in more context for diagnostics.
         let err_handler = |perms_range: Range<u64>,
+                           access_cause: diagnostics::AccessCause,
                            args: ErrHandlerArgs<'_, TransitionError>|
          -> InterpError<'tcx> {
             let ErrHandlerArgs { error_kind, conflicting_info, accessed_info } = args;
             TbError {
                 conflicting_info,
                 access_cause,
+                alloc_id,
                 error_offset: perms_range.start,
                 error_kind,
                 accessed_info,
@@ -635,7 +652,7 @@ impl<'tcx> Tree {
             .build()
         };
 
-        if let Some(access_range) = access_range {
+        if let Some((access_range, access_kind, access_cause)) = access_range_and_kind {
             // Default branch: this is a "normal" access through a known range.
             // We iterate over affected locations and traverse the tree for each of them.
             for (perms_range, perms) in self.rperms.iter_mut(access_range.start, access_range.size)
@@ -643,8 +660,8 @@ impl<'tcx> Tree {
                 TreeVisitor { nodes: &mut self.nodes, tag_mapping: &self.tag_mapping, perms }
                     .traverse_parents_this_children_others(
                         tag,
-                        |args| node_app(perms_range.clone(), args),
-                        |args| err_handler(perms_range.clone(), args),
+                        |args| node_app(perms_range.clone(), access_kind, access_cause, args),
+                        |args| err_handler(perms_range.clone(), access_cause, args),
                     )?;
             }
         } else {
@@ -663,11 +680,14 @@ impl<'tcx> Tree {
                 if let Some(p) = perms.get(idx)
                     && p.initialized
                 {
+                    let access_kind =
+                        if p.permission.is_active() { AccessKind::Write } else { AccessKind::Read };
+                    let access_cause = diagnostics::AccessCause::FnExit(access_kind);
                     TreeVisitor { nodes: &mut self.nodes, tag_mapping: &self.tag_mapping, perms }
                         .traverse_nonchildren(
                         tag,
-                        |args| node_app(perms_range.clone(), args),
-                        |args| err_handler(perms_range.clone(), args),
+                        |args| node_app(perms_range.clone(), access_kind, access_cause, args),
+                        |args| err_handler(perms_range.clone(), access_cause, args),
                     )?;
                 }
             }

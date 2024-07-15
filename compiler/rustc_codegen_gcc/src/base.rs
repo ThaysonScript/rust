@@ -1,30 +1,28 @@
 use std::collections::HashSet;
 use std::env;
+use std::sync::Arc;
 use std::time::Instant;
 
-use gccjit::{
-    FunctionType,
-    GlobalKind,
-};
-use rustc_middle::dep_graph;
-use rustc_middle::ty::TyCtxt;
-#[cfg(feature="master")]
-use rustc_middle::mir::mono::Visibility;
-use rustc_middle::mir::mono::Linkage;
-use rustc_codegen_ssa::{ModuleCodegen, ModuleKind};
+use gccjit::{CType, FunctionType, GlobalKind};
 use rustc_codegen_ssa::base::maybe_create_entry_wrapper;
 use rustc_codegen_ssa::mono_item::MonoItemExt;
 use rustc_codegen_ssa::traits::DebugInfoMethods;
+use rustc_codegen_ssa::{ModuleCodegen, ModuleKind};
+use rustc_middle::dep_graph;
+use rustc_middle::mir::mono::Linkage;
+#[cfg(feature = "master")]
+use rustc_middle::mir::mono::Visibility;
+use rustc_middle::ty::TyCtxt;
 use rustc_session::config::DebugInfo;
 use rustc_span::Symbol;
 use rustc_target::spec::PanicStrategy;
 
-use crate::{LockedTargetInfo, gcc_util, new_context};
-use crate::GccContext;
 use crate::builder::Builder;
 use crate::context::CodegenCx;
+use crate::{gcc_util, new_context, LockedTargetInfo};
+use crate::{GccContext, SyncContext};
 
-#[cfg(feature="master")]
+#[cfg(feature = "master")]
 pub fn visibility_to_gcc(linkage: Visibility) -> gccjit::Visibility {
     match linkage {
         Visibility::Default => gccjit::Visibility::Default,
@@ -66,7 +64,11 @@ pub fn linkage_to_gcc(linkage: Linkage) -> FunctionType {
     }
 }
 
-pub fn compile_codegen_unit(tcx: TyCtxt<'_>, cgu_name: Symbol, target_info: LockedTargetInfo) -> (ModuleCodegen<GccContext>, u64) {
+pub fn compile_codegen_unit(
+    tcx: TyCtxt<'_>,
+    cgu_name: Symbol,
+    target_info: LockedTargetInfo,
+) -> (ModuleCodegen<GccContext>, u64) {
     let prof_timer = tcx.prof.generic_activity("codegen_module");
     let start_time = Instant::now();
 
@@ -85,7 +87,10 @@ pub fn compile_codegen_unit(tcx: TyCtxt<'_>, cgu_name: Symbol, target_info: Lock
     // the time we needed for codegenning it.
     let cost = time_to_codegen.as_secs() * 1_000_000_000 + time_to_codegen.subsec_nanos() as u64;
 
-    fn module_codegen(tcx: TyCtxt<'_>, (cgu_name, target_info): (Symbol, LockedTargetInfo)) -> ModuleCodegen<GccContext> {
+    fn module_codegen(
+        tcx: TyCtxt<'_>,
+        (cgu_name, target_info): (Symbol, LockedTargetInfo),
+    ) -> ModuleCodegen<GccContext> {
         let cgu = tcx.codegen_unit(cgu_name);
         // Instantiate monomorphizations without filling out definitions yet...
         let context = new_context(tcx);
@@ -95,7 +100,12 @@ pub fn compile_codegen_unit(tcx: TyCtxt<'_>, cgu_name: Symbol, target_info: Lock
             context.add_driver_option("-fexceptions");
         }
 
-        let disabled_features: HashSet<_> = tcx.sess.opts.cg.target_feature.split(',')
+        let disabled_features: HashSet<_> = tcx
+            .sess
+            .opts
+            .cg
+            .target_feature
+            .split(',')
             .filter(|feature| feature.starts_with('-'))
             .map(|string| &string[1..])
             .collect();
@@ -126,10 +136,16 @@ pub fn compile_codegen_unit(tcx: TyCtxt<'_>, cgu_name: Symbol, target_info: Lock
 
         let target_cpu = gcc_util::target_cpu(tcx.sess);
         if target_cpu != "generic" {
-            context.add_command_line_option(&format!("-march={}", target_cpu));
+            context.add_command_line_option(format!("-march={}", target_cpu));
         }
 
-        if tcx.sess.opts.unstable_opts.function_sections.unwrap_or(tcx.sess.target.function_sections) {
+        if tcx
+            .sess
+            .opts
+            .unstable_opts
+            .function_sections
+            .unwrap_or(tcx.sess.target.function_sections)
+        {
             context.add_command_line_option("-ffunction-sections");
             context.add_command_line_option("-fdata-sections");
         }
@@ -152,23 +168,38 @@ pub fn compile_codegen_unit(tcx: TyCtxt<'_>, cgu_name: Symbol, target_info: Lock
         if env::var("CG_GCCJIT_DUMP_GIMPLE").as_deref() == Ok("1") {
             context.set_dump_initial_gimple(true);
         }
-        context.set_debug_info(true);
         if env::var("CG_GCCJIT_DUMP_EVERYTHING").as_deref() == Ok("1") {
             context.set_dump_everything(true);
         }
         if env::var("CG_GCCJIT_KEEP_INTERMEDIATES").as_deref() == Ok("1") {
             context.set_keep_intermediates(true);
         }
-
         if env::var("CG_GCCJIT_VERBOSE").as_deref() == Ok("1") {
             context.add_driver_option("-v");
         }
 
-        // NOTE: The codegen generates unrechable blocks.
+        // NOTE: The codegen generates unreachable blocks.
         context.set_allow_unreachable_blocks(true);
 
         {
-            let cx = CodegenCx::new(&context, cgu, tcx, target_info.supports_128bit_int());
+            // TODO: to make it less error-prone (calling get_target_info() will add the flag
+            // -fsyntax-only), forbid the compilation when get_target_info() is called on a
+            // context.
+            let f16_type_supported = target_info.supports_target_dependent_type(CType::Float16);
+            let f32_type_supported = target_info.supports_target_dependent_type(CType::Float32);
+            let f64_type_supported = target_info.supports_target_dependent_type(CType::Float64);
+            let f128_type_supported = target_info.supports_target_dependent_type(CType::Float128);
+            // TODO: improve this to avoid passing that many arguments.
+            let cx = CodegenCx::new(
+                &context,
+                cgu,
+                tcx,
+                target_info.supports_128bit_int(),
+                f16_type_supported,
+                f32_type_supported,
+                f64_type_supported,
+                f128_type_supported,
+            );
 
             let mono_items = cgu.items_in_deterministic_order(tcx);
             for &(mono_item, data) in &mono_items {
@@ -193,7 +224,7 @@ pub fn compile_codegen_unit(tcx: TyCtxt<'_>, cgu_name: Symbol, target_info: Lock
         ModuleCodegen {
             name: cgu_name.to_string(),
             module_llvm: GccContext {
-                context,
+                context: Arc::new(SyncContext::new(context)),
                 should_combine_object_files: false,
                 temp_dir: None,
             },

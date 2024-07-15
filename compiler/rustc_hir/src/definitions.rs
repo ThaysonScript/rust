@@ -7,14 +7,14 @@
 pub use crate::def_id::DefPathHash;
 use crate::def_id::{CrateNum, DefIndex, LocalDefId, StableCrateId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use crate::def_path_hash_map::DefPathHashMap;
-
 use rustc_data_structures::stable_hasher::{Hash64, StableHasher};
 use rustc_data_structures::unord::UnordMap;
 use rustc_index::IndexVec;
+use rustc_macros::{Decodable, Encodable};
 use rustc_span::symbol::{kw, sym, Symbol};
-
 use std::fmt::{self, Write};
 use std::hash::Hash;
+use tracing::{debug, instrument};
 
 /// The `DefPathTable` maps `DefIndex`es to `DefKey`s and vice versa.
 /// Internally the `DefPathTable` holds a tree of `DefKey`s, where each `DefKey`
@@ -377,17 +377,17 @@ impl Definitions {
     }
 
     #[inline(always)]
-    pub fn local_def_path_hash_to_def_id(
-        &self,
-        hash: DefPathHash,
-        err: &mut dyn FnMut() -> !,
-    ) -> LocalDefId {
+    /// Returns `None` if the `DefPathHash` does not correspond to a `LocalDefId`
+    /// in the current compilation session. This can legitimately happen if the
+    /// `DefPathHash` is from a `DefId` in an upstream crate or, during incr. comp.,
+    /// if the `DefPathHash` is from a previous compilation session and
+    /// the def-path does not exist anymore.
+    pub fn local_def_path_hash_to_def_id(&self, hash: DefPathHash) -> Option<LocalDefId> {
         debug_assert!(hash.stable_crate_id() == self.table.stable_crate_id);
         self.table
             .def_path_hash_to_index
             .get(&hash.local_hash())
             .map(|local_def_index| LocalDefId { local_def_index })
-            .unwrap_or_else(|| err())
     }
 
     pub fn def_path_hash_to_def_index_map(&self) -> &DefPathHashMap {
@@ -420,7 +420,9 @@ impl DefPathData {
     pub fn name(&self) -> DefPathDataName {
         use self::DefPathData::*;
         match *self {
-            TypeNs(name) if name == kw::Empty => DefPathDataName::Anon { namespace: sym::opaque },
+            TypeNs(name) if name == kw::Empty => {
+                DefPathDataName::Anon { namespace: sym::synthetic }
+            }
             TypeNs(name) | ValueNs(name) | MacroNs(name) | LifetimeNs(name) => {
                 DefPathDataName::Named(name)
             }

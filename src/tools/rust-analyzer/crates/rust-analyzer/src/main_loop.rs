@@ -1,8 +1,9 @@
 //! The main loop of `rust-analyzer` responsible for dispatching LSP
 //! requests/replies and notifications back to the client.
-use crate::lsp::ext;
+
 use std::{
     fmt,
+    ops::Div as _,
     time::{Duration, Instant},
 };
 
@@ -10,17 +11,19 @@ use always_assert::always;
 use crossbeam_channel::{select, Receiver};
 use ide_db::base_db::{SourceDatabase, SourceDatabaseExt, VfsPath};
 use lsp_server::{Connection, Notification, Request};
-use lsp_types::notification::Notification as _;
+use lsp_types::{notification::Notification as _, TextDocumentIdentifier};
 use stdx::thread::ThreadIntent;
+use tracing::{span, Level};
 use vfs::FileId;
 
 use crate::{
     config::Config,
-    diagnostics::fetch_native_diagnostics,
+    diagnostics::{fetch_native_diagnostics, DiagnosticsGeneration},
     dispatch::{NotificationDispatcher, RequestDispatcher},
     global_state::{file_id_to_url, url_to_file_id, GlobalState},
+    hack_recover_crate_name,
     lsp::{
-        from_proto,
+        from_proto, to_proto,
         utils::{notification_is, Progress},
     },
     lsp_ext,
@@ -43,7 +46,7 @@ pub fn main_loop(config: Config, connection: Connection) -> anyhow::Result<()> {
     // https://github.com/rust-lang/rust-analyzer/issues/2835
     #[cfg(windows)]
     unsafe {
-        use winapi::um::processthreadsapi::*;
+        use windows_sys::Win32::System::Threading::*;
         let thread = GetCurrentThread();
         let thread_priority_above_normal = 1;
         SetThreadPriority(thread, thread_priority_above_normal);
@@ -58,6 +61,7 @@ enum Event {
     QueuedTask(QueuedTask),
     Vfs(vfs::loader::Message),
     Flycheck(flycheck::Message),
+    TestResult(flycheck::CargoTestMessage),
 }
 
 impl fmt::Display for Event {
@@ -68,6 +72,7 @@ impl fmt::Display for Event {
             Event::Vfs(_) => write!(f, "Event::Vfs"),
             Event::Flycheck(_) => write!(f, "Event::Flycheck"),
             Event::QueuedTask(_) => write!(f, "Event::QueuedTask"),
+            Event::TestResult(_) => write!(f, "Event::TestResult"),
         }
     }
 }
@@ -81,9 +86,10 @@ pub(crate) enum QueuedTask {
 #[derive(Debug)]
 pub(crate) enum Task {
     Response(lsp_server::Response),
-    ClientNotification(ext::UnindexedProjectParams),
+    ClientNotification(lsp_ext::UnindexedProjectParams),
     Retry(lsp_server::Request),
-    Diagnostics(Vec<(FileId, Vec<lsp_types::Diagnostic>)>),
+    Diagnostics(DiagnosticsGeneration, Vec<(FileId, Vec<lsp_types::Diagnostic>)>),
+    DiscoverTest(lsp_ext::DiscoverTestResults),
     PrimeCaches(PrimeCachesProgress),
     FetchWorkspace(ProjectWorkspaceProgress),
     FetchBuildData(BuildDataProgress),
@@ -127,6 +133,7 @@ impl fmt::Debug for Event {
             Event::QueuedTask(it) => fmt::Debug::fmt(it, f),
             Event::Vfs(it) => fmt::Debug::fmt(it, f),
             Event::Flycheck(it) => fmt::Debug::fmt(it, f),
+            Event::TestResult(it) => fmt::Debug::fmt(it, f),
         }
     }
 }
@@ -180,6 +187,11 @@ impl GlobalState {
                         scheme: None,
                         pattern: Some("**/Cargo.lock".into()),
                     },
+                    lsp_types::DocumentFilter {
+                        language: None,
+                        scheme: None,
+                        pattern: Some("**/rust-analyzer.toml".into()),
+                    },
                 ]),
             },
         };
@@ -214,14 +226,17 @@ impl GlobalState {
 
             recv(self.flycheck_receiver) -> task =>
                 Some(Event::Flycheck(task.unwrap())),
+
+            recv(self.test_run_receiver) -> task =>
+                Some(Event::TestResult(task.unwrap())),
+
         }
     }
 
     fn handle_event(&mut self, event: Event) -> anyhow::Result<()> {
         let loop_start = Instant::now();
         // NOTE: don't count blocking select! call as a loop-turn time
-        let _p = tracing::span!(tracing::Level::INFO, "GlobalState::handle_event", event = %event)
-            .entered();
+        let _p = tracing::info_span!("GlobalState::handle_event", event = %event).entered();
 
         let event_dbg_msg = format!("{event:?}");
         tracing::debug!(?loop_start, ?event, "handle_event");
@@ -240,9 +255,7 @@ impl GlobalState {
                 lsp_server::Message::Response(resp) => self.complete_request(resp),
             },
             Event::QueuedTask(task) => {
-                let _p =
-                    tracing::span!(tracing::Level::INFO, "GlobalState::handle_event/queued_task")
-                        .entered();
+                let _p = tracing::info_span!("GlobalState::handle_event/queued_task").entered();
                 self.handle_queued_task(task);
                 // Coalesce multiple task events into one loop turn
                 while let Ok(task) = self.deferred_task_queue.receiver.try_recv() {
@@ -250,8 +263,7 @@ impl GlobalState {
                 }
             }
             Event::Task(task) => {
-                let _p = tracing::span!(tracing::Level::INFO, "GlobalState::handle_event/task")
-                    .entered();
+                let _p = tracing::info_span!("GlobalState::handle_event/task").entered();
                 let mut prime_caches_progress = Vec::new();
 
                 self.handle_task(&mut prime_caches_progress, task);
@@ -305,8 +317,7 @@ impl GlobalState {
                 }
             }
             Event::Vfs(message) => {
-                let _p =
-                    tracing::span!(tracing::Level::INFO, "GlobalState::handle_event/vfs").entered();
+                let _p = tracing::info_span!("GlobalState::handle_event/vfs").entered();
                 self.handle_vfs_msg(message);
                 // Coalesce many VFS event into a single loop turn
                 while let Ok(message) = self.loader.receiver.try_recv() {
@@ -314,12 +325,19 @@ impl GlobalState {
                 }
             }
             Event::Flycheck(message) => {
-                let _p = tracing::span!(tracing::Level::INFO, "GlobalState::handle_event/flycheck")
-                    .entered();
+                let _p = tracing::info_span!("GlobalState::handle_event/flycheck").entered();
                 self.handle_flycheck_msg(message);
                 // Coalesce many flycheck updates into a single loop turn
                 while let Ok(message) = self.flycheck_receiver.try_recv() {
                     self.handle_flycheck_msg(message);
+                }
+            }
+            Event::TestResult(message) => {
+                let _p = tracing::info_span!("GlobalState::handle_event/test_result").entered();
+                self.handle_cargo_test_msg(message);
+                // Coalesce many test result event into a single loop turn
+                while let Ok(message) = self.test_run_receiver.try_recv() {
+                    self.handle_cargo_test_msg(message);
                 }
             }
         }
@@ -329,11 +347,7 @@ impl GlobalState {
         let memdocs_added_or_removed = self.mem_docs.take_changes();
 
         if self.is_quiescent() {
-            let became_quiescent = !(was_quiescent
-                || self.fetch_workspaces_queue.op_requested()
-                || self.fetch_build_data_queue.op_requested()
-                || self.fetch_proc_macros_queue.op_requested());
-
+            let became_quiescent = !was_quiescent;
             if became_quiescent {
                 if self.config.check_on_save() {
                     // Project has loaded properly, kick off initial flycheck
@@ -344,7 +358,7 @@ impl GlobalState {
                 }
             }
 
-            let client_refresh = !was_quiescent || state_changed;
+            let client_refresh = became_quiescent || state_changed;
             if client_refresh {
                 // Refresh semantic tokens if the client supports it.
                 if self.config.semantic_tokens_refresh() {
@@ -358,16 +372,18 @@ impl GlobalState {
                 }
 
                 // Refresh inlay hints if the client supports it.
-                if self.send_hint_refresh_query && self.config.inlay_hints_refresh() {
+                if self.config.inlay_hints_refresh() {
                     self.send_request::<lsp_types::request::InlayHintRefreshRequest>((), |_, _| ());
-                    self.send_hint_refresh_query = false;
                 }
             }
 
-            let update_diagnostics = (!was_quiescent || state_changed || memdocs_added_or_removed)
-                && self.config.publish_diagnostics();
-            if update_diagnostics {
-                self.update_diagnostics()
+            let project_or_mem_docs_changed =
+                became_quiescent || state_changed || memdocs_added_or_removed;
+            if project_or_mem_docs_changed && self.config.publish_diagnostics() {
+                self.update_diagnostics();
+            }
+            if project_or_mem_docs_changed && self.config.test_explorer() {
+                self.update_tests();
             }
         }
 
@@ -388,7 +404,7 @@ impl GlobalState {
                 // See https://github.com/rust-lang/rust-analyzer/issues/13130
                 let patch_empty = |message: &mut String| {
                     if message.is_empty() {
-                        *message = " ".to_owned();
+                        " ".clone_into(message);
                     }
                 };
 
@@ -411,7 +427,7 @@ impl GlobalState {
             }
         }
 
-        if self.config.cargo_autoreload() {
+        if self.config.cargo_autoreload_config() {
             if let Some((cause, force_crate_graph_reload)) =
                 self.fetch_workspaces_queue.should_start_op()
             {
@@ -464,27 +480,98 @@ impl GlobalState {
 
     fn update_diagnostics(&mut self) {
         let db = self.analysis_host.raw_database();
+        let generation = self.diagnostics.next_generation();
+        let subscriptions = {
+            let vfs = &self.vfs.read().0;
+            self.mem_docs
+                .iter()
+                .map(|path| vfs.file_id(path).unwrap())
+                .filter(|&file_id| {
+                    let source_root = db.file_source_root(file_id);
+                    // Only publish diagnostics for files in the workspace, not from crates.io deps
+                    // or the sysroot.
+                    // While theoretically these should never have errors, we have quite a few false
+                    // positives particularly in the stdlib, and those diagnostics would stay around
+                    // forever if we emitted them here.
+                    !db.source_root(source_root).is_library
+                })
+                .collect::<std::sync::Arc<_>>()
+        };
+        tracing::trace!("updating notifications for {:?}", subscriptions);
+        // Split up the work on multiple threads, but we don't wanna fill the entire task pool with
+        // diagnostic tasks, so we limit the number of tasks to a quarter of the total thread pool.
+        let max_tasks = self.config.main_loop_num_threads().div(4).max(1);
+        let chunk_length = subscriptions.len() / max_tasks;
+        let remainder = subscriptions.len() % max_tasks;
+
+        let mut start = 0;
+        for task_idx in 0..max_tasks {
+            let extra = if task_idx < remainder { 1 } else { 0 };
+            let end = start + chunk_length + extra;
+            let slice = start..end;
+            if slice.is_empty() {
+                break;
+            }
+            // Diagnostics are triggered by the user typing
+            // so we run them on a latency sensitive thread.
+            self.task_pool.handle.spawn(ThreadIntent::LatencySensitive, {
+                let snapshot = self.snapshot();
+                let subscriptions = subscriptions.clone();
+                move || {
+                    Task::Diagnostics(
+                        generation,
+                        fetch_native_diagnostics(snapshot, subscriptions, slice),
+                    )
+                }
+            });
+            start = end;
+        }
+    }
+
+    fn update_tests(&mut self) {
+        let db = self.analysis_host.raw_database();
         let subscriptions = self
             .mem_docs
             .iter()
             .map(|path| self.vfs.read().0.file_id(path).unwrap())
             .filter(|&file_id| {
                 let source_root = db.file_source_root(file_id);
-                // Only publish diagnostics for files in the workspace, not from crates.io deps
-                // or the sysroot.
-                // While theoretically these should never have errors, we have quite a few false
-                // positives particularly in the stdlib, and those diagnostics would stay around
-                // forever if we emitted them here.
                 !db.source_root(source_root).is_library
             })
             .collect::<Vec<_>>();
-        tracing::trace!("updating notifications for {:?}", subscriptions);
+        tracing::trace!("updating tests for {:?}", subscriptions);
 
-        // Diagnostics are triggered by the user typing
+        // Updating tests are triggered by the user typing
         // so we run them on a latency sensitive thread.
         self.task_pool.handle.spawn(ThreadIntent::LatencySensitive, {
             let snapshot = self.snapshot();
-            move || Task::Diagnostics(fetch_native_diagnostics(snapshot, subscriptions))
+            move || {
+                let tests = subscriptions
+                    .iter()
+                    .copied()
+                    .filter_map(|f| snapshot.analysis.discover_tests_in_file(f).ok())
+                    .flatten()
+                    .collect::<Vec<_>>();
+                for t in &tests {
+                    hack_recover_crate_name::insert_name(t.id.clone());
+                }
+                Task::DiscoverTest(lsp_ext::DiscoverTestResults {
+                    tests: tests
+                        .into_iter()
+                        .filter_map(|t| {
+                            let line_index = t.file.and_then(|f| snapshot.file_line_index(f).ok());
+                            to_proto::test_item(&snapshot, t, line_index.as_ref())
+                        })
+                        .collect(),
+                    scope: None,
+                    scope_file: Some(
+                        subscriptions
+                            .into_iter()
+                            .map(|f| TextDocumentIdentifier { uri: to_proto::url(&snapshot, f) })
+                            .collect(),
+                    ),
+                })
+            }
         });
     }
 
@@ -525,9 +612,9 @@ impl GlobalState {
             // Only retry requests that haven't been cancelled. Otherwise we do unnecessary work.
             Task::Retry(req) if !self.is_completed(&req) => self.on_request(req),
             Task::Retry(_) => (),
-            Task::Diagnostics(diagnostics_per_file) => {
+            Task::Diagnostics(generation, diagnostics_per_file) => {
                 for (file_id, diagnostics) in diagnostics_per_file {
-                    self.diagnostics.set_native_diagnostics(file_id, diagnostics)
+                    self.diagnostics.set_native_diagnostics(generation, file_id, diagnostics)
                 }
             }
             Task::PrimeCaches(progress) => match progress {
@@ -571,14 +658,13 @@ impl GlobalState {
                         }
 
                         self.switch_workspaces("fetched build data".to_owned());
-                        self.send_hint_refresh_query = true;
 
                         (Some(Progress::End), None)
                     }
                 };
 
                 if let Some(state) = state {
-                    self.report_progress("Building", state, msg, None, None);
+                    self.report_progress("Building build-artifacts", state, msg, None, None);
                 }
             }
             Task::LoadProcMacros(progress) => {
@@ -588,23 +674,27 @@ impl GlobalState {
                     ProcMacroProgress::End(proc_macro_load_result) => {
                         self.fetch_proc_macros_queue.op_completed(true);
                         self.set_proc_macros(proc_macro_load_result);
-                        self.send_hint_refresh_query = true;
                         (Some(Progress::End), None)
                     }
                 };
 
                 if let Some(state) = state {
-                    self.report_progress("Loading", state, msg, None, None);
+                    self.report_progress("Loading proc-macros", state, msg, None, None);
                 }
             }
             Task::BuildDepsHaveChanged => self.build_deps_changed = true,
+            Task::DiscoverTest(tests) => {
+                self.send_notification::<lsp_ext::DiscoveredTests>(tests);
+            }
         }
     }
 
     fn handle_vfs_msg(&mut self, message: vfs::loader::Message) {
+        let _p = tracing::info_span!("GlobalState::handle_vfs_msg").entered();
         let is_changed = matches!(message, vfs::loader::Message::Changed { .. });
         match message {
             vfs::loader::Message::Changed { files } | vfs::loader::Message::Loaded { files } => {
+                let _p = tracing::info_span!("GlobalState::handle_vfs_msg{changed/load}").entered();
                 let vfs = &mut self.vfs.write().0;
                 for (path, contents) in files {
                     let path = VfsPath::from(path);
@@ -618,6 +708,7 @@ impl GlobalState {
                 }
             }
             vfs::loader::Message::Progress { n_total, n_done, dir, config_version } => {
+                let _p = tracing::info_span!("GlobalState::handle_vfs_mgs/progress").entered();
                 always!(config_version <= self.vfs_config_version);
 
                 let state = match n_done {
@@ -636,10 +727,9 @@ impl GlobalState {
                     message += &format!(
                         ": {}",
                         match dir.strip_prefix(self.config.root_path()) {
-                            Some(relative_path) => relative_path.as_ref(),
+                            Some(relative_path) => relative_path.as_utf8_path(),
                             None => dir.as_ref(),
                         }
-                        .display()
                     );
                 }
 
@@ -660,13 +750,12 @@ impl GlobalState {
                 let snap = self.snapshot();
 
                 self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {
-                    let _p = tracing::span!(tracing::Level::INFO, "GlobalState::check_if_indexed")
-                        .entered();
+                    let _p = tracing::info_span!("GlobalState::check_if_indexed").entered();
                     tracing::debug!(?uri, "handling uri");
                     let id = from_proto::file_id(&snap, &uri).expect("unable to get FileId");
                     if let Ok(crates) = &snap.analysis.crates_for(id) {
                         if crates.is_empty() {
-                            let params = ext::UnindexedProjectParams {
+                            let params = lsp_ext::UnindexedProjectParams {
                                 text_documents: vec![lsp_types::TextDocumentIdentifier { uri }],
                             };
                             sender.send(Task::ClientNotification(params)).unwrap();
@@ -694,6 +783,38 @@ impl GlobalState {
                         }
                     }
                 });
+            }
+        }
+    }
+
+    fn handle_cargo_test_msg(&mut self, message: flycheck::CargoTestMessage) {
+        match message {
+            flycheck::CargoTestMessage::Test { name, state } => {
+                let state = match state {
+                    flycheck::TestState::Started => lsp_ext::TestState::Started,
+                    flycheck::TestState::Ignored => lsp_ext::TestState::Skipped,
+                    flycheck::TestState::Ok => lsp_ext::TestState::Passed,
+                    flycheck::TestState::Failed { stdout } => {
+                        lsp_ext::TestState::Failed { message: stdout }
+                    }
+                };
+                let Some(test_id) = hack_recover_crate_name::lookup_name(name) else {
+                    return;
+                };
+                self.send_notification::<lsp_ext::ChangeTestState>(
+                    lsp_ext::ChangeTestStateParams { test_id, state },
+                );
+            }
+            flycheck::CargoTestMessage::Suite => (),
+            flycheck::CargoTestMessage::Finished => {
+                self.test_run_remaining_jobs = self.test_run_remaining_jobs.saturating_sub(1);
+                if self.test_run_remaining_jobs == 0 {
+                    self.send_notification::<lsp_ext::EndRunTest>(());
+                    self.test_run_session = None;
+                }
+            }
+            flycheck::CargoTestMessage::Custom { text } => {
+                self.send_notification::<lsp_ext::AppendOutputToRunTest>(text);
             }
         }
     }
@@ -726,12 +847,11 @@ impl GlobalState {
                 }
             }
 
+            flycheck::Message::ClearDiagnostics { id } => self.diagnostics.clear_check(id),
+
             flycheck::Message::Progress { id, progress } => {
                 let (state, message) = match progress {
-                    flycheck::Progress::DidStart => {
-                        self.diagnostics.clear_check(id);
-                        (Progress::Begin, None)
-                    }
+                    flycheck::Progress::DidStart => (Progress::Begin, None),
                     flycheck::Progress::DidCheckCrate(target) => (Progress::Report, Some(target)),
                     flycheck::Progress::DidCancel => {
                         self.last_flycheck_error = None;
@@ -754,7 +874,7 @@ impl GlobalState {
                 let title = if self.flycheck.len() == 1 {
                     format!("{}", self.config.flycheck())
                 } else {
-                    format!("cargo check (#{})", id + 1)
+                    format!("{} (#{})", self.config.flycheck(), id + 1)
                 };
                 self.report_progress(
                     &title,
@@ -769,6 +889,8 @@ impl GlobalState {
 
     /// Registers and handles a request. This should only be called once per incoming request.
     fn on_new_request(&mut self, request_received: Instant, req: Request) {
+        let _p =
+            span!(Level::INFO, "GlobalState::on_new_request", req.method = ?req.method).entered();
         self.register_request(&req, request_received);
         self.on_request(req);
     }
@@ -796,6 +918,10 @@ impl GlobalState {
         use crate::handlers::request as handlers;
         use lsp_types::request as lsp_request;
 
+        const RETRY: bool = true;
+        const NO_RETRY: bool = false;
+
+        #[rustfmt::skip]
         dispatcher
             // Request handlers that must run on the main thread
             // because they mutate GlobalState:
@@ -803,6 +929,7 @@ impl GlobalState {
             .on_sync_mut::<lsp_ext::RebuildProcMacros>(handlers::handle_proc_macros_rebuild)
             .on_sync_mut::<lsp_ext::MemoryUsage>(handlers::handle_memory_usage)
             .on_sync_mut::<lsp_ext::ShuffleCrateGraph>(handlers::handle_shuffle_crate_graph)
+            .on_sync_mut::<lsp_ext::RunTest>(handlers::handle_run_test)
             // Request handlers which are related to the user typing
             // are run on the main thread to reduce latency:
             .on_sync::<lsp_ext::JoinLines>(handlers::handle_join_lines)
@@ -820,66 +947,67 @@ impl GlobalState {
             // analysis on the main thread because that would block other
             // requests. Instead, we run these request handlers on higher priority
             // threads in the threadpool.
-            .on_latency_sensitive::<lsp_request::Completion>(handlers::handle_completion)
-            .on_latency_sensitive::<lsp_request::ResolveCompletionItem>(
-                handlers::handle_completion_resolve,
-            )
-            .on_latency_sensitive::<lsp_request::SemanticTokensFullRequest>(
-                handlers::handle_semantic_tokens_full,
-            )
-            .on_latency_sensitive::<lsp_request::SemanticTokensFullDeltaRequest>(
-                handlers::handle_semantic_tokens_full_delta,
-            )
-            .on_latency_sensitive::<lsp_request::SemanticTokensRangeRequest>(
-                handlers::handle_semantic_tokens_range,
-            )
+            // FIXME: Retrying can make the result of this stale?
+            .on_latency_sensitive::<RETRY, lsp_request::Completion>(handlers::handle_completion)
+            // FIXME: Retrying can make the result of this stale
+            .on_latency_sensitive::<RETRY, lsp_request::ResolveCompletionItem>(handlers::handle_completion_resolve)
+            .on_latency_sensitive::<RETRY, lsp_request::SemanticTokensFullRequest>(handlers::handle_semantic_tokens_full)
+            .on_latency_sensitive::<RETRY, lsp_request::SemanticTokensFullDeltaRequest>(handlers::handle_semantic_tokens_full_delta)
+            .on_latency_sensitive::<NO_RETRY, lsp_request::SemanticTokensRangeRequest>(handlers::handle_semantic_tokens_range)
+            // FIXME: Some of these NO_RETRY could be retries if the file they are interested didn't change.
             // All other request handlers
-            .on::<lsp_ext::FetchDependencyList>(handlers::fetch_dependency_list)
-            .on::<lsp_ext::AnalyzerStatus>(handlers::handle_analyzer_status)
-            .on::<lsp_ext::SyntaxTree>(handlers::handle_syntax_tree)
-            .on::<lsp_ext::ViewHir>(handlers::handle_view_hir)
-            .on::<lsp_ext::ViewMir>(handlers::handle_view_mir)
-            .on::<lsp_ext::InterpretFunction>(handlers::handle_interpret_function)
-            .on::<lsp_ext::ViewFileText>(handlers::handle_view_file_text)
-            .on::<lsp_ext::ViewCrateGraph>(handlers::handle_view_crate_graph)
-            .on::<lsp_ext::ViewItemTree>(handlers::handle_view_item_tree)
-            .on::<lsp_ext::ExpandMacro>(handlers::handle_expand_macro)
-            .on::<lsp_ext::ParentModule>(handlers::handle_parent_module)
-            .on::<lsp_ext::Runnables>(handlers::handle_runnables)
-            .on::<lsp_ext::RelatedTests>(handlers::handle_related_tests)
-            .on::<lsp_ext::CodeActionRequest>(handlers::handle_code_action)
-            .on::<lsp_ext::CodeActionResolveRequest>(handlers::handle_code_action_resolve)
-            .on::<lsp_ext::HoverRequest>(handlers::handle_hover)
-            .on::<lsp_ext::ExternalDocs>(handlers::handle_open_docs)
-            .on::<lsp_ext::OpenCargoToml>(handlers::handle_open_cargo_toml)
-            .on::<lsp_ext::MoveItem>(handlers::handle_move_item)
-            .on::<lsp_ext::WorkspaceSymbol>(handlers::handle_workspace_symbol)
-            .on::<lsp_request::DocumentSymbolRequest>(handlers::handle_document_symbol)
-            .on::<lsp_request::GotoDefinition>(handlers::handle_goto_definition)
-            .on::<lsp_request::GotoDeclaration>(handlers::handle_goto_declaration)
-            .on::<lsp_request::GotoImplementation>(handlers::handle_goto_implementation)
-            .on::<lsp_request::GotoTypeDefinition>(handlers::handle_goto_type_definition)
-            .on_no_retry::<lsp_request::InlayHintRequest>(handlers::handle_inlay_hints)
-            .on::<lsp_request::InlayHintResolveRequest>(handlers::handle_inlay_hints_resolve)
-            .on::<lsp_request::CodeLensRequest>(handlers::handle_code_lens)
-            .on::<lsp_request::CodeLensResolve>(handlers::handle_code_lens_resolve)
-            .on::<lsp_request::FoldingRangeRequest>(handlers::handle_folding_range)
-            .on::<lsp_request::SignatureHelpRequest>(handlers::handle_signature_help)
-            .on::<lsp_request::PrepareRenameRequest>(handlers::handle_prepare_rename)
-            .on::<lsp_request::Rename>(handlers::handle_rename)
-            .on::<lsp_request::References>(handlers::handle_references)
-            .on::<lsp_request::DocumentHighlightRequest>(handlers::handle_document_highlight)
-            .on::<lsp_request::CallHierarchyPrepare>(handlers::handle_call_hierarchy_prepare)
-            .on::<lsp_request::CallHierarchyIncomingCalls>(handlers::handle_call_hierarchy_incoming)
-            .on::<lsp_request::CallHierarchyOutgoingCalls>(handlers::handle_call_hierarchy_outgoing)
-            .on::<lsp_request::WillRenameFiles>(handlers::handle_will_rename_files)
-            .on::<lsp_ext::Ssr>(handlers::handle_ssr)
-            .on::<lsp_ext::ViewRecursiveMemoryLayout>(handlers::handle_view_recursive_memory_layout)
+            .on::<RETRY, lsp_request::DocumentSymbolRequest>(handlers::handle_document_symbol)
+            .on::<RETRY, lsp_request::FoldingRangeRequest>(handlers::handle_folding_range)
+            .on::<NO_RETRY, lsp_request::SignatureHelpRequest>(handlers::handle_signature_help)
+            .on::<RETRY, lsp_request::WillRenameFiles>(handlers::handle_will_rename_files)
+            .on::<NO_RETRY, lsp_request::GotoDefinition>(handlers::handle_goto_definition)
+            .on::<NO_RETRY, lsp_request::GotoDeclaration>(handlers::handle_goto_declaration)
+            .on::<NO_RETRY, lsp_request::GotoImplementation>(handlers::handle_goto_implementation)
+            .on::<NO_RETRY, lsp_request::GotoTypeDefinition>(handlers::handle_goto_type_definition)
+            .on::<RETRY, lsp_request::InlayHintRequest>(handlers::handle_inlay_hints)
+            .on::<RETRY, lsp_request::InlayHintResolveRequest>(handlers::handle_inlay_hints_resolve)
+            .on::<NO_RETRY, lsp_request::CodeLensRequest>(handlers::handle_code_lens)
+            .on::<RETRY, lsp_request::CodeLensResolve>(handlers::handle_code_lens_resolve)
+            .on::<NO_RETRY, lsp_request::PrepareRenameRequest>(handlers::handle_prepare_rename)
+            .on::<NO_RETRY, lsp_request::Rename>(handlers::handle_rename)
+            .on::<NO_RETRY, lsp_request::References>(handlers::handle_references)
+            .on::<NO_RETRY, lsp_request::DocumentHighlightRequest>(handlers::handle_document_highlight)
+            .on::<NO_RETRY, lsp_request::CallHierarchyPrepare>(handlers::handle_call_hierarchy_prepare)
+            .on::<NO_RETRY, lsp_request::CallHierarchyIncomingCalls>(handlers::handle_call_hierarchy_incoming)
+            .on::<NO_RETRY, lsp_request::CallHierarchyOutgoingCalls>(handlers::handle_call_hierarchy_outgoing)
+            // All other request handlers (lsp extension)
+            .on::<RETRY, lsp_ext::FetchDependencyList>(handlers::fetch_dependency_list)
+            .on::<RETRY, lsp_ext::AnalyzerStatus>(handlers::handle_analyzer_status)
+            .on::<RETRY, lsp_ext::ViewFileText>(handlers::handle_view_file_text)
+            .on::<RETRY, lsp_ext::ViewCrateGraph>(handlers::handle_view_crate_graph)
+            .on::<RETRY, lsp_ext::ViewItemTree>(handlers::handle_view_item_tree)
+            .on::<RETRY, lsp_ext::DiscoverTest>(handlers::handle_discover_test)
+            .on::<RETRY, lsp_ext::WorkspaceSymbol>(handlers::handle_workspace_symbol)
+            .on::<NO_RETRY, lsp_ext::Ssr>(handlers::handle_ssr)
+            .on::<NO_RETRY, lsp_ext::ViewRecursiveMemoryLayout>(handlers::handle_view_recursive_memory_layout)
+            .on::<NO_RETRY, lsp_ext::SyntaxTree>(handlers::handle_syntax_tree)
+            .on::<NO_RETRY, lsp_ext::ViewHir>(handlers::handle_view_hir)
+            .on::<NO_RETRY, lsp_ext::ViewMir>(handlers::handle_view_mir)
+            .on::<NO_RETRY, lsp_ext::InterpretFunction>(handlers::handle_interpret_function)
+            .on::<NO_RETRY, lsp_ext::ExpandMacro>(handlers::handle_expand_macro)
+            .on::<NO_RETRY, lsp_ext::ParentModule>(handlers::handle_parent_module)
+            .on::<NO_RETRY, lsp_ext::Runnables>(handlers::handle_runnables)
+            .on::<NO_RETRY, lsp_ext::RelatedTests>(handlers::handle_related_tests)
+            .on::<NO_RETRY, lsp_ext::CodeActionRequest>(handlers::handle_code_action)
+            .on::<RETRY, lsp_ext::CodeActionResolveRequest>(handlers::handle_code_action_resolve)
+            .on::<NO_RETRY, lsp_ext::HoverRequest>(handlers::handle_hover)
+            .on::<NO_RETRY, lsp_ext::ExternalDocs>(handlers::handle_open_docs)
+            .on::<NO_RETRY, lsp_ext::OpenCargoToml>(handlers::handle_open_cargo_toml)
+            .on::<NO_RETRY, lsp_ext::MoveItem>(handlers::handle_move_item)
+            //
+            .on::<NO_RETRY, lsp_ext::InternalTestingFetchConfig>(handlers::internal_testing_fetch_config)
             .finish();
     }
 
     /// Handles an incoming notification.
     fn on_notification(&mut self, not: Notification) -> anyhow::Result<()> {
+        let _p =
+            span!(Level::INFO, "GlobalState::on_notification", not.method = ?not.method).entered();
         use crate::handlers::notification as handlers;
         use lsp_types::notification as notifs;
 
@@ -906,6 +1034,7 @@ impl GlobalState {
             .on_sync_mut::<lsp_ext::CancelFlycheck>(handlers::handle_cancel_flycheck)?
             .on_sync_mut::<lsp_ext::ClearFlycheck>(handlers::handle_clear_flycheck)?
             .on_sync_mut::<lsp_ext::RunFlycheck>(handlers::handle_run_flycheck)?
+            .on_sync_mut::<lsp_ext::AbortRunTest>(handlers::handle_abort_run_test)?
             .finish();
         Ok(())
     }
